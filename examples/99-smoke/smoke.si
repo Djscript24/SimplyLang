@@ -1,0 +1,33 @@
+# Compact end-to-end check for the Simply language
+name as String is "Simply"
+values is array [5, 10, 15]
+
+open "../08-standard-library/imported-values.si" as imported_values
+
+fn total(items):
+    result is 0
+    for item in items:
+        result -> result + item
+    end
+    return result
+end
+
+filtered_total is pipeline:
+    imported_values
+    filter item >= 20
+    sum
+end
+
+fn greet(self):
+    return "Hello " + self["name"]
+end
+
+person is hash:
+    name is "Ada"
+end
+
+if total(values) == 30 and filtered_total == 50 and send(person, "greet") == "Hello Ada" and name == "Simply":
+    Say "Smoke test passed"
+else:
+    Say "Smoke test failed"
+end

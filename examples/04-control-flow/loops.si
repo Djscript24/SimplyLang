@@ -1,0 +1,6 @@
+# Iterating over a collection
+names is list ["Ada", "Lin", "Rio"]
+
+for name in names:
+    Say name
+end

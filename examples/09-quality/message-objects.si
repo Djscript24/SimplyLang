@@ -1,0 +1,10 @@
+# Values receive messages through explicit behavior
+fn greet(self):
+    return "Hello " + self["name"]
+end
+
+person is hash:
+    name is "Ada"
+end
+
+Say send(person, "greet")

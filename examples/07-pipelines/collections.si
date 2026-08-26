@@ -1,0 +1,11 @@
+# Filter, map, and sum in one data flow
+numbers is list [10, 20, 30, 40]
+
+total is pipeline:
+    numbers
+    filter item >= 20
+    map item * 2
+    sum
+end
+
+Say total

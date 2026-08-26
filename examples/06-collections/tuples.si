@@ -1,0 +1,6 @@
+# Fixed-size tuples and destructuring
+coordinates is (12, 30)
+(x, y) is coordinates
+
+Say x
+Say y

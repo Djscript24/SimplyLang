@@ -1,0 +1,6 @@
+# Inspect values without changing them
+items is list ["one", "two"]
+Say contains(items, "one")
+Say contains(items, "missing")
+Say type_of(items)
+print("Printed with the print function")

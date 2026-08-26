@@ -1,0 +1,10 @@
+# Typed assignment and reassignment
+scores as List[Int] is list [1, 2, 3]
+label as String is "starter"
+
+Say scores
+scores[1] -> 20
+label -> "updated"
+
+Say scores
+Say label

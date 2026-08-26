@@ -1,0 +1,9 @@
+# Built-in functions and source-value imports
+numbers is range(1, 5)
+Say numbers
+Say length(numbers)
+Say count(numbers)
+Say length("Simply")
+
+open "imported-values.si" as imported
+Say imported[1]

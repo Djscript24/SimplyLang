@@ -1,0 +1,7 @@
+# A counted while loop
+step is 0
+
+while step < 3:
+    Say step
+    step -> step + 1
+end

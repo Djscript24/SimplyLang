@@ -1,0 +1,8 @@
+# Fixed-style arrays and mutable lists
+cities is array ["Jakarta", "Citra", "Lima"]
+queue is list ["first", "second"]
+
+queue add "third"
+queue remove "first"
+Say cities[1]
+Say queue

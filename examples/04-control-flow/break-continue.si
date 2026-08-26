@@ -1,0 +1,10 @@
+# Skip one value, then stop at another
+for value in array [1, 2, 3, 4, 5]:
+    if value == 2:
+        continue
+    end
+    if value == 5:
+        break
+    end
+    Say value
+end

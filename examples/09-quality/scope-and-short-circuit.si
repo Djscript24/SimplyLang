@@ -1,0 +1,10 @@
+# Function globals and lazy boolean expressions
+factor is 3
+
+fn scale(value as Int) gives Int:
+    return value * factor
+end
+
+Say scale(7)
+Say false and missing_value
+Say true or missing_value

@@ -1,0 +1,8 @@
+# Named values for records and nested data
+profile is hash:
+    name is "Ada"
+    role is "builder"
+end
+
+Say profile["name"]
+Say profile["role"]
