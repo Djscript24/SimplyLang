@@ -1,0 +1,611 @@
+use std::collections::HashMap;
+
+use crate::{
+    ast::{BinaryOperator, Expr, Literal, PipelineStep, Program, Stmt, Type, UnaryOperator},
+    error::{SimplyError, Span},
+};
+
+#[derive(Clone)]
+struct FunctionSignature {
+    parameters: Vec<Option<Type>>,
+    return_type: Option<Type>,
+}
+
+#[derive(Default)]
+pub struct SemanticAnalyzer {
+    variables: HashMap<String, Type>,
+    functions: HashMap<String, FunctionSignature>,
+    current_span: Option<Span>,
+    loop_depth: usize,
+    function_depth: usize,
+    function_return: Option<Type>,
+    saw_return: bool,
+}
+
+impl SemanticAnalyzer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn analyze(&mut self, program: &Program) -> Result<(), SimplyError> {
+        self.collect_functions(&program.statements);
+        self.analyze_statements(&program.statements)
+    }
+
+    fn collect_functions(&mut self, statements: &[Stmt]) {
+        for statement in statements {
+            let statement = match statement {
+                Stmt::Located { statement, .. } => statement.as_ref(),
+                statement => statement,
+            };
+            if let Stmt::Function {
+                name,
+                parameters,
+                return_type,
+                ..
+            } = statement
+            {
+                self.functions.insert(
+                    name.clone(),
+                    FunctionSignature {
+                        parameters: parameters
+                            .iter()
+                            .map(|(_, parameter_type)| parameter_type.clone())
+                            .collect(),
+                        return_type: return_type.clone(),
+                    },
+                );
+                self.variables.insert(
+                    name.clone(),
+                    Type::Function {
+                        parameters: parameters
+                            .iter()
+                            .map(|(_, parameter_type)| parameter_type.clone().map(Box::new))
+                            .collect(),
+                        return_type: return_type.clone().map(Box::new),
+                    },
+                );
+            }
+        }
+    }
+
+    fn analyze_statements(&mut self, statements: &[Stmt]) -> Result<(), SimplyError> {
+        for statement in statements {
+            match statement {
+                Stmt::Located { span, statement } => {
+                    self.current_span = Some(span.clone());
+                    self.analyze_statements(std::slice::from_ref(statement.as_ref()))?;
+                }
+                Stmt::Say(expression) | Stmt::Expression(expression) => {
+                    self.analyze_expression(expression)?;
+                }
+                Stmt::Import { alias, .. } => {
+                    self.variables.insert(alias.clone(), Type::Unknown);
+                }
+                Stmt::Assign {
+                    name,
+                    declared_type,
+                    value,
+                } => {
+                    let actual = self.analyze_expression(value)?;
+                    let expected = declared_type.clone().unwrap_or_else(|| actual.clone());
+                    if !Self::compatible(&actual, &expected) {
+                        return Err(self.type_error(&expected, &actual, name));
+                    }
+                    self.variables.insert(name.clone(), expected);
+                }
+                Stmt::Reassign { name, value } => {
+                    let expected =
+                        self.variables.get(name).cloned().ok_or_else(|| {
+                            self.error("E0001", format!("unknown variable `{name}`"))
+                        })?;
+                    let actual = self.analyze_expression(value)?;
+                    if !Self::compatible(&actual, &expected) {
+                        return Err(self.type_error(&expected, &actual, name));
+                    }
+                }
+                Stmt::SetIndex { name, index, value } => {
+                    let target =
+                        self.variables.get(name).cloned().ok_or_else(|| {
+                            self.error("E0001", format!("unknown variable `{name}`"))
+                        })?;
+                    let index_type = self.analyze_expression(index)?;
+                    let value_type = self.analyze_expression(value)?;
+                    match target {
+                        Type::Array(element) | Type::List(element) => {
+                            self.require_type(&Type::Int, &index_type)?;
+                            self.require_type(&element, &value_type)?;
+                        }
+                        Type::Hash => self.require_type(&Type::String, &index_type)?,
+                        _ => return Err(self.error("E0010", format!("`{name}` is not mutable"))),
+                    }
+                }
+                Stmt::Destructure { names, value } => {
+                    let value_type = self.analyze_expression(value)?;
+                    match value_type {
+                        Type::Tuple(types) if types.len() == names.len() => {
+                            for (name, value_type) in names.iter().zip(types) {
+                                self.variables.insert(name.clone(), value_type);
+                            }
+                        }
+                        Type::Tuple(types) => {
+                            return Err(self.error(
+                                "E0011",
+                                format!(
+                                    "tuple has {} values, but {} names were provided",
+                                    types.len(),
+                                    names.len()
+                                ),
+                            ));
+                        }
+                        Type::Unknown => {}
+                        _ => return Err(self.error("E0011", "destructuring requires a tuple")),
+                    }
+                }
+                Stmt::CollectionOp {
+                    name,
+                    operation: _,
+                    value,
+                } => {
+                    let target =
+                        self.variables.get(name).cloned().ok_or_else(|| {
+                            self.error("E0001", format!("unknown variable `{name}`"))
+                        })?;
+                    let value_type = self.analyze_expression(value)?;
+                    match target {
+                        Type::List(element) => self.require_type(&element, &value_type)?,
+                        _ => return Err(self.error("E0010", format!("`{name}` is not a list"))),
+                    }
+                }
+                Stmt::Function {
+                    name,
+                    parameters,
+                    return_type,
+                    body,
+                } => {
+                    let saved_variables = self.variables.clone();
+                    let saved_function_depth = self.function_depth;
+                    let saved_return = self.function_return.clone();
+                    let saved_saw_return = self.saw_return;
+                    self.function_return = return_type.clone();
+                    self.function_depth += 1;
+                    self.saw_return = false;
+                    for (parameter, parameter_type) in parameters {
+                        self.variables.insert(
+                            parameter.clone(),
+                            parameter_type.clone().unwrap_or(Type::Unknown),
+                        );
+                    }
+                    self.analyze_statements(body)?;
+                    if let Some(expected) = return_type {
+                        if !self.saw_return && *expected != Type::Unknown {
+                            return Err(self.error(
+                                "E0005",
+                                format!(
+                                    "function `{name}` must return {}",
+                                    Self::type_name(expected)
+                                ),
+                            ));
+                        }
+                    }
+                    self.variables = saved_variables;
+                    self.function_depth = saved_function_depth;
+                    self.function_return = saved_return;
+                    self.saw_return = saved_saw_return;
+                }
+                Stmt::Return(expression) => {
+                    let actual = self.analyze_expression(expression)?;
+                    if self.function_depth == 0 {
+                        return Err(self.error("E0006", "return used outside a function"));
+                    }
+                    if let Some(expected) = self.function_return.clone() {
+                        self.require_type(&expected, &actual)?;
+                    }
+                    self.saw_return = true;
+                }
+                Stmt::If {
+                    condition,
+                    then_branch,
+                    else_branch,
+                } => {
+                    let condition_type = self.analyze_expression(condition)?;
+                    self.require_type(&Type::Bool, &condition_type)?;
+                    let saved = self.variables.clone();
+                    self.analyze_statements(then_branch)?;
+                    self.variables = saved.clone();
+                    self.analyze_statements(else_branch)?;
+                    self.variables = saved;
+                }
+                Stmt::For {
+                    name,
+                    iterable,
+                    body,
+                } => {
+                    let iterable_type = self.analyze_expression(iterable)?;
+                    let element = Self::element_type(&iterable_type)
+                        .ok_or_else(|| self.error("E0012", "for requires a collection"))?;
+                    let previous = self.variables.insert(name.clone(), element);
+                    self.loop_depth += 1;
+                    self.analyze_statements(body)?;
+                    self.loop_depth -= 1;
+                    match previous {
+                        Some(value) => {
+                            self.variables.insert(name.clone(), value);
+                        }
+                        None => {
+                            self.variables.remove(name);
+                        }
+                    }
+                }
+                Stmt::While { condition, body } => {
+                    let condition_type = self.analyze_expression(condition)?;
+                    self.require_type(&Type::Bool, &condition_type)?;
+                    self.loop_depth += 1;
+                    self.analyze_statements(body)?;
+                    self.loop_depth -= 1;
+                }
+                Stmt::Break | Stmt::Continue if self.loop_depth == 0 => {
+                    return Err(self.error("E0007", "break or continue used outside a loop"));
+                }
+                Stmt::Break | Stmt::Continue => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn analyze_expression(&mut self, expression: &Expr) -> Result<Type, SimplyError> {
+        match expression {
+            Expr::Literal(Literal::String(_)) => Ok(Type::String),
+            Expr::Literal(Literal::Int(_)) => Ok(Type::Int),
+            Expr::Literal(Literal::Float(_)) => Ok(Type::Float),
+            Expr::Literal(Literal::Bool(_)) => Ok(Type::Bool),
+            Expr::Identifier(name) => self
+                .variables
+                .get(name)
+                .cloned()
+                .ok_or_else(|| self.error("E0001", format!("unknown variable `{name}`"))),
+            Expr::Array(values) => self.collection_type(values, true),
+            Expr::List(values) => self.collection_type(values, false),
+            Expr::Tuple(values) => Ok(Type::Tuple(
+                values
+                    .iter()
+                    .map(|value| self.analyze_expression(value))
+                    .collect::<Result<_, _>>()?,
+            )),
+            Expr::Matrix(values) => {
+                for value in values {
+                    self.analyze_expression(value)?;
+                }
+                Ok(Type::Matrix)
+            }
+            Expr::Hash(entries) | Expr::Tree(entries) => {
+                for (_, value) in entries {
+                    self.analyze_expression(value)?;
+                }
+                Ok(if matches!(expression, Expr::Hash(_)) {
+                    Type::Hash
+                } else {
+                    Type::Tree
+                })
+            }
+            Expr::Unary { operator, operand } => {
+                let operand_type = self.analyze_expression(operand)?;
+                match operator {
+                    UnaryOperator::Not => {
+                        self.require_type(&Type::Bool, &operand_type)?;
+                        Ok(Type::Bool)
+                    }
+                    UnaryOperator::Negate => {
+                        self.require_numeric(&operand_type)?;
+                        Ok(operand_type)
+                    }
+                    UnaryOperator::Transpose => {
+                        self.require_type(&Type::Matrix, &operand_type)?;
+                        Ok(Type::Matrix)
+                    }
+                }
+            }
+            Expr::Binary {
+                left,
+                operator,
+                right,
+            } => {
+                let left_type = self.analyze_expression(left)?;
+                if matches!(
+                    (operator, left.as_ref()),
+                    (BinaryOperator::And, Expr::Literal(Literal::Bool(false)))
+                        | (BinaryOperator::Or, Expr::Literal(Literal::Bool(true)))
+                ) {
+                    return Ok(Type::Bool);
+                }
+                let right_type = self.analyze_expression(right)?;
+                self.binary_type(operator, &left_type, &right_type)
+            }
+            Expr::Call { name, arguments } => self.call_type(name, arguments),
+            Expr::Index { target, index } => {
+                let target_type = self.analyze_expression(target)?;
+                let index_type = self.analyze_expression(index)?;
+                self.index_type(&target_type, &index_type)
+            }
+            Expr::Field { target, name } => {
+                let target_type = self.analyze_expression(target)?;
+                match target_type {
+                    Type::Hash | Type::Tree | Type::Unknown => Ok(Type::Unknown),
+                    _ => Err(self.error("E0013", format!("value has no field `{name}`"))),
+                }
+            }
+            Expr::Pipeline { source, steps } => self.pipeline_type(source, steps),
+        }
+    }
+
+    fn collection_type(&mut self, values: &[Expr], array: bool) -> Result<Type, SimplyError> {
+        let mut element = Type::Unknown;
+        for value in values {
+            let actual = self.analyze_expression(value)?;
+            if element == Type::Unknown {
+                element = actual;
+            } else if !Self::compatible(&actual, &element) {
+                return Err(self.type_error(&element, &actual, "collection element"));
+            }
+        }
+        Ok(if array {
+            Type::Array(Box::new(element))
+        } else {
+            Type::List(Box::new(element))
+        })
+    }
+
+    fn binary_type(
+        &self,
+        operator: &BinaryOperator,
+        left: &Type,
+        right: &Type,
+    ) -> Result<Type, SimplyError> {
+        use BinaryOperator::*;
+        if left == &Type::Unknown || right == &Type::Unknown {
+            return Ok(Type::Unknown);
+        }
+        match operator {
+            Add if left == &Type::Matrix && right == &Type::Matrix => Ok(Type::Matrix),
+            Add if left == &Type::String && right == &Type::String => Ok(Type::String),
+            Add => self.numeric_result(left, right),
+            Subtract | Multiply | Divide | Remainder => self.numeric_result(left, right),
+            MatrixMultiply => {
+                self.require_type(&Type::Matrix, left)?;
+                self.require_type(&Type::Matrix, right)?;
+                Ok(Type::Matrix)
+            }
+            Greater | GreaterEqual | Less | LessEqual => {
+                self.require_numeric(left)?;
+                self.require_numeric(right)?;
+                Ok(Type::Bool)
+            }
+            Equal | NotEqual => Ok(Type::Bool),
+            And | Or => {
+                self.require_type(&Type::Bool, left)?;
+                self.require_type(&Type::Bool, right)?;
+                Ok(Type::Bool)
+            }
+        }
+    }
+
+    fn call_type(&mut self, name: &str, arguments: &[Expr]) -> Result<Type, SimplyError> {
+        let argument_types = arguments
+            .iter()
+            .map(|argument| self.analyze_expression(argument))
+            .collect::<Result<Vec<_>, _>>()?;
+        match name {
+            "print" => {
+                self.expect_count(name, &argument_types, 1)?;
+                Ok(Type::Unit)
+            }
+            "type_of" => {
+                self.expect_count(name, &argument_types, 1)?;
+                Ok(Type::String)
+            }
+            "length" | "count" => {
+                self.expect_count(name, &argument_types, 1)?;
+                Ok(Type::Int)
+            }
+            "contains" => {
+                self.expect_count(name, &argument_types, 2)?;
+                Ok(Type::Bool)
+            }
+            "range" => {
+                self.expect_count(name, &argument_types, 2)?;
+                for argument in &argument_types {
+                    self.require_type(&Type::Int, argument)?;
+                }
+                Ok(Type::Array(Box::new(Type::Int)))
+            }
+            "send" => {
+                if argument_types.len() < 2 {
+                    return Err(self.error("E0002", "`send` expects a receiver and a message"));
+                }
+                self.require_type(&Type::String, &argument_types[1])?;
+                Ok(Type::Unknown)
+            }
+            _ => {
+                let function = self
+                    .functions
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| self.error("E0002", format!("unknown function `{name}`")))?;
+                if function.parameters.len() != argument_types.len() {
+                    return Err(self.error(
+                        "E0002",
+                        format!(
+                            "function `{name}` expects {} arguments, got {}",
+                            function.parameters.len(),
+                            argument_types.len()
+                        ),
+                    ));
+                }
+                for (expected, actual) in function.parameters.iter().zip(argument_types.iter()) {
+                    if let Some(expected) = expected {
+                        self.require_type(expected, actual)?;
+                    }
+                }
+                Ok(function.return_type.unwrap_or(Type::Unit))
+            }
+        }
+    }
+
+    fn pipeline_type(
+        &mut self,
+        source: &Expr,
+        steps: &[PipelineStep],
+    ) -> Result<Type, SimplyError> {
+        let source_type = self.analyze_expression(source)?;
+        let mut item_type = Self::element_type(&source_type)
+            .ok_or_else(|| self.error("E0012", "pipeline source must be an array or list"))?;
+        for step in steps {
+            match step {
+                PipelineStep::Filter(expression) => {
+                    let previous = self.variables.insert("item".into(), item_type.clone());
+                    let filter_type = self.analyze_expression(expression)?;
+                    self.require_type(&Type::Bool, &filter_type)?;
+                    Self::restore_item(&mut self.variables, previous);
+                }
+                PipelineStep::Map(expression) => {
+                    let previous = self.variables.insert("item".into(), item_type.clone());
+                    item_type = self.analyze_expression(expression)?;
+                    Self::restore_item(&mut self.variables, previous);
+                }
+                PipelineStep::Sum => {
+                    self.require_numeric(&item_type)?;
+                    return Ok(item_type);
+                }
+                PipelineStep::Count => return Ok(Type::Int),
+            }
+        }
+        Ok(Type::List(Box::new(item_type)))
+    }
+
+    fn restore_item(variables: &mut HashMap<String, Type>, previous: Option<Type>) {
+        match previous {
+            Some(value) => {
+                variables.insert("item".into(), value);
+            }
+            None => {
+                variables.remove("item");
+            }
+        }
+    }
+    fn index_type(&self, target: &Type, index: &Type) -> Result<Type, SimplyError> {
+        match target {
+            Type::Array(element) | Type::List(element) => {
+                self.require_type(&Type::Int, index)?;
+                Ok((**element).clone())
+            }
+            Type::Tuple(types) => {
+                self.require_type(&Type::Int, index)?;
+                Ok(types.first().cloned().unwrap_or(Type::Unknown))
+            }
+            Type::Hash | Type::Tree => {
+                self.require_type(&Type::String, index)?;
+                Ok(Type::Unknown)
+            }
+            Type::Matrix => Ok(Type::Unknown),
+            Type::Unknown => Ok(Type::Unknown),
+            _ => Err(self.error("E0014", "value is not indexable")),
+        }
+    }
+    fn element_type(typ: &Type) -> Option<Type> {
+        match typ {
+            Type::Array(element) | Type::List(element) => Some((**element).clone()),
+            Type::Tuple(types) => types.first().cloned(),
+            Type::Hash | Type::Tree => Some(Type::Unknown),
+            Type::Unknown => Some(Type::Unknown),
+            _ => None,
+        }
+    }
+    fn numeric_result(&self, left: &Type, right: &Type) -> Result<Type, SimplyError> {
+        self.require_numeric(left)?;
+        self.require_numeric(right)?;
+        Ok(if left == &Type::Float || right == &Type::Float {
+            Type::Float
+        } else {
+            Type::Int
+        })
+    }
+    fn require_numeric(&self, typ: &Type) -> Result<(), SimplyError> {
+        if matches!(typ, Type::Int | Type::Float | Type::Unknown) {
+            Ok(())
+        } else {
+            Err(self.error(
+                "E0003",
+                format!("expected a number, found {}", Self::type_name(typ)),
+            ))
+        }
+    }
+    fn require_type(&self, expected: &Type, actual: &Type) -> Result<(), SimplyError> {
+        if Self::compatible(actual, expected) {
+            Ok(())
+        } else {
+            Err(self.type_error(expected, actual, "expression"))
+        }
+    }
+    fn expect_count(
+        &self,
+        name: &str,
+        arguments: &[Type],
+        expected: usize,
+    ) -> Result<(), SimplyError> {
+        if arguments.len() == expected {
+            Ok(())
+        } else {
+            Err(self.error(
+                "E0002",
+                format!(
+                    "`{name}` expects {expected} arguments, got {}",
+                    arguments.len()
+                ),
+            ))
+        }
+    }
+    fn compatible(actual: &Type, expected: &Type) -> bool {
+        actual == &Type::Unknown || expected == &Type::Unknown || actual == expected
+    }
+    fn type_error(&self, expected: &Type, actual: &Type, subject: &str) -> SimplyError {
+        self.error(
+            "E0003",
+            format!(
+                "type mismatch for `{subject}`: expected {}, found {}",
+                Self::type_name(expected),
+                Self::type_name(actual)
+            ),
+        )
+    }
+    fn type_name(typ: &Type) -> String {
+        match typ {
+            Type::Unknown => "Unknown".into(),
+            Type::Unit => "Unit".into(),
+            Type::String => "String".into(),
+            Type::Int => "Int".into(),
+            Type::Float => "Float".into(),
+            Type::Bool => "Bool".into(),
+            Type::Array(element) => format!("Array[{}]", Self::type_name(element)),
+            Type::List(element) => format!("List[{}]", Self::type_name(element)),
+            Type::Tuple(types) => format!(
+                "Tuple[{}]",
+                types
+                    .iter()
+                    .map(Self::type_name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Type::Hash => "Hash".into(),
+            Type::Tree => "Tree".into(),
+            Type::Matrix => "Matrix".into(),
+            Type::Function { .. } => "Function".into(),
+        }
+    }
+    fn error(&self, code: &str, message: impl Into<String>) -> SimplyError {
+        SimplyError::Semantic {
+            span: self.current_span.clone().unwrap_or_else(|| Span::new(0, 0)),
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}

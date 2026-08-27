@@ -152,6 +152,9 @@ impl Evaluator {
                         self.variable_types.insert(name.clone(), expected.clone());
                     } else if let Some(expected) = self.variable_types.get(name).cloned() {
                         self.ensure_type(&value, &expected, name)?;
+                    } else {
+                        self.variable_types
+                            .insert(name.clone(), Self::type_of_value(&value));
                     }
                     self.variables.insert(name.clone(), value);
                 }
@@ -985,7 +988,52 @@ impl Evaluator {
         if valid {
             Ok(())
         } else {
-            Err(self.runtime_error(format!("value assigned to `{name}` has the wrong type")))
+            Err(self.runtime_error(format!(
+                "value assigned to `{name}` has the wrong type: expected {}, found {}",
+                Self::type_name(expected),
+                Self::value_type_name(value)
+            )))
+        }
+    }
+
+    fn type_name(expected: &Type) -> String {
+        match expected {
+            Type::Unknown => "Unknown".into(),
+            Type::Unit => "Unit".into(),
+            Type::String => "String".into(),
+            Type::Int => "Int".into(),
+            Type::Float => "Float".into(),
+            Type::Bool => "Bool".into(),
+            Type::Array(element) => format!("Array[{}]", Self::type_name(element)),
+            Type::List(element) => format!("List[{}]", Self::type_name(element)),
+            Type::Tuple(types) => format!(
+                "Tuple[{}]",
+                types
+                    .iter()
+                    .map(Self::type_name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Type::Hash => "Hash".into(),
+            Type::Tree => "Tree".into(),
+            Type::Matrix => "Matrix".into(),
+            Type::Function { .. } => "Function".into(),
+        }
+    }
+
+    fn value_type_name(value: &Value) -> &'static str {
+        match value {
+            Value::Unit => "Unit",
+            Value::String(_) => "String",
+            Value::Int(_) => "Int",
+            Value::Float(_) => "Float",
+            Value::Bool(_) => "Bool",
+            Value::Array(_) => "Array",
+            Value::List(_) => "List",
+            Value::Tuple(_) => "Tuple",
+            Value::Hash(_) => "Hash",
+            Value::Tree(_) => "Tree",
+            Value::Matrix(_) => "Matrix",
         }
     }
 
@@ -1010,6 +1058,26 @@ impl Evaluator {
                         .all(|(value, expected)| self.value_matches_type(value, expected))
             }
             _ => false,
+        }
+    }
+
+    fn type_of_value(value: &Value) -> Type {
+        match value {
+            Value::String(_) => Type::String,
+            Value::Int(_) => Type::Int,
+            Value::Float(_) => Type::Float,
+            Value::Bool(_) => Type::Bool,
+            Value::Array(values) => Type::Array(Box::new(
+                values.first().map(Self::type_of_value).unwrap_or(Type::Int),
+            )),
+            Value::List(values) => Type::List(Box::new(
+                values.first().map(Self::type_of_value).unwrap_or(Type::Int),
+            )),
+            Value::Tuple(values) => Type::Tuple(values.iter().map(Self::type_of_value).collect()),
+            Value::Hash(_) => Type::Hash,
+            Value::Tree(_) => Type::Tree,
+            Value::Matrix(_) => Type::Matrix,
+            Value::Unit => Type::Unit,
         }
     }
 }

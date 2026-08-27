@@ -4,6 +4,7 @@ mod evaluator;
 mod formatter;
 mod lexer;
 mod parser;
+mod semantic;
 
 use std::{env, fs, path::Path, process};
 
@@ -11,6 +12,7 @@ use error::SimplyError;
 use evaluator::Evaluator;
 use lexer::Lexer;
 use parser::Parser;
+use semantic::SemanticAnalyzer;
 
 fn usage() {
     println!("Simply 0.2.0");
@@ -19,6 +21,8 @@ fn usage() {
     println!("  simply --tokens <file.si>");
     println!("  simply --ast <file.si>");
     println!("  simply --format <file.si>");
+    println!("  simply check <file.si>");
+    println!("  simply --check <file.si>");
     println!("  simply --help");
 }
 
@@ -41,6 +45,12 @@ fn format_source(source: &str) -> String {
     formatter::format(source)
 }
 
+fn check_source(source: &str) -> Result<(), SimplyError> {
+    let tokens = Lexer::new(source).tokenize()?;
+    let program = Parser::new(tokens).parse()?;
+    SemanticAnalyzer::new().analyze(&program)
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -59,6 +69,8 @@ fn main() {
             "--tokens" => ("tokens", &args[2]),
             "--ast" => ("ast", &args[2]),
             "--format" => ("format", &args[2]),
+            "check" => ("check", &args[2]),
+            "--check" => ("check", &args[2]),
             other => {
                 eprintln!("error: unknown option `{other}`");
                 usage();
@@ -89,11 +101,18 @@ fn main() {
             print!("{}", format_source(&source));
             Ok(())
         }
+        "check" => {
+            println!("Checking {path}...");
+            check_source(&source).map(|_| println!("No errors found."))
+        }
         _ => Evaluator::new().run_file(Path::new(path)),
     };
 
     if let Err(err) = result {
-        eprintln!("{err}");
+        eprintln!("{}", err.render(path, &source));
+        if mode == "check" {
+            eprintln!("\nFound 1 error.");
+        }
         process::exit(1);
     }
 }

@@ -7,6 +7,8 @@ pub struct Program {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
+    Unknown,
+    Unit,
     String,
     Int,
     Float,
@@ -17,6 +19,10 @@ pub enum Type {
     Hash,
     Tree,
     Matrix,
+    Function {
+        parameters: Vec<Option<Box<Type>>>,
+        return_type: Option<Box<Type>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

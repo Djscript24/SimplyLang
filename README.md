@@ -30,6 +30,12 @@ cargo run -- --ast examples/01-basics/values.si
 cargo run -- --format examples/04-control-flow/while.si
 ```
 
+Check a source file without executing it:
+
+```bash
+cargo run -- check examples/99-smoke/smoke.si
+```
+
 Run the full test suite:
 
 ```bash
@@ -42,6 +48,9 @@ cargo test
 
 Simply supports strings, integers, floats, booleans, arithmetic, comparison,
 equality, and short-circuit boolean operators.
+
+An unannotated binding infers its type from its initial value. Reassignment
+must keep that type; use `as` when an explicit type is clearer.
 
 ```si
 active is true
@@ -181,6 +190,12 @@ Built-in functions include:
 - `contains(collection, value)`
 - `type_of(value)`
 - `print(value)`
+
+## Errors
+
+Lexing, parsing, and runtime errors report their category, source filename,
+line, column, source line, and a caret pointing to the available source span.
+Type errors include both the expected and actual value types.
 
 ## Examples
 

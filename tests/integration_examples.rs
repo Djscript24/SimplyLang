@@ -31,6 +31,28 @@ fn run_source(source: &str) -> (bool, String) {
     (output.status.success(), message)
 }
 
+fn check_source(source: &str) -> (bool, String, String) {
+    let source_id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "simply-check-{}-{source_id}.si",
+        std::process::id()
+    ));
+    fs::write(&path, source).expect("failed to write temporary Simply source");
+    let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args([
+            "check",
+            path.to_str().expect("temporary path was not UTF-8"),
+        ])
+        .output()
+        .expect("failed to run Simply check");
+    let _ = fs::remove_file(path);
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
 #[test]
 fn runs_basic_values() {
     let output = run_example("examples/01-basics/values.si");
@@ -103,6 +125,7 @@ fn reports_runtime_errors() {
     let (success, type_error) = run_source("value as Int is \"wrong\"\n");
     assert!(!success);
     assert!(type_error.contains("wrong type"));
+    assert!(type_error.contains("expected Int, found String"));
     assert!(type_error.contains("1:1"));
 
     let (success, index_error) = run_source("values is array [1]\nSay values[2]\n");
@@ -126,6 +149,58 @@ fn reports_runtime_errors() {
     let (success, overflow_error) = run_source("Say 9223372036854775807 + 1\n");
     assert!(!success);
     assert!(overflow_error.contains("integer arithmetic error"));
+}
+
+#[test]
+fn reports_source_context_for_runtime_errors() {
+    let (success, error) = run_source("value is 1\nSay missing\n");
+    assert!(!success);
+    assert!(error.contains("Runtime error"));
+    assert!(error.contains("2:1"));
+    assert!(error.contains("2 | Say missing"));
+    assert!(error.contains("| ^"));
+}
+
+#[test]
+fn infers_primitive_types_for_reassignment() {
+    let (success, error) = run_source("age is 18\nage -> \"Ada\"\n");
+    assert!(!success);
+    assert!(error.contains("wrong type"));
+}
+
+#[test]
+fn checks_programs_without_executing_them() {
+    let (success, output, error) = check_source("Say missing\n");
+    assert!(!success);
+    assert!(output.contains("Checking"));
+    assert!(error.contains("error[E0001]"));
+    assert!(error.contains("unknown variable `missing`"));
+
+    let (success, output, error) = check_source("Say \"no output during check\"\n");
+    assert!(success, "unexpected check error: {error}");
+    assert!(output.contains("No errors found."));
+    assert!(!output.contains("no output during check"));
+}
+
+#[test]
+fn checks_expression_function_and_control_flow_types() {
+    let (success, _, error) = check_source("Say 10 + \"hello\"\n");
+    assert!(!success);
+    assert!(error.contains("error[E0003]"));
+
+    let (success, _, error) = check_source(
+        "fn add(left as Int, right as Int) gives Int:\n    return left + right\nend\nSay add(\"hello\", 2)\n",
+    );
+    assert!(!success);
+    assert!(error.contains("expected Int, found String"));
+
+    let (success, _, error) = check_source("break\n");
+    assert!(!success);
+    assert!(error.contains("error[E0007]"));
+
+    let (success, _, error) = check_source("return 1\n");
+    assert!(!success);
+    assert!(error.contains("return used outside a function"));
 }
 
 #[test]
