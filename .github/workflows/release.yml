@@ -1,0 +1,199 @@
+name: Release Simply
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        include:
+          # macOS Apple Silicon
+          - name: macOS ARM64
+            os: macos-14
+            target: aarch64-apple-darwin
+            binary: simply
+            archive: Simply-macos-arm64.tar.gz
+
+          # macOS Intel
+          - name: macOS x86_64
+            os: macos-13
+            target: x86_64-apple-darwin
+            binary: simply
+            archive: Simply-macos-x86_64.tar.gz
+
+          # Linux x86_64
+          - name: Linux x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: simply
+            archive: Simply-linux-x86_64.tar.gz
+
+          # Windows x86_64
+          - name: Windows x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: simply.exe
+            archive: Simply-windows-x86_64.zip
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      # --------------------------------
+      # Checkout repository
+      # --------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # --------------------------------
+      # Install Rust
+      # --------------------------------
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # --------------------------------
+      # Build
+      # --------------------------------
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # --------------------------------
+      # Package macOS / Linux
+      # --------------------------------
+      - name: Package Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p package
+
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" \
+             "package/${{ matrix.binary }}"
+
+          if [ -f README.md ]; then
+            cp README.md package/README.md
+          fi
+
+          if [ -f LICENSE ]; then
+            cp LICENSE package/LICENSE
+          fi
+
+          tar -czf "${{ matrix.archive }}" -C package .
+
+      # --------------------------------
+      # Install Inno Setup on Windows
+      # --------------------------------
+      - name: Install Inno Setup
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          choco install innosetup --no-progress -y
+
+      # --------------------------------
+      # Create Windows installer
+      # --------------------------------
+      - name: Create Windows installer
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path installer | Out-Null
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+
+          @"
+          [Setup]
+          AppName=Simply
+          AppVersion=${{ github.ref_name }}
+          AppPublisher=Simply
+          DefaultDirName={autopf}\Simply
+          DefaultGroupName=Simply
+
+          OutputDir=release
+          OutputBaseFilename=Simply-Setup
+
+          Compression=lzma
+          SolidCompression=yes
+
+          ArchitecturesInstallIn64BitMode=x64compatible
+
+          UninstallDisplayName=Simply
+
+          [Files]
+          Source: "..\target\${{ matrix.target }}\release\simply.exe"; DestDir: "{app}"; Flags: ignoreversion
+
+          [Icons]
+          Name: "{group}\Simply"; Filename: "{app}\simply.exe"
+
+          [Registry]
+          Root: HKCU
+          Subkey: "Environment"
+          ValueType: expandsz
+          ValueName: "Path"
+          ValueData: "{olddata};{app}"
+          Flags: preservestringtype
+
+          [UninstallDelete]
+          Type: filesandordirs
+          Name: "{app}"
+          "@ | Set-Content installer\Simply.iss
+
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\Simply.iss
+
+      # --------------------------------
+      # Upload Unix artifacts
+      # --------------------------------
+      - name: Upload Unix artifact
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+
+      # --------------------------------
+      # Upload Windows installer
+      # --------------------------------
+      - name: Upload Windows installer
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Simply-Windows-Installer
+          path: release/Simply-Setup.exe
+
+  # ==================================
+  # GitHub Release
+  # ==================================
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.exe
+
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
