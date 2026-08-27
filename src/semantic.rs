@@ -13,7 +13,7 @@ struct FunctionSignature {
 
 #[derive(Default)]
 pub struct SemanticAnalyzer {
-    variables: HashMap<String, Type>,
+    variables: ScopeStack,
     functions: HashMap<String, FunctionSignature>,
     current_span: Option<Span>,
     loop_depth: usize,
@@ -22,9 +22,52 @@ pub struct SemanticAnalyzer {
     saw_return: bool,
 }
 
+#[derive(Clone, Default)]
+struct ScopeStack {
+    scopes: Vec<HashMap<String, Type>>,
+}
+
+impl ScopeStack {
+    fn new() -> Self {
+        Self {
+            scopes: vec![HashMap::new()],
+        }
+    }
+
+    fn insert(&mut self, name: String, typ: Type) -> Option<Type> {
+        self.scopes
+            .last_mut()
+            .expect("semantic analyzer always has a global scope")
+            .insert(name, typ)
+    }
+
+    fn get(&self, name: &str) -> Option<&Type> {
+        self.scopes.iter().rev().find_map(|scope| scope.get(name))
+    }
+
+    fn remove(&mut self, name: &str) -> Option<Type> {
+        self.scopes
+            .last_mut()
+            .expect("semantic analyzer always has a global scope")
+            .remove(name)
+    }
+
+    fn push(&mut self) {
+        self.scopes.push(HashMap::new());
+    }
+
+    fn pop(&mut self) {
+        debug_assert!(self.scopes.len() > 1);
+        self.scopes.pop();
+    }
+}
+
 impl SemanticAnalyzer {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            variables: ScopeStack::new(),
+            ..Self::default()
+        }
     }
 
     pub fn analyze(&mut self, program: &Program) -> Result<(), SimplyError> {
@@ -163,10 +206,10 @@ impl SemanticAnalyzer {
                     return_type,
                     body,
                 } => {
-                    let saved_variables = self.variables.clone();
                     let saved_function_depth = self.function_depth;
                     let saved_return = self.function_return.clone();
                     let saved_saw_return = self.saw_return;
+                    self.variables.push();
                     self.function_return = return_type.clone();
                     self.function_depth += 1;
                     self.saw_return = false;
@@ -176,9 +219,19 @@ impl SemanticAnalyzer {
                             parameter_type.clone().unwrap_or(Type::Unknown),
                         );
                     }
-                    self.analyze_statements(body)?;
+                    if let Err(error) = self.analyze_statements(body) {
+                        self.variables.pop();
+                        self.function_depth = saved_function_depth;
+                        self.function_return = saved_return;
+                        self.saw_return = saved_saw_return;
+                        return Err(error);
+                    }
                     if let Some(expected) = return_type {
                         if !self.saw_return && *expected != Type::Unknown {
+                            self.variables.pop();
+                            self.function_depth = saved_function_depth;
+                            self.function_return = saved_return;
+                            self.saw_return = saved_saw_return;
                             return Err(self.error(
                                 "E0005",
                                 format!(
@@ -188,7 +241,7 @@ impl SemanticAnalyzer {
                             ));
                         }
                     }
-                    self.variables = saved_variables;
+                    self.variables.pop();
                     self.function_depth = saved_function_depth;
                     self.function_return = saved_return;
                     self.saw_return = saved_saw_return;
@@ -210,11 +263,18 @@ impl SemanticAnalyzer {
                 } => {
                     let condition_type = self.analyze_expression(condition)?;
                     self.require_type(&Type::Bool, &condition_type)?;
-                    let saved = self.variables.clone();
-                    self.analyze_statements(then_branch)?;
-                    self.variables = saved.clone();
-                    self.analyze_statements(else_branch)?;
-                    self.variables = saved;
+                    self.variables.push();
+                    if let Err(error) = self.analyze_statements(then_branch) {
+                        self.variables.pop();
+                        return Err(error);
+                    }
+                    self.variables.pop();
+                    self.variables.push();
+                    if let Err(error) = self.analyze_statements(else_branch) {
+                        self.variables.pop();
+                        return Err(error);
+                    }
+                    self.variables.pop();
                 }
                 Stmt::For {
                     name,
@@ -224,18 +284,16 @@ impl SemanticAnalyzer {
                     let iterable_type = self.analyze_expression(iterable)?;
                     let element = Self::element_type(&iterable_type)
                         .ok_or_else(|| self.error("E0012", "for requires a collection"))?;
-                    let previous = self.variables.insert(name.clone(), element);
+                    self.variables.push();
+                    self.variables.insert(name.clone(), element);
                     self.loop_depth += 1;
-                    self.analyze_statements(body)?;
-                    self.loop_depth -= 1;
-                    match previous {
-                        Some(value) => {
-                            self.variables.insert(name.clone(), value);
-                        }
-                        None => {
-                            self.variables.remove(name);
-                        }
+                    if let Err(error) = self.analyze_statements(body) {
+                        self.loop_depth -= 1;
+                        self.variables.pop();
+                        return Err(error);
                     }
+                    self.loop_depth -= 1;
+                    self.variables.pop();
                 }
                 Stmt::While { condition, body } => {
                     let condition_type = self.analyze_expression(condition)?;
@@ -325,7 +383,7 @@ impl SemanticAnalyzer {
             Expr::Index { target, index } => {
                 let target_type = self.analyze_expression(target)?;
                 let index_type = self.analyze_expression(index)?;
-                self.index_type(&target_type, &index_type)
+                self.index_type(&target_type, &index_type, index)
             }
             Expr::Field { target, name } => {
                 let target_type = self.analyze_expression(target)?;
@@ -482,7 +540,7 @@ impl SemanticAnalyzer {
         Ok(Type::List(Box::new(item_type)))
     }
 
-    fn restore_item(variables: &mut HashMap<String, Type>, previous: Option<Type>) {
+    fn restore_item(variables: &mut ScopeStack, previous: Option<Type>) {
         match previous {
             Some(value) => {
                 variables.insert("item".into(), value);
@@ -492,7 +550,12 @@ impl SemanticAnalyzer {
             }
         }
     }
-    fn index_type(&self, target: &Type, index: &Type) -> Result<Type, SimplyError> {
+    fn index_type(
+        &self,
+        target: &Type,
+        index: &Type,
+        index_expression: &Expr,
+    ) -> Result<Type, SimplyError> {
         match target {
             Type::Array(element) | Type::List(element) => {
                 self.require_type(&Type::Int, index)?;
@@ -500,13 +563,33 @@ impl SemanticAnalyzer {
             }
             Type::Tuple(types) => {
                 self.require_type(&Type::Int, index)?;
-                Ok(types.first().cloned().unwrap_or(Type::Unknown))
+                match index_expression {
+                    Expr::Literal(Literal::Int(value)) if *value >= 0 => types
+                        .get(*value as usize)
+                        .cloned()
+                        .ok_or_else(|| self.error("E0015", "tuple index out of bounds")),
+                    Expr::Literal(Literal::Int(_)) => {
+                        Err(self.error("E0015", "tuple index must be non-negative"))
+                    }
+                    _ => Ok(Type::Unknown),
+                }
             }
             Type::Hash | Type::Tree => {
                 self.require_type(&Type::String, index)?;
                 Ok(Type::Unknown)
             }
-            Type::Matrix => Ok(Type::Unknown),
+            Type::Matrix => match index {
+                Type::Tuple(types)
+                    if types.len() == 2
+                        && types
+                            .iter()
+                            .all(|value| Self::compatible(value, &Type::Int)) =>
+                {
+                    Ok(Type::Unknown)
+                }
+                Type::Unknown => Ok(Type::Unknown),
+                _ => Err(self.error("E0016", "matrix index requires a tuple of two integers")),
+            },
             Type::Unknown => Ok(Type::Unknown),
             _ => Err(self.error("E0014", "value is not indexable")),
         }

@@ -75,12 +75,54 @@ impl Value {
 
 #[derive(Default)]
 pub struct Evaluator {
-    variables: HashMap<String, Value>,
+    scopes: Vec<HashMap<String, Value>>,
     variable_types: HashMap<String, Type>,
     functions: HashMap<String, Function>,
     current_span: Option<Span>,
     current_file: Option<PathBuf>,
     import_stack: Vec<PathBuf>,
+}
+
+impl Evaluator {
+    fn define(&mut self, name: String, value: Value) {
+        self.scopes
+            .last_mut()
+            .expect("evaluator always has a global scope")
+            .insert(name, value);
+    }
+
+    fn lookup(&self, name: &str) -> Option<&Value> {
+        self.scopes.iter().rev().find_map(|scope| scope.get(name))
+    }
+
+    fn lookup_mut(&mut self, name: &str) -> Option<&mut Value> {
+        self.scopes
+            .iter_mut()
+            .rev()
+            .find_map(|scope| scope.get_mut(name))
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.lookup(name).is_some()
+    }
+
+    fn assign(&mut self, name: &str, value: Value) -> bool {
+        if let Some(binding) = self.lookup_mut(name) {
+            *binding = value;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn push_scope(&mut self) {
+        self.scopes.push(HashMap::new());
+    }
+
+    fn pop_scope(&mut self) {
+        debug_assert!(self.scopes.len() > 1);
+        self.scopes.pop();
+    }
 }
 
 enum Flow {
@@ -99,7 +141,10 @@ struct Function {
 
 impl Evaluator {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            scopes: vec![HashMap::new()],
+            ..Self::default()
+        }
     }
 
     pub fn run(&mut self, program: &Program) -> Result<(), SimplyError> {
@@ -136,7 +181,7 @@ impl Evaluator {
                 }
                 Stmt::Import { path, alias } => {
                     let value = self.load_import(path)?;
-                    self.variables.insert(alias.clone(), value);
+                    self.define(alias.clone(), value);
                 }
                 Stmt::Expression(expr) => {
                     self.evaluate(expr)?;
@@ -156,10 +201,10 @@ impl Evaluator {
                         self.variable_types
                             .insert(name.clone(), Self::type_of_value(&value));
                     }
-                    self.variables.insert(name.clone(), value);
+                    self.define(name.clone(), value);
                 }
                 Stmt::Reassign { name, value } => {
-                    if !self.variables.contains_key(name) {
+                    if !self.contains(name) {
                         return Err(self
                             .runtime_error(format!("cannot reassign unknown variable `{name}`")));
                     }
@@ -167,7 +212,11 @@ impl Evaluator {
                     if let Some(expected) = self.variable_types.get(name).cloned() {
                         self.ensure_type(&value, &expected, name)?;
                     }
-                    self.variables.insert(name.clone(), value);
+                    if !self.assign(name, value) {
+                        return Err(
+                            self.runtime_error(format!("cannot reassign unknown variable `{name}"))
+                        );
+                    }
                 }
                 Stmt::CollectionOp {
                     name,
@@ -181,7 +230,7 @@ impl Evaluator {
                             _ => {}
                         }
                     }
-                    match self.variables.get_mut(name) {
+                    match self.lookup_mut(name) {
                         Some(Value::List(values)) => match operation {
                             CollectionOperation::Add => values.push(value),
                             CollectionOperation::Remove => {
@@ -207,7 +256,7 @@ impl Evaluator {
                         }
                     }
                     if let Value::String(key) = &index_value {
-                        if let Some(Value::Hash(values)) = self.variables.get_mut(name) {
+                        if let Some(Value::Hash(values)) = self.lookup_mut(name) {
                             values.insert(key.clone(), value);
                             continue;
                         }
@@ -220,7 +269,7 @@ impl Evaluator {
                             ));
                         }
                     };
-                    match self.variables.get_mut(name) {
+                    match self.lookup_mut(name) {
                         Some(Value::Array(values)) | Some(Value::List(values)) => {
                             if index >= values.len() {
                                 return Err(
@@ -249,7 +298,7 @@ impl Evaluator {
                         );
                     }
                     for (name, value) in names.iter().zip(values) {
-                        self.variables.insert(name.clone(), value);
+                        self.define(name.clone(), value);
                     }
                 }
                 Stmt::Function {
@@ -275,28 +324,24 @@ impl Evaluator {
                     iterable,
                     body,
                 } => {
-                    let previous = self.variables.get(name).cloned();
                     let values = match self.evaluate(iterable)? {
                         Value::Array(values) | Value::List(values) | Value::Tuple(values) => values,
                         Value::Hash(values) | Value::Tree(values) => values.into_values().collect(),
                         _ => return Err(self.runtime_error("for requires a collection".into())),
                     };
+                    self.push_scope();
                     for value in values {
-                        self.variables.insert(name.clone(), value);
+                        self.define(name.clone(), value);
                         match self.execute_statements(body)? {
                             Flow::None | Flow::Continue => {}
                             Flow::Break => break,
-                            Flow::Return(value) => return Ok(Flow::Return(value)),
+                            Flow::Return(value) => {
+                                self.pop_scope();
+                                return Ok(Flow::Return(value));
+                            }
                         }
                     }
-                    match previous {
-                        Some(value) => {
-                            self.variables.insert(name.clone(), value);
-                        }
-                        None => {
-                            self.variables.remove(name);
-                        }
-                    }
+                    self.pop_scope();
                 }
                 Stmt::While { condition, body } => {
                     while match self.evaluate(condition)? {
@@ -420,8 +465,7 @@ impl Evaluator {
                 self.evaluate_pipeline(source, steps)
             }
             Expr::Identifier(name) => self
-                .variables
-                .get(name)
+                .lookup(name)
                 .cloned()
                 .ok_or_else(|| self.runtime_error(format!("unknown variable `{name}`"))),
             Expr::Unary { operator, operand } => {
@@ -603,7 +647,7 @@ impl Evaluator {
                         _ => Err(self.runtime_error("matrix row is not an array".into())),
                     };
                 }
-                if let Value::Hash(values) = target.clone() {
+                if let Value::Hash(values) | Value::Tree(values) = target.clone() {
                     if let Value::String(key) = index_value {
                         return values
                             .get(&key)
@@ -659,21 +703,28 @@ impl Evaluator {
                 self.ensure_type(value, expected, parameter)?;
             }
         }
-        let saved_variables = self.variables.clone();
+        self.push_scope();
         let saved_variable_types = self.variable_types.clone();
         for ((parameter, _), value) in function.parameters.iter().zip(values) {
-            self.variables.insert(parameter.clone(), value);
+            self.define(parameter.clone(), value);
         }
         let result = self.execute_statements(&function.body);
-        self.variables = saved_variables;
         self.variable_types = saved_variable_types;
-        let result = match result? {
-            Flow::None => Value::Unit,
-            Flow::Return(value) => value,
-            Flow::Break | Flow::Continue => {
-                return Err(self.runtime_error("break/continue used outside a loop".into()));
+        let result = match result {
+            Ok(flow) => match flow {
+                Flow::None => Value::Unit,
+                Flow::Return(value) => value,
+                Flow::Break | Flow::Continue => {
+                    self.pop_scope();
+                    return Err(self.runtime_error("break/continue used outside a loop".into()));
+                }
+            },
+            Err(error) => {
+                self.pop_scope();
+                return Err(error);
             }
         };
+        self.pop_scope();
         if let Some(expected) = &function.return_type {
             self.ensure_type(&result, expected, name)?;
         }
@@ -692,16 +743,9 @@ impl Evaluator {
         mut values: Vec<Value>,
         steps: &[PipelineStep],
     ) -> Result<Value, SimplyError> {
-        let previous_item = self.variables.get("item").cloned();
+        self.push_scope();
         let result = self.evaluate_pipeline_steps(&mut values, steps);
-        match previous_item {
-            Some(value) => {
-                self.variables.insert("item".into(), value);
-            }
-            None => {
-                self.variables.remove("item");
-            }
-        }
+        self.pop_scope();
         result
     }
 
@@ -715,7 +759,7 @@ impl Evaluator {
                 PipelineStep::Filter(expression) => {
                     let mut kept = Vec::new();
                     for value in values.drain(..) {
-                        self.variables.insert("item".into(), value.clone());
+                        self.define("item".into(), value.clone());
                         match self.evaluate(expression)? {
                             Value::Bool(true) => kept.push(value),
                             Value::Bool(false) => {}
@@ -731,7 +775,7 @@ impl Evaluator {
                 PipelineStep::Map(expression) => {
                     let mut mapped = Vec::new();
                     for value in values.drain(..) {
-                        self.variables.insert("item".into(), value);
+                        self.define("item".into(), value);
                         mapped.push(self.evaluate(expression)?);
                     }
                     *values = mapped;

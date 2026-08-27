@@ -204,6 +204,35 @@ fn checks_expression_function_and_control_flow_types() {
 }
 
 #[test]
+fn checks_tuple_and_matrix_index_shapes() {
+    let (success, _, error) = check_source("point is (10, \"Ada\")\nSay point[2]\n");
+    assert!(!success);
+    assert!(error.contains("tuple index out of bounds"));
+
+    let (success, _, error) = check_source("m is matrix [[1, 2]]\nSay m[0]\n");
+    assert!(!success);
+    assert!(
+        error.contains("matrix index requires a tuple of two integers"),
+        "unexpected matrix index error: {error}"
+    );
+}
+
+#[test]
+fn indexes_tree_values_consistently_with_hash_values() {
+    let (success, error) =
+        run_source("profile is tree:\n    name is \"Ada\"\nend\nSay profile[\"name\"]\n");
+    assert!(success, "unexpected tree index error: {error}");
+}
+
+#[test]
+fn keeps_function_bindings_local() {
+    let (success, _, error) =
+        check_source("fn make():\n    local is 42\n    return local\nend\nSay make()\nSay local\n");
+    assert!(!success);
+    assert!(error.contains("unknown variable `local`"));
+}
+
+#[test]
 fn accepts_compact_minus_expressions_and_inline_comments() {
     let (success, message) = run_source("value is 5 # keep the newline\nSay value-2\nSay -value\n");
     assert!(success, "unexpected error: {message}");
