@@ -1,8 +1,8 @@
 # Simply
 
-**Simply** is a small programming language written in Rust.
+A small programming language written in Rust.
 
-The idea behind it is pretty straightforward: programming should be easy to read without hiding what's actually happening.
+Simply is built around a straightforward idea: programming should be easy to read without hiding what is actually happening.
 
 ```si
 name is "Simply"
@@ -12,173 +12,195 @@ age -> age + 1
 
 Say "Hello, " + name
 Say age
+```
 
-The syntax is intentionally simple. There are no semicolons everywhere, declarations use is, reassignment uses ->, and blocks end with end.
+The syntax is intentionally simple. Variable declarations use `is`, reassignment uses `->`, and blocks end explicitly with `end`.
 
-Simply is currently an interpreted language. It already has a lexer, parser, AST, semantic checker, evaluator, formatter, CLI, tests, and a collection of examples.
+Simply is currently an interpreted language. The project includes a lexer, parser, abstract syntax tree, semantic checker, evaluator, formatter, command-line interface, tests, and a growing collection of examples.
 
-> Simply is still a work in progress. Things may change as the language evolves.
-
-
-
-
----
-
-What Simply can do
-
-A few things are already working:
-
-Simple variable declarations with is
-
-Type inference and optional type annotations
-
-Type-safe reassignment with ->
-
-Integers, floats, booleans, strings, and Unit
-
-Arrays, lists, tuples, hashes, trees, and matrices
-
-if / else
-
-for and while
-
-break and continue
-
-Functions
-
-Static checking with check
-
-Collection pipelines with filter, map, sum, and count
-
-Built-in functions such as range, length, contains, and type_of
-
-Loading values from another source file with open
-
-Explicit message dispatch with send
-
-Token, AST, and formatting inspection
-
-Source-aware error messages
-
-
-There's still a lot to build, but the core language is already usable.
-
+> **Note**
+>
+> Simply is still a work in progress. The language and its features may change as the project evolves.
 
 ---
 
-Try it
+## What Simply Can Do
 
-From source
+The current implementation includes:
 
-You'll need:
+* Variable declarations with `is`
+* Type inference and optional type annotations
+* Type-safe reassignment with `->`
+* Integers, floats, booleans, strings, and `Unit`
+* Arrays, lists, tuples, hashes, trees, and matrices
+* Conditional execution with `if` and `else`
+* Iteration with `for` and `while`
+* `break` and `continue`
+* Functions with parameters and return values
+* Static semantic checking with `check`
+* Collection pipelines with `filter`, `map`, `sum`, and `count`
+* Built-in functions such as `range`, `length`, `contains`, and `type_of`
+* Loading values from another source file with `open`
+* Explicit message dispatch with `send`
+* Token inspection
+* AST inspection
+* Source formatting
+* Source-aware diagnostics and error messages
 
-Rust
+There is still more to build, but the core language is already usable.
 
-Cargo
+---
 
+## Getting Started
 
-Clone the repository and run an example:
+### Requirements
 
+To build Simply from source, you need:
+
+* Rust
+* Cargo
+
+Run the smoke example directly from the project root:
+
+```bash
 cargo run -- examples/99-smoke/smoke.si
+```
 
 You can also install the CLI locally:
 
+```bash
 cargo install --path .
+```
 
-After that:
+After installation, run a Simply program with:
 
+```bash
 simply examples/99-smoke/smoke.si
+```
 
-That's it.
+The CLI accepts `.si` source files.
 
-Prebuilt releases
+### Prebuilt Releases
 
-Prebuilt binaries are available on the GitHub Releases page when a release is published.
+Prebuilt binaries can be published through the project's GitHub Releases page.
 
-After installing Simply, you should be able to run:
+Once Simply is installed, programs can be executed directly:
 
+```bash
 simply program.si
-
-The CLI accepts .si source files.
-
+```
 
 ---
 
-CLI
+## CLI
 
-The CLI is intentionally small.
+The command-line interface is intentionally small.
 
+```text
 simply <file.si>
 simply check <file.si>
+simply --check <file.si>
 simply --tokens <file.si>
 simply --ast <file.si>
 simply --format <file.si>
 simply --help
+```
 
-Run a program
+### Run a Program
 
+```bash
 simply examples/01-basics/values.si
+```
 
-Check a program
+### Check a Program
 
-check runs the lexer, parser, and semantic analyzer without actually executing the program.
+The `check` command runs the lexer, parser, and semantic analyzer without executing the program.
 
+```bash
 simply check examples/99-smoke/smoke.si
+```
 
 You can also use:
 
+```bash
 simply --check examples/99-smoke/smoke.si
+```
 
-Inspect tokens or AST
+### Inspect Tokens
 
-Useful when working on the language itself:
-
+```bash
 simply --tokens examples/01-basics/values.si
+```
+
+### Inspect the AST
+
+```bash
 simply --ast examples/01-basics/values.si
+```
 
-Format source
+These commands are useful when debugging programs or working on the language implementation.
 
+### Format Source
+
+```bash
 simply --format examples/04-control-flow/while.si
+```
 
-Formatting currently prints the result instead of modifying the file.
+Formatting currently prints the formatted result to standard output instead of modifying the source file.
 
+### Help
+
+```bash
+simply --help
+```
 
 ---
 
-The Language
+## The Language
 
-Variables
+### Variables
 
-Variables use is:
+Variables are declared using `is`:
 
+```si
 name is "Ada"
 age is 18
 active is true
+```
 
-Simply figures out the type from the value.
+Simply infers the type from the assigned value.
 
-You can also write the type explicitly:
+Types can also be written explicitly:
 
+```si
 age as Int is 18
+
 scores as List[Int] is list [10, 20, 30]
+```
 
-To change a variable, use ->:
+To update an existing variable, use `->`:
 
+```si
 age is 18
+
 age -> age + 1
+```
 
-A variable keeps its type, so this isn't allowed:
+Variables are type-safe, so changing a variable to an incompatible type is rejected:
 
+```si
 age is 18
-age -> "hello"
 
+age -> "hello"
+```
 
 ---
 
-Conditions
+### Conditions
 
-Blocks end with end.
+Blocks end explicitly with `end`.
 
+```si
 score is 75
 
 if score >= 60:
@@ -186,38 +208,56 @@ if score >= 60:
 else:
     Say "try again"
 end
+```
 
-Conditions must evaluate to Bool.
-
+Conditions must evaluate to `Bool`.
 
 ---
 
-Loops
+### Loops
 
-for
+#### `for`
 
+```si
 for name in list ["Ada", "Lin"]:
     Say name
 end
+```
 
-while
+#### `while`
 
+```si
 count is 0
 
 while count < 3:
     Say count
     count -> count + 1
 end
+```
 
-Both break and continue are supported.
+Both `break` and `continue` are supported:
 
+```si
+for number in range(0, 10):
+    if number == 5:
+        continue
+    end
+
+    if number == 8:
+        break
+    end
+
+    Say number
+end
+```
 
 ---
 
-Functions
+### Functions
 
-Functions use fn:
+Functions are declared with `fn`.
 
+```si
 fn add(left as Int, right as Int) gives Int:
     return left + right
 end
@@ -225,21 +265,23 @@ end
 total is add(10, 20)
 
 Say total
+```
 
-Parameters and return types can be left untyped when you don't need explicit annotations.
+Parameters and return types can be omitted when explicit annotations are unnecessary.
 
-Functions have their own local scope and support return.
-
+Functions have their own local scope and support `return`.
 
 ---
 
-Collections
+## Collections
 
-Simply currently has several collection types.
+Simply currently supports several collection types.
 
-Lists and arrays
+### Arrays and Lists
 
+```si
 cities is array ["Jakarta", "Citra", "Lima"]
+
 queue is list ["first", "second"]
 
 queue add "third"
@@ -247,36 +289,45 @@ queue remove "first"
 
 Say cities[1]
 Say queue
+```
 
-Tuples
+### Tuples
 
+```si
 point is (10, "Ada")
 
 (x, y) is point
 
 Say x
 Say point[1]
+```
 
-Hashes
+### Hashes
 
+```si
 settings is hash:
     retries is 3
     mode is "quiet"
 end
 
 Say settings["mode"]
+```
 
 Trees and matrices are also supported.
 
-For examples, see examples/06-collections.
+More collection examples can be found in:
 
+```text
+examples/06-collections/
+```
 
 ---
 
-Pipelines
+## Pipelines
 
-Pipelines are a way to process collections step by step.
+Pipelines provide a simple way to process collections step by step.
 
+```si
 numbers is list [10, 20, 30]
 
 total is pipeline:
@@ -287,129 +338,130 @@ total is pipeline:
 end
 
 Say total
+```
 
-Current pipeline stages are:
+Current pipeline stages include:
 
-filter
-
-map
-
-sum
-
-count
-
-
+* `filter`
+* `map`
+* `sum`
+* `count`
 
 ---
 
-Loading another source file
+## Loading Another Source File
 
-open can load a value from another Simply source file:
+The `open` statement loads a value from another Simply source file.
 
+```si
 open "imported-values.si" as imported
 
 Say imported[1]
+```
 
-The other file can return a value:
+The imported source file can return a value:
 
+```si
 return list [10, 20, 30]
+```
 
-Paths are resolved relative to the file doing the open.
+Paths are resolved relative to the file performing the `open`.
 
-This is currently more like loading a source value than a full module/import system.
-
+This mechanism currently behaves more like loading a source value than a full module or import system.
 
 ---
 
-Message Dispatch
+## Message Dispatch
 
-Simply also has a small message-dispatch mechanism.
+Simply includes a small and explicit message-dispatch mechanism.
 
 A function can receive a value:
 
+```si
 fn greet(self):
     return "Hello " + self["name"]
 end
+```
 
-And a value can contain the data:
+A value can contain the associated data:
 
+```si
 person is hash:
     name is "Ada"
 end
+```
 
-Then:
+A message can then be dispatched with `send`:
 
+```si
 Say send(person, "greet")
+```
 
-There are no classes, constructors, inheritance, or hidden method machinery here. The behavior is deliberately explicit.
-
-
----
-
-Built-ins
-
-Some of the currently available built-ins:
-
-Function	What it does
-
-range(start, end)	Creates a range of integers
-length(value)	Gets the size of a collection or string
-count(value)	Counts a value/collection
-contains(collection, value)	Checks whether something exists
-type_of(value)	Returns the runtime type name
-print(value)	Prints a value
-
-
-You can find working examples in examples/08-standard-library.
-
+There are no classes, constructors, inheritance, or hidden method machinery. The behavior is intentionally explicit.
 
 ---
 
-Errors and check
+## Built-ins
 
-One of the things I'm trying to keep important in Simply is getting useful errors instead of just crashing somewhere deep inside the interpreter.
+Some of the currently available built-in functions are:
+
+| Function                      | Description                                |
+| ----------------------------- | ------------------------------------------ |
+| `range(start, end)`           | Creates a range of integers                |
+| `length(value)`               | Returns the size of a collection or string |
+| `count(value)`                | Counts a collection or value               |
+| `contains(collection, value)` | Checks whether a value exists              |
+| `type_of(value)`              | Returns the runtime type name              |
+| `print(value)`                | Prints a value                             |
+
+Working examples can be found in:
+
+```text
+examples/08-standard-library/
+```
+
+---
+
+## Errors and Static Checking
+
+One of the goals of Simply is to provide useful errors instead of failing somewhere deep inside the interpreter.
 
 For example:
 
+```bash
 simply check program.si
+```
 
-can catch things such as:
+The semantic checker can detect issues such as:
 
-Unknown variables or functions
+* Unknown variables or functions
+* Type mismatches
+* Invalid reassignment
+* Incorrect function arguments
+* Invalid return types
+* Invalid use of `break` or `continue`
+* Invalid conditions
+* Collection and indexing problems
+* Pipeline mistakes
 
-Type mismatches
+When an error occurs, Simply attempts to point to the relevant location:
 
-Invalid reassignment
-
-Wrong function arguments
-
-Invalid return types
-
-Invalid break / continue
-
-Invalid conditions
-
-Collection and indexing problems
-
-Pipeline mistakes
-
-
-When something goes wrong, Simply tries to point to the actual location:
-
+```text
 Error: Semantic error at program.si:2:1: error[E0003]: type mismatch
 
   2 | age -> "hello"
     | ^
+```
 
-Some problems can only be known at runtime, so those are still handled by the evaluator.
-
+Some problems can only be detected at runtime. Those are handled by the evaluator.
 
 ---
 
-Under the Hood
+## Under the Hood
 
-The interpreter is intentionally split into a few straightforward stages:
+The interpreter is divided into a small set of straightforward stages:
 
+```text
 Source
   ↓
 Lexer
@@ -423,30 +475,30 @@ Semantic Analyzer
 Evaluator
   ↓
 Value
+```
 
-The main pieces live in src/:
+The main components live in `src/`:
 
-File	Purpose
-
-lexer.rs	Turns source code into tokens
-parser.rs	Turns tokens into an AST
-ast.rs	Defines the language structure
-semantic.rs	Checks names, scopes, and types
-evaluator.rs	Executes programs
-error.rs	Error reporting
-formatter.rs	Source formatting
-main.rs	CLI
-
+| File           | Purpose                                 |
+| -------------- | --------------------------------------- |
+| `lexer.rs`     | Converts source code into tokens        |
+| `parser.rs`    | Converts tokens into an AST             |
+| `ast.rs`       | Defines the language structure          |
+| `semantic.rs`  | Checks names, scopes, and types         |
+| `evaluator.rs` | Executes programs                       |
+| `error.rs`     | Handles diagnostics and error reporting |
+| `formatter.rs` | Formats source code                     |
+| `main.rs`      | Provides the CLI entry point            |
 
 The implementation is written in Rust.
 
-
 ---
 
-Examples
+## Examples
 
-If you want to see what Simply looks like without reading the whole README, start here:
+The repository includes examples organized by language feature:
 
+```text
 examples/
 ├── 01-basics/
 ├── 02-variables/
@@ -458,65 +510,77 @@ examples/
 ├── 08-standard-library/
 ├── 09-quality/
 └── 99-smoke/
+```
 
-The 99-smoke example is a good starting point if you just want to see the language running.
+The `99-smoke` example is a good starting point if you want to quickly see the language in action.
 
-Run one with:
+Run an example with:
 
+```bash
 cargo run -- examples/01-basics/values.si
-
+```
 
 ---
 
-Development
+## Development
 
-If you're working on Simply itself:
+If you're working on Simply itself, run the test suite:
 
+```bash
 cargo test
+```
 
 Format the code:
 
+```bash
 cargo fmt
+```
 
-Check formatting without changing anything:
+Check formatting without modifying files:
 
+```bash
 cargo fmt -- --check
+```
 
-Before pushing changes, I usually recommend:
+Before pushing changes, it is recommended to run:
 
+```bash
 cargo fmt -- --check
 cargo test
+```
 
-When changing the language, try to keep these three things together:
+When changing the language, try to keep these parts aligned:
 
 1. The implementation
-
-
 2. The tests
-
-
 3. The examples
+4. The documentation
 
-
-
-That makes it much easier to tell whether a language feature actually works end-to-end.
-
+This makes it easier to verify that a feature works correctly from implementation through user-facing behavior.
 
 ---
 
-Project Status
+## Project Status
 
-Simply is not finished yet.
+Simply is still under active development.
 
-It's currently an interpreter with static semantic checking and a growing standard library. There is no bytecode VM, native compiler backend, package manager, or class/inheritance system at the moment.
+It is currently an interpreter with static semantic checking and a growing standard library.
 
-Those may come later, but the current priority is keeping the core language small, understandable, and consistent.
+The project does not currently include:
 
+* A bytecode VM
+* A native compiler backend
+* A package manager
+* Classes
+* Inheritance
+
+These features may come later, but the current priority is keeping the core language small, understandable, explicit, and consistent.
 
 ---
 
-Repository Structure
+## Repository Structure
 
+```text
 .
 ├── src/
 │   ├── ast.rs
@@ -535,33 +599,31 @@ Repository Structure
 ├── tests/
 │   └── integration_examples.rs
 ├── Cargo.toml
+├── LICENSE
 └── README.md
-
-
----
-
-Contributing
-
-Simply is still evolving, so feedback and improvements are welcome.
-
-If you change language behavior, please try to update the relevant:
-
-implementation
-
-tests
-
-examples
-
-documentation
-
-
-Small changes are fine too. Even finding a confusing error message or an awkward piece of syntax is useful feedback.
-
+```
 
 ---
 
-License
+## Contributing
+
+Simply is still evolving, and feedback and improvements are welcome.
+
+When changing language behavior, please update the relevant:
+
+* Implementation
+* Tests
+* Examples
+* Documentation
+
+Small contributions are welcome too. Finding a confusing error message, awkward syntax, or inconsistent behavior can be just as useful as adding a new feature.
+
+---
+
+## License
 
 Simply is licensed under the MIT License.
 
 Copyright (c) 2026 Simply Contributors.
+
+See the [LICENSE](LICENSE) file for more information.
