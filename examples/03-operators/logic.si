@@ -1,8 +1,9 @@
-# Comparisons and short-circuit boolean logic
+# Comparisons, boolean operators, and short-circuit evaluation
 age is 21
 active is true
 
 Say age >= 18
 Say active and age < 30
+Say not false
 Say false and missing_value
 Say true or missing_value

@@ -1,10 +1,11 @@
 use crate::{
     ast::{
-        BinaryOperator, CollectionOperation, Expr, Literal, PipelineStep, Program, Stmt, Type,
+        BinaryOperator, CollectionOperation, Expr, Literal, PipelineStep, Program, Stmt,
         UnaryOperator,
     },
-    error::{SimplyError, Span},
+    error::{DiagnosticCode, SimplyError, Span},
     lexer::{Token, TokenKind},
+    types::Type,
 };
 
 pub struct Parser {
@@ -13,7 +14,17 @@ pub struct Parser {
 }
 
 impl Parser {
-    pub fn new(tokens: Vec<Token>) -> Self {
+    pub fn new(mut tokens: Vec<Token>) -> Self {
+        let eof_span = tokens
+            .last()
+            .map(|token| token.span.clone())
+            .unwrap_or_else(|| Span::new(0, 0));
+        if !matches!(tokens.last().map(|token| &token.kind), Some(TokenKind::Eof)) {
+            tokens.push(Token {
+                kind: TokenKind::Eof,
+                span: eof_span,
+            });
+        }
         Self { tokens, current: 0 }
     }
 
@@ -389,14 +400,15 @@ impl Parser {
             }
             _ => Err(SimplyError::Parse {
                 span: token.span,
+                code: DiagnosticCode::ExpectedExpression,
                 message: "expected a value after the statement".into(),
             }),
         }?;
 
-        if let Expr::Identifier(name) = &expression {
-            if self.check(TokenKind::LeftParen) {
-                expression = self.call_expression(name.clone())?;
-            }
+        if let Expr::Identifier(name) = &expression
+            && self.check(TokenKind::LeftParen)
+        {
+            expression = self.call_expression(name.clone())?;
         }
         loop {
             if self.match_kind(TokenKind::Transpose) {
@@ -602,6 +614,7 @@ impl Parser {
     fn error_here(&self, message: &str) -> SimplyError {
         SimplyError::Parse {
             span: self.peek().span.clone(),
+            code: DiagnosticCode::UnexpectedToken,
             message: message.into(),
         }
     }
@@ -683,6 +696,23 @@ mod tests {
         assert!(matches!(
             inner(&program.statements[1]),
             Stmt::Say(Expr::Call { .. })
+        ));
+    }
+
+    #[test]
+    fn handles_empty_or_eof_less_token_streams_without_panicking() {
+        assert!(Parser::new(Vec::new()).parse().is_ok());
+
+        let tokens = vec![Token {
+            kind: TokenKind::Say,
+            span: Span::new(1, 1),
+        }];
+        assert!(matches!(
+            Parser::new(tokens).parse(),
+            Err(SimplyError::Parse {
+                code: DiagnosticCode::ExpectedExpression,
+                ..
+            })
         ));
     }
 }

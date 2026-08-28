@@ -1,28 +1,8 @@
-use crate::error::Span;
+use crate::{error::Span, types::Type};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub statements: Vec<Stmt>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Type {
-    Unknown,
-    Unit,
-    String,
-    Int,
-    Float,
-    Bool,
-    Array(Box<Type>),
-    List(Box<Type>),
-    Tuple(Vec<Type>),
-    Hash,
-    Tree,
-    Matrix,
-    Function {
-        parameters: Vec<Option<Box<Type>>>,
-        return_type: Option<Box<Type>>,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

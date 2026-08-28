@@ -61,6 +61,86 @@ fn runs_basic_values() {
 }
 
 #[test]
+fn every_runnable_example_is_a_conformance_regression() {
+    let runnable_examples = [
+        "examples/01-basics/values.si",
+        "examples/02-variables/assignment.si",
+        "examples/03-operators/arithmetic.si",
+        "examples/03-operators/logic.si",
+        "examples/04-control-flow/break-continue.si",
+        "examples/04-control-flow/conditionals.si",
+        "examples/04-control-flow/loops.si",
+        "examples/04-control-flow/while.si",
+        "examples/05-functions/functions.si",
+        "examples/06-collections/arrays-lists.si",
+        "examples/06-collections/hash-tree.si",
+        "examples/06-collections/matrices.si",
+        "examples/06-collections/tuples.si",
+        "examples/07-pipelines/collections.si",
+        "examples/08-standard-library/builtins.si",
+        "examples/08-standard-library/inspection.si",
+        "examples/09-quality/message-objects.si",
+        "examples/09-quality/scope-and-short-circuit.si",
+        "examples/99-smoke/smoke.si",
+    ];
+
+    for path in runnable_examples {
+        let output = run_example(path);
+        assert!(!output.is_empty(), "example produced no output: {path}");
+    }
+}
+
+#[test]
+fn cli_commands_use_expected_exit_codes_and_streams() {
+    let binary = env!("CARGO_BIN_EXE_simply");
+    let commands = [
+        vec!["examples/99-smoke/smoke.si"],
+        vec!["check", "examples/99-smoke/smoke.si"],
+        vec!["--check", "examples/99-smoke/smoke.si"],
+        vec!["--tokens", "examples/01-basics/values.si"],
+        vec!["--ast", "examples/01-basics/values.si"],
+        vec!["--format", "examples/01-basics/values.si"],
+        vec!["--help"],
+    ];
+
+    for arguments in commands {
+        let output = Command::new(binary)
+            .args(arguments)
+            .output()
+            .expect("failed to run Simply CLI command");
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+    }
+
+    let invalid = Command::new(binary)
+        .arg("examples/does-not-exist.si")
+        .output()
+        .expect("failed to run invalid Simply CLI command");
+    assert!(!invalid.status.success());
+    assert!(!invalid.stderr.is_empty());
+    assert!(invalid.stdout.is_empty());
+
+    let invalid_option = Command::new(binary)
+        .args(["--unknown", "examples/99-smoke/smoke.si"])
+        .output()
+        .expect("failed to run invalid option command");
+    assert!(!invalid_option.status.success());
+    assert!(
+        String::from_utf8_lossy(&invalid_option.stderr)
+            .contains("Error: Runtime error at simply: error[E0206]: unknown option `--unknown`")
+    );
+
+    let invalid_extension = Command::new(binary)
+        .arg("README.md")
+        .output()
+        .expect("failed to run invalid extension command");
+    assert!(!invalid_extension.status.success());
+    assert!(String::from_utf8_lossy(&invalid_extension.stderr).contains(
+        "Error: Runtime error at README.md: error[E0206]: Simply source files must use the .si extension"
+    ));
+}
+
+#[test]
 fn runs_functions_with_typed_parameters() {
     let output = run_example("examples/05-functions/functions.si");
     assert!(output.contains("Hello Alex"));
@@ -127,6 +207,7 @@ fn reports_runtime_errors() {
     assert!(type_error.contains("wrong type"));
     assert!(type_error.contains("expected Int, found String"));
     assert!(type_error.contains("1:1"));
+    assert!(type_error.contains("error[E0003]"));
 
     let (success, index_error) = run_source("values is array [1]\nSay values[2]\n");
     assert!(!success);
@@ -149,6 +230,87 @@ fn reports_runtime_errors() {
     let (success, overflow_error) = run_source("Say 9223372036854775807 + 1\n");
     assert!(!success);
     assert!(overflow_error.contains("integer arithmetic error"));
+    assert!(overflow_error.contains("error[E0203]"));
+}
+
+#[test]
+fn reports_stable_codes_for_lex_and_parse_errors() {
+    let (success, lex_error) = run_source("Say @\n");
+    assert!(!success);
+    assert!(lex_error.contains("error[E0101]"));
+    assert!(lex_error.contains("Say @"));
+
+    let (success, parse_error) = run_source("Say\n");
+    assert!(!success);
+    assert!(parse_error.contains("error[E0104]"));
+    assert!(parse_error.contains("1 | Say"));
+}
+
+#[test]
+fn rejects_malformed_programs_with_parse_diagnostics() {
+    for source in [
+        "values is array [1\n",
+        "fn add(value):\n    return value\n",
+        "if true:\n    Say \"yes\"\n",
+        "values is list [1]\nresult is pipeline:\n    values\n    filter item\n",
+        "values is list [1]\nSay values[0\n",
+    ] {
+        let (success, error) = run_source(source);
+        assert!(
+            !success,
+            "malformed source unexpectedly succeeded: {source}"
+        );
+        assert!(
+            error.contains("Parse error"),
+            "unexpected diagnostic: {error}"
+        );
+        assert!(error.contains("error[E010"), "missing parse code: {error}");
+    }
+}
+
+#[test]
+fn reports_structured_diagnostics_for_all_malformed_input_shapes() {
+    let cases = [
+        ("Say @\n", "Lex error", "error[E0101]", "1:5"),
+        ("Say\n", "Parse error", "error[E0104]", "1:4"),
+        ("values is array [1\n", "Parse error", "error[E0103]", "2:1"),
+        ("Say \"unterminated\n", "Lex error", "error[E0102]", "1:5"),
+        (
+            "fn broken(value):\n    return value\n",
+            "Parse error",
+            "error[E0103]",
+            "3:1",
+        ),
+        (
+            "if true:\n    Say true\n",
+            "Parse error",
+            "error[E0103]",
+            "3:1",
+        ),
+        (
+            "values is list [1]\nresult is pipeline:\n    values\n    nope\nend\n",
+            "Parse error",
+            "error[E0103]",
+            "4:5",
+        ),
+        (
+            "values is list [1]\nSay values[0\n",
+            "Parse error",
+            "error[E0103]",
+            "2:13",
+        ),
+    ];
+
+    for (source, category, code, location) in cases {
+        let (success, error) = run_source(source);
+        assert!(
+            !success,
+            "malformed source unexpectedly succeeded: {source}"
+        );
+        assert!(error.contains(category), "missing category in: {error}");
+        assert!(error.contains(code), "missing code in: {error}");
+        assert!(error.contains(location), "missing location in: {error}");
+    }
 }
 
 #[test]
@@ -183,6 +345,15 @@ fn checks_programs_without_executing_them() {
 }
 
 #[test]
+fn diagnostics_include_source_path_and_context() {
+    let (success, _, error) = check_source("Say missing\n");
+    assert!(!success);
+    assert!(error.contains("simply-check-"));
+    assert!(error.contains("1 | Say missing"));
+    assert!(error.contains("| ^"));
+}
+
+#[test]
 fn checks_expression_function_and_control_flow_types() {
     let (success, _, error) = check_source("Say 10 + \"hello\"\n");
     assert!(!success);
@@ -201,6 +372,47 @@ fn checks_expression_function_and_control_flow_types() {
     let (success, _, error) = check_source("return 1\n");
     assert!(!success);
     assert!(error.contains("return used outside a function"));
+}
+
+#[test]
+fn checks_builtin_collection_arguments() {
+    let (success, _, error) = check_source("contains(10, 10)\n");
+    assert!(!success);
+    assert!(error.contains("error[E0012]"));
+
+    let (success, _, error) = check_source("length(10)\n");
+    assert!(!success);
+    assert!(error.contains("error[E0012]"));
+
+    let (success, _, error) = check_source("contains(\"Ada\", 10)\n");
+    assert!(!success);
+    assert!(error.contains("expected String, found Int"));
+}
+
+#[test]
+fn checks_empty_tuple_iteration_without_rejecting_valid_code() {
+    let (success, _, error) = check_source("for item in ():\nend\n");
+    assert!(success, "unexpected check error: {error}");
+}
+
+#[test]
+fn malformed_user_programs_return_errors_without_panicking() {
+    for source in [
+        "Say \"unterminated",
+        "values is list [1,",
+        "fn broken(value):\n    return value\n",
+        "values is list [1]\nresult is pipeline:\n    values\n    nope\nend\n",
+    ] {
+        let (success, error) = run_source(source);
+        assert!(
+            !success,
+            "malformed source unexpectedly succeeded: {source}"
+        );
+        assert!(
+            !error.contains("panicked at"),
+            "unexpected panic output: {error}"
+        );
+    }
 }
 
 #[test]
@@ -230,6 +442,20 @@ fn keeps_function_bindings_local() {
         check_source("fn make():\n    local is 42\n    return local\nend\nSay make()\nSay local\n");
     assert!(!success);
     assert!(error.contains("unknown variable `local`"));
+}
+
+#[test]
+fn keeps_branch_bindings_local_at_runtime() {
+    let (success, error) = run_source("if true:\n    branch_value is 42\nend\nSay branch_value\n");
+    assert!(!success);
+    assert!(error.contains("unknown variable `branch_value`"));
+}
+
+#[test]
+fn keeps_runtime_types_aligned_with_shadowed_scopes() {
+    let source = "value is 1\nif true:\n    value is \"inner\"\n    value -> \"updated\"\nend\nvalue -> 2\nfn update(value):\n    value -> \"local\"\n    return value\nend\nSay update(\"initial\")\nSay value\n";
+    let (success, error) = run_source(source);
+    assert!(success, "shadowed bindings produced an error: {error}");
 }
 
 #[test]
@@ -269,6 +495,107 @@ fn imports_a_returned_value_relative_to_the_source_file() {
 
     assert!(output.status.success());
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "8");
+}
+
+#[test]
+fn resolves_nested_and_absolute_imports_without_using_the_working_directory() {
+    let root = std::env::temp_dir().join(format!("simply-nested-import-{}", std::process::id()));
+    let nested = root.join("nested");
+    let leaf = root.join("leaf.si");
+    let middle = nested.join("middle.si");
+    let main = root.join("main.si");
+    fs::create_dir_all(&nested).expect("failed to create nested import directory");
+    fs::write(&leaf, "return list [11]\n").expect("failed to write leaf source");
+    fs::write(&middle, "open \"../leaf.si\" as values\nreturn values\n")
+        .expect("failed to write middle source");
+    let absolute_leaf = leaf.to_string_lossy().replace('\\', "\\\\");
+    fs::write(
+        &main,
+        format!(
+            "open \"nested/middle.si\" as nested\nopen \"{absolute_leaf}\" as absolute\nSay nested[0]\nSay absolute[0]\n"
+        ),
+    )
+    .expect("failed to write main source");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .arg(&main)
+        .current_dir(&nested)
+        .output()
+        .expect("failed to run nested import source");
+    let _ = fs::remove_dir_all(root);
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "11\n11");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn reports_missing_imports_with_structured_diagnostics() {
+    let root = std::env::temp_dir().join(format!("simply-missing-import-{}", std::process::id()));
+    let main = root.join("main.si");
+    fs::create_dir_all(&root).expect("failed to create missing import directory");
+    fs::write(&main, "open \"missing.si\" as missing\n")
+        .expect("failed to write missing import source");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .arg(&main)
+        .output()
+        .expect("failed to run missing import source");
+    let _ = fs::remove_dir_all(root);
+
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(error.contains("Runtime error"));
+    assert!(error.contains("error[E0204]"));
+    assert!(error.contains("1 | open \"missing.si\" as missing"));
+}
+
+#[test]
+fn reports_circular_imports_without_recursing_forever() {
+    let root = std::env::temp_dir().join(format!("simply-circular-import-{}", std::process::id()));
+    let first = root.join("a.si");
+    let second = root.join("b.si");
+    fs::create_dir_all(&root).expect("failed to create circular import directory");
+    fs::write(&first, "open \"b.si\" as b\nreturn b\n")
+        .expect("failed to write first circular source");
+    fs::write(&second, "open \"a.si\" as a\nreturn a\n")
+        .expect("failed to write second circular source");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .arg(&first)
+        .output()
+        .expect("failed to run circular import source");
+    let _ = fs::remove_dir_all(root);
+
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(error.contains("cyclic import"));
+    assert!(error.contains("error[E0204]"));
+}
+
+#[test]
+fn resolves_nested_imports_independently_of_working_directory() {
+    let root = std::env::temp_dir().join(format!("simply-cwd-import-{}", std::process::id()));
+    let source_dir = root.join("sources");
+    let unrelated_dir = root.join("unrelated");
+    fs::create_dir_all(&source_dir).expect("failed to create source directory");
+    fs::create_dir_all(&unrelated_dir).expect("failed to create unrelated directory");
+    let imported = source_dir.join("values.si");
+    let main = source_dir.join("main.si");
+    fs::write(&imported, "return list [7, 8, 9]\n").expect("failed to write imported source");
+    fs::write(&main, "open \"values.si\" as values\nSay values[1]\n")
+        .expect("failed to write main source");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .arg(&main)
+        .current_dir(&unrelated_dir)
+        .output()
+        .expect("failed to run source from unrelated directory");
+    let _ = fs::remove_dir_all(root);
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "8");
+    assert!(output.stderr.is_empty());
 }
 
 #[test]

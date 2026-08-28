@@ -1,8 +1,13 @@
-# Named values for records and nested data
+# Hashes and trees support fields, string indexing, and nesting
 profile is hash:
     name is "Ada"
     role is "builder"
 end
 
-Say profile["name"]
+catalog is tree:
+    featured is profile
+end
+
+Say profile.name
 Say profile["role"]
+Say catalog["featured"].name

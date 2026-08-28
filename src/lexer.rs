@@ -1,4 +1,4 @@
-use crate::error::{SimplyError, Span};
+use crate::error::{DiagnosticCode, SimplyError, Span};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
@@ -138,6 +138,7 @@ impl<'a> Lexer<'a> {
                 _ => {
                     return Err(SimplyError::Lex {
                         span: Span::new(self.line, self.column),
+                        code: DiagnosticCode::InvalidCharacter,
                         message: format!("unexpected character `{ch}`"),
                     });
                 }
@@ -287,6 +288,7 @@ impl<'a> Lexer<'a> {
             if self.index == exp_start {
                 return Err(SimplyError::Lex {
                     span,
+                    code: DiagnosticCode::InvalidCharacter,
                     message: "expected digits after exponent".into(),
                 });
             }
@@ -299,6 +301,7 @@ impl<'a> Lexer<'a> {
                 Err(_) => {
                     return Err(SimplyError::Lex {
                         span,
+                        code: DiagnosticCode::InvalidCharacter,
                         message: format!("invalid floating-point number `{text}`"),
                     });
                 }
@@ -309,6 +312,7 @@ impl<'a> Lexer<'a> {
                 Err(_) => {
                     return Err(SimplyError::Lex {
                         span,
+                        code: DiagnosticCode::InvalidCharacter,
                         message: format!("invalid integer `{text}`"),
                     });
                 }
@@ -328,6 +332,7 @@ impl<'a> Lexer<'a> {
                 None => {
                     return Err(SimplyError::Lex {
                         span,
+                        code: DiagnosticCode::UnterminatedString,
                         message: "unterminated string".into(),
                     });
                 }
@@ -342,6 +347,7 @@ impl<'a> Lexer<'a> {
                     self.advance();
                     let escaped = self.peek().ok_or_else(|| SimplyError::Lex {
                         span: span.clone(),
+                        code: DiagnosticCode::UnterminatedString,
                         message: "unterminated escape sequence".into(),
                     })?;
                     self.advance();
@@ -354,6 +360,7 @@ impl<'a> Lexer<'a> {
                         other => {
                             return Err(SimplyError::Lex {
                                 span,
+                                code: DiagnosticCode::InvalidCharacter,
                                 message: format!("unknown escape sequence `\\{other}`"),
                             });
                         }
@@ -362,6 +369,7 @@ impl<'a> Lexer<'a> {
                 Some('\n') => {
                     return Err(SimplyError::Lex {
                         span,
+                        code: DiagnosticCode::UnterminatedString,
                         message: "strings cannot contain a raw newline".into(),
                     });
                 }
@@ -400,7 +408,7 @@ mod tests {
                 TokenKind::Int(42),
                 TokenKind::Newline,
                 TokenKind::Say,
-                TokenKind::Float(3.14),
+                TokenKind::Float(314.0 / 100.0),
                 TokenKind::Newline,
                 TokenKind::Say,
                 TokenKind::True,
@@ -431,5 +439,30 @@ mod tests {
                 TokenKind::Eof,
             ]
         );
+    }
+
+    #[test]
+    fn tracks_unicode_and_windows_newlines_without_losing_tokens() {
+        let tokens = Lexer::new("Say \"é\"\r\nSay 2\r\n").tokenize().unwrap();
+        assert_eq!(tokens[1].kind, TokenKind::String("é".into()));
+        assert_eq!(tokens[2].span, Span::new(1, 9));
+        assert_eq!(tokens[3].span, Span::new(2, 1));
+    }
+
+    #[test]
+    fn rejects_unterminated_strings_as_lex_errors() {
+        let error = Lexer::new("Say \"unterminated").tokenize().unwrap_err();
+        assert!(matches!(error, SimplyError::Lex { .. }));
+        assert!(error.to_string().contains("E0102"));
+    }
+
+    #[test]
+    fn tracks_scalar_columns_after_unicode_source() {
+        let error = Lexer::new("Say \"é你好😀\"\nSay @\n")
+            .tokenize()
+            .unwrap_err();
+
+        assert_eq!(error.code(), DiagnosticCode::InvalidCharacter);
+        assert_eq!(error.span(), &Span::new(2, 5));
     }
 }

@@ -1,10 +1,18 @@
-# Function globals and lazy boolean expressions
+# Global reads, function-local shadowing, and lazy boolean expressions
 factor is 3
+value is 10
 
 fn scale(value as Int) gives Int:
-    return value * factor
+    local is value
+    return local * factor
+end
+
+if true:
+    value is "inner"
+    Say value
 end
 
 Say scale(7)
+Say value
 Say false and missing_value
 Say true or missing_value

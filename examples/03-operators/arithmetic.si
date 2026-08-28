@@ -1,8 +1,9 @@
-# Integer, float, compact operators, and precedence
+# Integer, float, mixed arithmetic, precedence, and negation
 whole is 8
 fraction is 2.5
 
 Say whole + 4
-Say whole*3-2
+Say whole * 3 - 2
 Say fraction / 2
+Say whole + fraction
 Say -whole

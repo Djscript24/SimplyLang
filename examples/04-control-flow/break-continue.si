@@ -1,4 +1,4 @@
-# Skip one value, then stop at another
+# Continue skips one value; break stops the loop
 for value in array [1, 2, 3, 4, 5]:
     if value == 2:
         continue

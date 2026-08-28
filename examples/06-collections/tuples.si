@@ -1,6 +1,7 @@
-# Fixed-size tuples and destructuring
+# Tuple indexing and destructuring
 coordinates is (12, 30)
 (x, y) is coordinates
 
 Say x
 Say y
+Say coordinates[0]

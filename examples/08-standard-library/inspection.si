@@ -1,5 +1,6 @@
-# Inspect values without changing them
+# Membership, type inspection, and print
 items is list ["one", "two"]
+
 Say contains(items, "one")
 Say contains(items, "missing")
 Say type_of(items)

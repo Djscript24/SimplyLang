@@ -1,9 +1,8 @@
-# Primitive values and readable output
+# Primitive values, comments, and readable output
 name is "Simply"
 version as Float is 3.14159
 ready is true
 
 Say "Hello, Simply!"
-Say name
 Say version
 Say ready

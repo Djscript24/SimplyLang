@@ -1,4 +1,4 @@
-# Functions with String, Int, and Float values
+# Typed parameters, return values, and Unit-returning functions
 fn greet(name as String):
     Say "Hello " + name
 end

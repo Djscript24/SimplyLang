@@ -1,4 +1,4 @@
-# Values receive messages through explicit behavior
+# Explicit message dispatch without classes
 fn greet(self):
     return "Hello " + self["name"]
 end

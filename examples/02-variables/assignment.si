@@ -1,10 +1,9 @@
-# Typed assignment and reassignment
+# Inferred and explicit types with reassignment
 scores as List[Int] is list [1, 2, 3]
 label as String is "starter"
 
-Say scores
-scores[1] -> 20
 label -> "updated"
 
 Say scores
+Say scores[1]
 Say label

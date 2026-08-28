@@ -1,4 +1,4 @@
-# Iterating over a collection
+# For-loop variables are local to the loop
 names is list ["Ada", "Lin", "Rio"]
 
 for name in names:

@@ -1,4 +1,4 @@
-# Filter, map, and sum in one data flow
+# Filter, map, sum, and count in collection pipelines
 numbers is list [10, 20, 30, 40]
 
 total is pipeline:
@@ -8,4 +8,11 @@ total is pipeline:
     sum
 end
 
+how_many is pipeline:
+    numbers
+    filter item >= 20
+    count
+end
+
 Say total
+Say how_many

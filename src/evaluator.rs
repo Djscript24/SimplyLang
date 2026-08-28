@@ -5,123 +5,92 @@ use std::{
 };
 
 use crate::{
-    ast::{
-        BinaryOperator, CollectionOperation, Expr, Literal, PipelineStep, Program, Stmt, Type,
-        UnaryOperator,
-    },
-    error::{SimplyError, Span},
+    ast::{BinaryOperator, Expr, Literal, PipelineStep, Program, Stmt},
+    error::{DiagnosticCode, SimplyError, Span},
     lexer::Lexer,
     parser::Parser,
+    runtime::{collections, operations, scope::ScopeStack, value::Value},
+    types::Type,
 };
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Value {
-    Unit,
-    String(String),
-    Int(i64),
-    Float(f64),
-    Bool(bool),
-    Array(Vec<Value>),
-    List(Vec<Value>),
-    Tuple(Vec<Value>),
-    Hash(BTreeMap<String, Value>),
-    Tree(BTreeMap<String, Value>),
-    Matrix(Vec<Value>),
-}
-
-impl Value {
-    fn display(&self) -> String {
-        match self {
-            Self::Unit => String::new(),
-            Self::String(value) => value.clone(),
-            Self::Int(value) => value.to_string(),
-            Self::Float(value) => value.to_string(),
-            Self::Bool(value) => value.to_string(),
-            Self::Array(values) | Self::List(values) | Self::Tuple(values) => format!(
-                "[{}]",
-                values
-                    .iter()
-                    .map(Value::display)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            Self::Hash(values) => format!(
-                "{{{}}}",
-                values
-                    .iter()
-                    .map(|(key, value)| format!("{key}: {}", value.display()))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            Self::Tree(values) => format!(
-                "tree {{{}}}",
-                values
-                    .iter()
-                    .map(|(key, value)| format!("{key}: {}", value.display()))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            Self::Matrix(values) => format!(
-                "[{}]",
-                values
-                    .iter()
-                    .map(Value::display)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        }
-    }
-}
 
 #[derive(Default)]
 pub struct Evaluator {
-    scopes: Vec<HashMap<String, Value>>,
-    variable_types: HashMap<String, Type>,
+    scopes: ScopeStack,
+    variable_types: TypeScopes,
     functions: HashMap<String, Function>,
     current_span: Option<Span>,
     current_file: Option<PathBuf>,
     import_stack: Vec<PathBuf>,
 }
 
-impl Evaluator {
-    fn define(&mut self, name: String, value: Value) {
-        self.scopes
-            .last_mut()
-            .expect("evaluator always has a global scope")
-            .insert(name, value);
-    }
+struct TypeScopes {
+    scopes: Vec<HashMap<String, Type>>,
+}
 
-    fn lookup(&self, name: &str) -> Option<&Value> {
-        self.scopes.iter().rev().find_map(|scope| scope.get(name))
-    }
-
-    fn lookup_mut(&mut self, name: &str) -> Option<&mut Value> {
-        self.scopes
-            .iter_mut()
-            .rev()
-            .find_map(|scope| scope.get_mut(name))
-    }
-
-    fn contains(&self, name: &str) -> bool {
-        self.lookup(name).is_some()
-    }
-
-    fn assign(&mut self, name: &str, value: Value) -> bool {
-        if let Some(binding) = self.lookup_mut(name) {
-            *binding = value;
-            true
-        } else {
-            false
+impl TypeScopes {
+    fn new() -> Self {
+        Self {
+            scopes: vec![HashMap::new()],
         }
     }
 
-    fn push_scope(&mut self) {
+    fn define(&mut self, name: String, typ: Type) {
+        self.scopes
+            .last_mut()
+            .expect("type scope stack always has a global scope")
+            .insert(name, typ);
+    }
+
+    fn lookup(&self, name: &str) -> Option<&Type> {
+        self.scopes.iter().rev().find_map(|scope| scope.get(name))
+    }
+
+    fn push(&mut self) {
         self.scopes.push(HashMap::new());
     }
 
+    fn pop(&mut self) {
+        if self.scopes.len() > 1 {
+            self.scopes.pop();
+        }
+    }
+}
+
+impl Default for TypeScopes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Evaluator {
+    fn define(&mut self, name: String, value: Value) {
+        self.scopes.define(name, value);
+    }
+
+    fn lookup(&self, name: &str) -> Option<&Value> {
+        self.scopes.lookup(name)
+    }
+
+    fn lookup_mut(&mut self, name: &str) -> Option<&mut Value> {
+        self.scopes.lookup_mut(name)
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.scopes.contains(name)
+    }
+
+    fn assign(&mut self, name: &str, value: Value) -> bool {
+        self.scopes.assign(name, value)
+    }
+
+    fn push_scope(&mut self) {
+        self.scopes.push();
+        self.variable_types.push();
+    }
+
     fn pop_scope(&mut self) {
-        debug_assert!(self.scopes.len() > 1);
         self.scopes.pop();
+        self.variable_types.pop();
     }
 }
 
@@ -142,7 +111,8 @@ struct Function {
 impl Evaluator {
     pub fn new() -> Self {
         Self {
-            scopes: vec![HashMap::new()],
+            scopes: ScopeStack::new(),
+            variable_types: TypeScopes::new(),
             ..Self::default()
         }
     }
@@ -194,22 +164,22 @@ impl Evaluator {
                     let value = self.evaluate(value)?;
                     if let Some(expected) = declared_type {
                         self.ensure_type(&value, expected, name)?;
-                        self.variable_types.insert(name.clone(), expected.clone());
-                    } else if let Some(expected) = self.variable_types.get(name).cloned() {
-                        self.ensure_type(&value, &expected, name)?;
+                        self.variable_types.define(name.clone(), expected.clone());
                     } else {
                         self.variable_types
-                            .insert(name.clone(), Self::type_of_value(&value));
+                            .define(name.clone(), Self::type_of_value(&value));
                     }
                     self.define(name.clone(), value);
                 }
                 Stmt::Reassign { name, value } => {
                     if !self.contains(name) {
-                        return Err(self
-                            .runtime_error(format!("cannot reassign unknown variable `{name}`")));
+                        return Err(self.runtime_error_with_code(
+                            DiagnosticCode::InvalidReassignment,
+                            format!("cannot reassign unknown variable `{name}`"),
+                        ));
                     }
                     let value = self.evaluate(value)?;
-                    if let Some(expected) = self.variable_types.get(name).cloned() {
+                    if let Some(expected) = self.variable_types.lookup(name).cloned() {
                         self.ensure_type(&value, &expected, name)?;
                     }
                     if !self.assign(name, value) {
@@ -224,66 +194,41 @@ impl Evaluator {
                     value,
                 } => {
                     let value = self.evaluate(value)?;
-                    if let Some(expected) = self.variable_types.get(name) {
-                        match expected {
-                            Type::List(element) => self.ensure_type(&value, element, name)?,
-                            _ => {}
+                    if let Some(expected) = self.variable_types.lookup(name)
+                        && let Type::List(element) = expected
+                    {
+                        self.ensure_type(&value, element, name)?;
+                    }
+                    let span = self.current_span.clone();
+                    let target = match self.lookup_mut(name) {
+                        Some(target) => target,
+                        None => {
+                            return Err(self.runtime_error_with_code(
+                                DiagnosticCode::RuntimeCollection,
+                                format!("`{name}` is not a list"),
+                            ));
                         }
-                    }
-                    match self.lookup_mut(name) {
-                        Some(Value::List(values)) => match operation {
-                            CollectionOperation::Add => values.push(value),
-                            CollectionOperation::Remove => {
-                                if let Some(position) =
-                                    values.iter().position(|item| item == &value)
-                                {
-                                    values.remove(position);
-                                }
-                            }
-                        },
-                        _ => return Err(self.runtime_error(format!("`{name}` is not a list"))),
-                    }
+                    };
+                    collections::mutate_list(target, operation, value, name, span.as_ref())?;
                 }
                 Stmt::SetIndex { name, index, value } => {
                     let index_value = self.evaluate(index)?;
                     let value = self.evaluate(value)?;
-                    if let Some(expected) = self.variable_types.get(name) {
-                        match expected {
-                            Type::Array(element) | Type::List(element) => {
-                                self.ensure_type(&value, element, name)?
-                            }
-                            _ => {}
-                        }
+                    if let Some(expected) = self.variable_types.lookup(name)
+                        && let Type::Array(element) | Type::List(element) = expected
+                    {
+                        self.ensure_type(&value, element, name)?;
                     }
-                    if let Value::String(key) = &index_value {
-                        if let Some(Value::Hash(values)) = self.lookup_mut(name) {
-                            values.insert(key.clone(), value);
-                            continue;
-                        }
-                    }
-                    let index = match index_value {
-                        Value::Int(index) if index >= 0 => index as usize,
-                        _ => {
-                            return Err(self.runtime_error(
-                                "collection index must be a non-negative integer".into(),
-                            ));
-                        }
-                    };
-                    match self.lookup_mut(name) {
-                        Some(Value::Array(values)) | Some(Value::List(values)) => {
-                            if index >= values.len() {
-                                return Err(
-                                    self.runtime_error("collection index out of bounds".into())
-                                );
-                            }
-                            values[index] = value;
-                        }
-                        _ => {
+                    let span = self.current_span.clone();
+                    let target = match self.lookup_mut(name) {
+                        Some(target) => target,
+                        None => {
                             return Err(
                                 self.runtime_error(format!("`{name}` is not a mutable collection"))
                             );
                         }
-                    }
+                    };
+                    collections::set_index(target, index_value, value, span.as_ref())?;
                 }
                 Stmt::Destructure { names, value } => {
                     let values = match self.evaluate(value)? {
@@ -298,6 +243,8 @@ impl Evaluator {
                         );
                     }
                     for (name, value) in names.iter().zip(values) {
+                        self.variable_types
+                            .define(name.clone(), Self::type_of_value(&value));
                         self.define(name.clone(), value);
                     }
                 }
@@ -371,7 +318,10 @@ impl Evaluator {
                             return Err(self.runtime_error("if condition must be a boolean".into()));
                         }
                     };
-                    match self.execute_statements(branch)? {
+                    self.push_scope();
+                    let result = self.execute_statements(branch);
+                    self.pop_scope();
+                    match result? {
                         Flow::None => {}
                         flow => return Ok(flow),
                     }
@@ -396,7 +346,10 @@ impl Evaluator {
         let resolved =
             fs::canonicalize(&resolved).map_err(|error| self.file_error(&resolved, error))?;
         if self.import_stack.contains(&resolved) {
-            return Err(self.runtime_error(format!("cyclic import of `{path}`")));
+            return Err(self.runtime_error_with_code(
+                DiagnosticCode::RuntimeImport,
+                format!("cyclic import of `{path}`"),
+            ));
         }
         let source =
             fs::read_to_string(&resolved).map_err(|error| self.file_error(&resolved, error))?;
@@ -424,7 +377,10 @@ impl Evaluator {
     }
 
     fn file_error(&self, path: &Path, error: std::io::Error) -> SimplyError {
-        self.runtime_error(format!("could not open `{}`: {error}", path.display()))
+        self.runtime_error_with_code(
+            DiagnosticCode::RuntimeImport,
+            format!("could not open `{}`: {error}", path.display()),
+        )
     }
 
     fn evaluate(&mut self, expr: &Expr) -> Result<Value, SimplyError> {
@@ -470,24 +426,7 @@ impl Evaluator {
                 .ok_or_else(|| self.runtime_error(format!("unknown variable `{name}`"))),
             Expr::Unary { operator, operand } => {
                 let value = self.evaluate(operand)?;
-                match operator {
-                    UnaryOperator::Not => match value {
-                        Value::Bool(value) => Ok(Value::Bool(!value)),
-                        _ => Err(self.runtime_error("`not` requires a boolean".into())),
-                    },
-                    UnaryOperator::Negate => match value {
-                        Value::Int(value) => value
-                            .checked_neg()
-                            .map(Value::Int)
-                            .ok_or_else(|| self.runtime_error("integer overflow".into())),
-                        Value::Float(value) => Ok(Value::Float(-value)),
-                        _ => Err(self.runtime_error("unary `-` requires a number".into())),
-                    },
-                    UnaryOperator::Transpose => match value {
-                        Value::Matrix(rows) => self.matrix_transpose(rows),
-                        _ => Err(self.runtime_error("transpose requires a matrix".into())),
-                    },
-                }
+                operations::unary(value, operator, self.current_span.as_ref())
             }
             Expr::Binary {
                 left,
@@ -495,32 +434,32 @@ impl Evaluator {
                 right,
             } => {
                 let left = self.evaluate(left)?;
-                if matches!(operator, BinaryOperator::And | BinaryOperator::Or) {
-                    if let Value::Bool(value) = left {
-                        if (*operator == BinaryOperator::And && !value)
-                            || (*operator == BinaryOperator::Or && value)
-                        {
-                            return Ok(Value::Bool(value));
-                        }
-                    }
+                if matches!(operator, BinaryOperator::And | BinaryOperator::Or)
+                    && let Value::Bool(value) = left
+                    && ((*operator == BinaryOperator::And && !value)
+                        || (*operator == BinaryOperator::Or && value))
+                {
+                    return Ok(Value::Bool(value));
                 }
                 let right = self.evaluate(right)?;
-                self.evaluate_binary(left, operator, right)
+                operations::binary(left, operator, right, self.current_span.as_ref())
             }
             Expr::Call { name, arguments } => {
                 if name == "send" {
                     if arguments.len() < 2 {
-                        return Err(
-                            self.runtime_error("`send` expects a receiver and a message".into())
-                        );
+                        return Err(self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeMessage,
+                            "`send` expects a receiver and a message",
+                        ));
                     }
                     let receiver = self.evaluate(&arguments[0])?;
                     let message = match self.evaluate(&arguments[1])? {
                         Value::String(message) => message,
                         _ => {
-                            return Err(
-                                self.runtime_error("`send` message must be a string".into())
-                            );
+                            return Err(self.runtime_error_with_code(
+                                DiagnosticCode::RuntimeMessage,
+                                "`send` message must be a string",
+                            ));
                         }
                     };
                     let mut values = vec![receiver];
@@ -625,55 +564,7 @@ impl Evaluator {
             Expr::Index { target, index } => {
                 let target = self.evaluate(target)?;
                 let index_value = self.evaluate(index)?;
-                if let (Value::Matrix(rows), Value::Tuple(coordinates)) = (&target, &index_value) {
-                    if coordinates.len() != 2 {
-                        return Err(
-                            self.runtime_error("matrix index requires row and column".into())
-                        );
-                    }
-                    let row = match &coordinates[0] {
-                        Value::Int(value) if *value >= 0 => *value as usize,
-                        _ => return Err(self.runtime_error("matrix index must be integer".into())),
-                    };
-                    let column = match &coordinates[1] {
-                        Value::Int(value) if *value >= 0 => *value as usize,
-                        _ => return Err(self.runtime_error("matrix index must be integer".into())),
-                    };
-                    return match rows.get(row) {
-                        Some(Value::Array(values)) => values
-                            .get(column)
-                            .cloned()
-                            .ok_or_else(|| self.runtime_error("matrix index out of bounds".into())),
-                        _ => Err(self.runtime_error("matrix row is not an array".into())),
-                    };
-                }
-                if let Value::Hash(values) | Value::Tree(values) = target.clone() {
-                    if let Value::String(key) = index_value {
-                        return values
-                            .get(&key)
-                            .cloned()
-                            .ok_or_else(|| self.runtime_error(format!("unknown key `{key}`")));
-                    }
-                    return Err(self.runtime_error("hash key must be a string".into()));
-                }
-                let index = match index_value {
-                    Value::Int(index) if index >= 0 => index as usize,
-                    _ => {
-                        return Err(self.runtime_error(
-                            "collection index must be a non-negative integer".into(),
-                        ));
-                    }
-                };
-                match target {
-                    Value::Array(values)
-                    | Value::List(values)
-                    | Value::Tuple(values)
-                    | Value::Matrix(values) => values
-                        .get(index)
-                        .cloned()
-                        .ok_or_else(|| self.runtime_error("collection index out of bounds".into())),
-                    _ => Err(self.runtime_error("value is not indexable".into())),
-                }
+                collections::index(target, index_value, self.current_span.as_ref())
             }
             Expr::Field { target, name } => match self.evaluate(target)? {
                 Value::Hash(values) | Value::Tree(values) => values
@@ -686,11 +577,12 @@ impl Evaluator {
     }
 
     fn invoke_function(&mut self, name: &str, values: Vec<Value>) -> Result<Value, SimplyError> {
-        let function = self
-            .functions
-            .get(name)
-            .cloned()
-            .ok_or_else(|| self.runtime_error(format!("unknown function `{name}`")))?;
+        let function = self.functions.get(name).cloned().ok_or_else(|| {
+            self.runtime_error_with_code(
+                DiagnosticCode::RuntimeMessage,
+                format!("unknown function `{name}`"),
+            )
+        })?;
         if function.parameters.len() != values.len() {
             return Err(self.runtime_error(format!(
                 "function `{name}` expects {} arguments, got {}",
@@ -704,12 +596,12 @@ impl Evaluator {
             }
         }
         self.push_scope();
-        let saved_variable_types = self.variable_types.clone();
         for ((parameter, _), value) in function.parameters.iter().zip(values) {
+            self.variable_types
+                .define(parameter.clone(), Self::type_of_value(&value));
             self.define(parameter.clone(), value);
         }
         let result = self.execute_statements(&function.body);
-        self.variable_types = saved_variable_types;
         let result = match result {
             Ok(flow) => match flow {
                 Flow::None => Value::Unit,
@@ -783,7 +675,12 @@ impl Evaluator {
                 PipelineStep::Sum => {
                     let mut total = Value::Int(0);
                     for value in values.drain(..) {
-                        total = self.evaluate_binary(total, &BinaryOperator::Add, value)?;
+                        total = operations::binary(
+                            total,
+                            &BinaryOperator::Add,
+                            value,
+                            self.current_span.as_ref(),
+                        )?;
                     }
                     return Ok(total);
                 }
@@ -793,212 +690,19 @@ impl Evaluator {
         Ok(Value::List(std::mem::take(values)))
     }
 
-    fn evaluate_binary(
-        &self,
-        left: Value,
-        operator: &BinaryOperator,
-        right: Value,
-    ) -> Result<Value, SimplyError> {
-        use BinaryOperator::*;
-        match operator {
-            Add => match (left, right) {
-                (Value::Matrix(left), Value::Matrix(right)) => self.matrix_add(left, right),
-                (Value::String(left), Value::String(right)) => Ok(Value::String(left + &right)),
-                (Value::Int(left), Value::Int(right)) => left
-                    .checked_add(right)
-                    .map(Value::Int)
-                    .ok_or_else(|| self.runtime_error("integer arithmetic error".into())),
-                (Value::Float(left), Value::Float(right)) => Ok(Value::Float(left + right)),
-                (Value::Int(left), Value::Float(right)) => Ok(Value::Float(left as f64 + right)),
-                (Value::Float(left), Value::Int(right)) => Ok(Value::Float(left + right as f64)),
-                _ => Err(self.runtime_error("`+` requires two compatible values".into())),
-            },
-            Subtract | Multiply | Divide | Remainder => {
-                self.numeric_operation(left, operator, right)
-            }
-            MatrixMultiply => self.matrix_multiply(left, right),
-            Greater | GreaterEqual | Less | LessEqual => {
-                self.numeric_comparison(left, operator, right)
-            }
-            Equal => Ok(Value::Bool(left == right)),
-            NotEqual => Ok(Value::Bool(left != right)),
-            And => match (left, right) {
-                (Value::Bool(left), Value::Bool(right)) => Ok(Value::Bool(left && right)),
-                _ => Err(self.runtime_error("`and` requires two booleans".into())),
-            },
-            Or => match (left, right) {
-                (Value::Bool(left), Value::Bool(right)) => Ok(Value::Bool(left || right)),
-                _ => Err(self.runtime_error("`or` requires two booleans".into())),
-            },
-        }
-    }
-
-    fn numeric_operation(
-        &self,
-        left: Value,
-        operator: &BinaryOperator,
-        right: Value,
-    ) -> Result<Value, SimplyError> {
-        if let (Value::Int(left), Value::Int(right)) = (&left, &right) {
-            if *right == 0 && matches!(operator, BinaryOperator::Divide | BinaryOperator::Remainder)
-            {
-                return Err(self.runtime_error("division by zero".into()));
-            }
-            let result = match operator {
-                BinaryOperator::Subtract => left.checked_sub(*right),
-                BinaryOperator::Multiply => left.checked_mul(*right),
-                BinaryOperator::Divide => left.checked_div(*right),
-                BinaryOperator::Remainder => left.checked_rem(*right),
-                _ => unreachable!(),
-            };
-            return result
-                .map(Value::Int)
-                .ok_or_else(|| self.runtime_error("integer arithmetic error".into()));
-        }
-        let (left, right) = match (left, right) {
-            (Value::Float(left), Value::Float(right)) => (left, right),
-            (Value::Int(left), Value::Float(right)) => (left as f64, right),
-            (Value::Float(left), Value::Int(right)) => (left, right as f64),
-            _ => return Err(self.runtime_error("arithmetic requires two numbers".into())),
-        };
-        if right == 0.0 && matches!(operator, BinaryOperator::Divide | BinaryOperator::Remainder) {
-            return Err(self.runtime_error("division by zero".into()));
-        }
-        let result = match operator {
-            BinaryOperator::Subtract => left - right,
-            BinaryOperator::Multiply => left * right,
-            BinaryOperator::Divide => left / right,
-            BinaryOperator::Remainder => left % right,
-            _ => unreachable!(),
-        };
-        Ok(Value::Float(result))
-    }
-
-    fn matrix_add(&self, left: Vec<Value>, right: Vec<Value>) -> Result<Value, SimplyError> {
-        self.matrix_numbers(&left)?;
-        self.matrix_numbers(&right)?;
-        if left.len() != right.len() {
-            return Err(self.runtime_error("matrix dimensions do not match".into()));
-        }
-        let mut rows = Vec::new();
-        for (left_row, right_row) in left.into_iter().zip(right) {
-            match (left_row, right_row) {
-                (Value::Array(left), Value::Array(right)) if left.len() == right.len() => {
-                    let mut row = Vec::new();
-                    for (a, b) in left.into_iter().zip(right) {
-                        row.push(self.evaluate_binary(a, &BinaryOperator::Add, b)?);
-                    }
-                    rows.push(Value::Array(row));
-                }
-                _ => return Err(self.runtime_error("invalid matrix rows".into())),
-            }
-        }
-        Ok(Value::Matrix(rows))
-    }
-
-    fn matrix_multiply(&self, left: Value, right: Value) -> Result<Value, SimplyError> {
-        let (left, right) = match (left, right) {
-            (Value::Matrix(left), Value::Matrix(right)) => (left, right),
-            _ => return Err(self.runtime_error("matrix multiply requires matrices".into())),
-        };
-        let left_rows = self.matrix_numbers(&left)?;
-        let right_rows = self.matrix_numbers(&right)?;
-        if left_rows.is_empty()
-            || right_rows.is_empty()
-            || left_rows.iter().any(|row| row.len() != left_rows[0].len())
-            || right_rows
-                .iter()
-                .any(|row| row.len() != right_rows[0].len())
-            || left_rows[0].len() != right_rows.len()
-        {
-            return Err(self.runtime_error("matrix dimensions do not match".into()));
-        }
-        let mut result = Vec::new();
-        for row in &left_rows {
-            let mut output = Vec::new();
-            for column in 0..right_rows[0].len() {
-                output.push(
-                    row.iter()
-                        .enumerate()
-                        .map(|(index, value)| value * right_rows[index][column])
-                        .sum::<f64>(),
-                );
-            }
-            result.push(Value::Array(output.into_iter().map(Value::Float).collect()));
-        }
-        Ok(Value::Matrix(result))
-    }
-
-    fn matrix_numbers(&self, matrix: &[Value]) -> Result<Vec<Vec<f64>>, SimplyError> {
-        let numbers: Vec<Vec<f64>> = matrix
-            .iter()
-            .map(|row| match row {
-                Value::Array(values) => values
-                    .iter()
-                    .map(|value| match value {
-                        Value::Int(value) => Ok(*value as f64),
-                        Value::Float(value) => Ok(*value),
-                        _ => Err(self.runtime_error("matrix values must be numeric".into())),
-                    })
-                    .collect(),
-                _ => Err(self.runtime_error("matrix rows must be arrays".into())),
-            })
-            .collect::<Result<_, _>>()?;
-        if let Some(first_width) = numbers.first().map(Vec::len) {
-            if numbers.iter().any(|row| row.len() != first_width) {
-                return Err(self.runtime_error("matrix rows must have equal widths".into()));
-            }
-        }
-        Ok(numbers)
-    }
-
-    fn matrix_transpose(&self, rows: Vec<Value>) -> Result<Value, SimplyError> {
-        let numbers = self.matrix_numbers(&rows)?;
-        if numbers.is_empty() {
-            return Ok(Value::Matrix(Vec::new()));
-        }
-        let width = numbers[0].len();
-        if numbers.iter().any(|row| row.len() != width) {
-            return Err(self.runtime_error("invalid matrix rows".into()));
-        }
-        let result = (0..width)
-            .map(|column| {
-                Value::Array(
-                    numbers
-                        .iter()
-                        .map(|row| Value::Float(row[column]))
-                        .collect(),
-                )
-            })
-            .collect();
-        Ok(Value::Matrix(result))
-    }
-    fn numeric_comparison(
-        &self,
-        left: Value,
-        operator: &BinaryOperator,
-        right: Value,
-    ) -> Result<Value, SimplyError> {
-        let (left, right) = match (left, right) {
-            (Value::Int(left), Value::Int(right)) => (left as f64, right as f64),
-            (Value::Float(left), Value::Float(right)) => (left, right),
-            (Value::Int(left), Value::Float(right)) => (left as f64, right),
-            (Value::Float(left), Value::Int(right)) => (left, right as f64),
-            _ => return Err(self.runtime_error("comparison requires two numbers".into())),
-        };
-        let result = match operator {
-            BinaryOperator::Greater => left > right,
-            BinaryOperator::GreaterEqual => left >= right,
-            BinaryOperator::Less => left < right,
-            BinaryOperator::LessEqual => left <= right,
-            _ => unreachable!(),
-        };
-        Ok(Value::Bool(result))
-    }
-
     fn runtime_error(&self, message: String) -> SimplyError {
+        self.runtime_error_with_code(DiagnosticCode::RuntimeGeneral, message)
+    }
+
+    fn runtime_error_with_code(
+        &self,
+        code: DiagnosticCode,
+        message: impl Into<String>,
+    ) -> SimplyError {
+        let message = message.into();
         SimplyError::Runtime {
             span: self.current_span.clone().unwrap_or_else(|| Span::new(0, 0)),
+            code,
             message,
         }
     }
@@ -1032,37 +736,19 @@ impl Evaluator {
         if valid {
             Ok(())
         } else {
-            Err(self.runtime_error(format!(
-                "value assigned to `{name}` has the wrong type: expected {}, found {}",
-                Self::type_name(expected),
-                Self::value_type_name(value)
-            )))
+            Err(self.runtime_error_with_code(
+                DiagnosticCode::TypeMismatch,
+                format!(
+                    "value assigned to `{name}` has the wrong type: expected {}, found {}",
+                    Self::type_name(expected),
+                    Self::value_type_name(value)
+                ),
+            ))
         }
     }
 
     fn type_name(expected: &Type) -> String {
-        match expected {
-            Type::Unknown => "Unknown".into(),
-            Type::Unit => "Unit".into(),
-            Type::String => "String".into(),
-            Type::Int => "Int".into(),
-            Type::Float => "Float".into(),
-            Type::Bool => "Bool".into(),
-            Type::Array(element) => format!("Array[{}]", Self::type_name(element)),
-            Type::List(element) => format!("List[{}]", Self::type_name(element)),
-            Type::Tuple(types) => format!(
-                "Tuple[{}]",
-                types
-                    .iter()
-                    .map(Self::type_name)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            Type::Hash => "Hash".into(),
-            Type::Tree => "Tree".into(),
-            Type::Matrix => "Matrix".into(),
-            Type::Function { .. } => "Function".into(),
-        }
+        expected.name()
     }
 
     fn value_type_name(value: &Value) -> &'static str {

@@ -1,0 +1,40 @@
+name: Windows Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Windows executable
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Build release executable
+        run: cargo build --release
+
+      - name: Verify executable
+        shell: pwsh
+        run: |
+          $executable = "target/release/simply.exe"
+          if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
+            Write-Error "Expected Windows executable was not produced: $executable"
+            exit 1
+          }
+
+      - name: Verify executable runs
+        run: target/release/simply.exe --help
+
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: simply-windows-x64
+          path: target/release/simply.exe
+          if-no-files-found: error
