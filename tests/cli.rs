@@ -271,6 +271,56 @@ fn repl_preserves_state_prints_expressions_and_recovers_from_errors() {
 }
 
 #[test]
+fn repl_evaluates_pasted_multiline_blocks_as_single_statements() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .arg("repl")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start REPL");
+    child
+        .stdin
+        .as_mut()
+        .expect("REPL stdin was unavailable")
+        .write_all(
+            b"# global and function-local scope\n\
+              factor is 3\n\
+              value is 10\n\
+              \n\
+              fn scale(value as Int) gives Int:\n\
+                  local is value\n\
+                  return local * factor\n\
+              end\n\
+              \n\
+              if true:\n\
+                  value is \"inner\"\n\
+                  Say value\n\
+              end\n\
+              \n\
+              Say scale(7)\n\
+              Say value\n\
+              Say false and missing_value\n\
+              Say true or missing_value\n",
+        )
+        .expect("failed to write REPL input");
+    drop(child.stdin.take());
+    let output = child
+        .wait_with_output()
+        .expect("failed to read REPL output");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("inner\n"));
+    assert!(stdout.contains("21\n"));
+    assert!(stdout.contains("10\n"));
+    assert!(stdout.contains("false\n"));
+    assert!(stdout.contains("true\n"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
 fn reports_failure_for_missing_example() {
     assert!(!Path::new("examples/does-not-exist.si").exists());
 }

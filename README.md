@@ -288,6 +288,10 @@ Commands are intentionally explicit: `fmt` and `check` are commands, not
 duplicated flag aliases. The formatter writes the result to standard output,
 so it can be reviewed or redirected safely.
 
+The REPL evaluates ordinary statements as they are entered and accepts
+multiline blocks such as functions and conditionals through their closing
+`end`; the continuation prompt is shown while a block is open.
+
 The benchmark command reports average lexing, parsing, semantic-analysis,
 runtime, and total time over repeated iterations. Runtime output is suppressed
 while measuring.

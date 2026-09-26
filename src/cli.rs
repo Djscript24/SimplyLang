@@ -13,7 +13,7 @@ use crate::{
     error::{DiagnosticCode, SimplyError, Span},
     evaluator::Evaluator,
     formatter,
-    lexer::Lexer,
+    lexer::{Lexer, Token, TokenKind},
     parser::Parser,
     semantic::SemanticAnalyzer,
 };
@@ -681,33 +681,42 @@ fn repl() -> i32 {
     let mut evaluator = Evaluator::new();
     let stdin = io::stdin();
     let mut input = String::new();
+    let mut line = String::new();
 
     loop {
-        print!("{}", stdout_paint("> ", CYAN));
+        let prompt = if input.is_empty() { "> " } else { "... " };
+        print!("{}", stdout_paint(prompt, CYAN));
         if io::stdout().flush().is_err() {
             return 1;
         }
-        input.clear();
-        match stdin.read_line(&mut input) {
+        line.clear();
+        match stdin.read_line(&mut line) {
             Ok(0) => return 0,
             Ok(_) => {
+                input.push_str(&line);
                 let tokens = match Lexer::new(&input).tokenize() {
                     Ok(tokens) => tokens,
                     Err(error) => {
                         render_error("<repl>", error, &input);
+                        input.clear();
                         continue;
                     }
                 };
+                if repl_block_depth(&tokens) > 0 {
+                    continue;
+                }
                 let program = match Parser::new(tokens).parse() {
                     Ok(program) => program,
                     Err(error) => {
                         render_error("<repl>", error, &input);
+                        input.clear();
                         continue;
                     }
                 };
                 if let Err(error) = evaluator.run_repl(&program) {
                     render_error("<repl>", error, &input);
                 }
+                input.clear();
             }
             Err(error) => {
                 render_error(
@@ -723,6 +732,42 @@ fn repl() -> i32 {
             }
         }
     }
+}
+
+fn repl_block_depth(tokens: &[Token]) -> usize {
+    let mut depth: usize = 0;
+    for (index, token) in tokens.iter().enumerate() {
+        match &token.kind {
+            TokenKind::End => depth = depth.saturating_sub(1),
+            TokenKind::Fn
+            | TokenKind::If
+            | TokenKind::For
+            | TokenKind::While
+            | TokenKind::Try
+            | TokenKind::Flow
+            | TokenKind::Pipeline
+            | TokenKind::Hash
+            | TokenKind::Tree
+            | TokenKind::Partition => {
+                let is_else_if = matches!(
+                    tokens.get(index.wrapping_sub(1)),
+                    Some(Token {
+                        kind: TokenKind::Else,
+                        span,
+                    }) if span.line == token.span.line
+                );
+                let has_colon = tokens[index + 1..]
+                    .iter()
+                    .take_while(|next| !matches!(next.kind, TokenKind::Newline | TokenKind::Eof))
+                    .any(|next| matches!(next.kind, TokenKind::Colon));
+                if has_colon && !is_else_if {
+                    depth += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth
 }
 
 fn debug_tokens(source: &str) -> Result<(), SimplyError> {
