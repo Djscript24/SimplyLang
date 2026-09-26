@@ -264,7 +264,9 @@ fn repl_preserves_state_prints_expressions_and_recovers_from_errors() {
     assert!(stdout.contains("Simply 0.9.0"));
     assert!(stdout.contains("from say"));
     assert!(stdout.contains("15"));
-    assert!(stdout.ends_with("10\n"));
+    assert!(stdout.contains("from say\n--------------------\n15\n"));
+    assert!(stdout.contains("15\n--------------------\n10\n"));
+    assert!(stdout.ends_with("10\n--------------------\n"));
     assert!(!stdout.contains("> "));
     assert!(!stdout.contains("... "));
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -313,11 +315,22 @@ fn repl_evaluates_pasted_multiline_blocks_as_single_statements() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("inner\n"));
-    assert!(stdout.contains("21\n"));
-    assert!(stdout.contains("10\n"));
-    assert!(stdout.contains("false\n"));
-    assert!(stdout.contains("true\n"));
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        [
+            "Simply 0.9.0",
+            "inner",
+            "--------------------",
+            "21",
+            "--------------------",
+            "10",
+            "--------------------",
+            "false",
+            "--------------------",
+            "true",
+            "--------------------",
+        ]
+    );
     assert!(!stdout.contains("> "));
     assert!(!stdout.contains("... "));
     let stderr = String::from_utf8_lossy(&output.stderr);

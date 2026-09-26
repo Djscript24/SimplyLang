@@ -293,9 +293,9 @@ multiline blocks such as functions and conditionals through their closing
 `end`; the continuation prompt is shown while a block is open. Prompts are
 hidden when input is piped or redirected, keeping pasted scripts and batch
 input clean. When a terminal paste has additional lines already buffered, the
-REPL also skips prompts until that paste is consumed on Unix. Enter `:q`,
-`:quit`, `:exit`, `quit`, or `exit` to leave the interactive REPL; Ctrl-D also
-works.
+REPL also skips prompts until that paste is consumed on Unix. Each value
+printed in the REPL is followed by a separator line. Enter `:q`, `:quit`,
+`:exit`, `quit`, or `exit` to leave the interactive REPL; Ctrl-D also works.
 
 The benchmark command reports average lexing, parsing, semantic-analysis,
 runtime, and total time over repeated iterations. Runtime output is suppressed

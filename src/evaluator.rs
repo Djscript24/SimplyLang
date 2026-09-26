@@ -946,6 +946,7 @@ pub struct Evaluator {
     import_stack: Vec<PathBuf>,
     import_cache: Rc<RefCell<HashMap<PathBuf, Arc<Program>>>>,
     output_enabled: bool,
+    repl_output_separator: bool,
 }
 
 struct TypeScopes {
@@ -1076,12 +1077,15 @@ impl Evaluator {
     }
 }
 
-fn print_value(value: &Value) {
+fn print_value(value: &Value, repl_separator: bool) {
     let rendered = value.display();
     if io::stdout().is_terminal() {
         println!("\x1b[36m{rendered}\x1b[0m");
     } else {
         println!("{rendered}");
+    }
+    if repl_separator {
+        println!("--------------------");
     }
 }
 
@@ -1303,6 +1307,7 @@ impl Evaluator {
     }
 
     pub fn run_repl(&mut self, program: &Program) -> Result<(), SimplyError> {
+        self.repl_output_separator = true;
         for statement in &program.statements {
             let (span, statement) = match statement {
                 Stmt::Located { span, statement } => (Some(span.clone()), statement.as_ref()),
@@ -1312,7 +1317,7 @@ impl Evaluator {
             if let Stmt::Expression(expression) = statement {
                 let value = self.evaluate(expression)?;
                 if !matches!(value, Value::Unit) {
-                    print_value(&value);
+                    print_value(&value, self.repl_output_separator);
                 }
                 continue;
             }
@@ -1352,7 +1357,7 @@ impl Evaluator {
                 Stmt::Say(expr) => {
                     let value = self.evaluate(expr)?;
                     if self.output_enabled {
-                        print_value(&value);
+                        print_value(&value, self.repl_output_separator);
                     }
                 }
                 Stmt::Import { path, alias } => {
@@ -1905,7 +1910,7 @@ impl Evaluator {
                     }
                     let value = self.evaluate(&arguments[0])?;
                     if self.output_enabled {
-                        print_value(&value);
+                        print_value(&value, self.repl_output_separator);
                     }
                     return Ok(Value::Unit);
                 }
