@@ -1,0 +1,11 @@
+# 02-pipeline.si — pipeline language fixture
+# Checks selecting, deriving, and summing a list in a pipeline.
+# Key components: values list and result pipeline.
+values is list [1, 2, 3, 4]
+result is pipeline:
+    values
+    where item >= 2
+    derive item * 2
+    sum
+end
+Say result

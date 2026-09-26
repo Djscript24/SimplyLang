@@ -1,0 +1,13 @@
+# conditionals.si — conditional branching example
+# Demonstrates if, else if, and else branches over a score.
+# Key components: ordered conditional selection.
+# Branching with if, else if, and else
+score is 87
+
+if score >= 90:
+    Say "excellent"
+else if score >= 60:
+    Say "passed"
+else:
+    Say "try again"
+end

@@ -1,0 +1,13 @@
+# parallel-scalar.si — deterministic parallel scalar Flow
+# Pure scalar where/derive stages run in isolated workers and merge in source order.
+values is range(0, 100)
+
+flow total from values:
+    chunk 20
+    parallel 4
+    where item % 2 == 0
+    derive item * 3
+    sum
+end
+
+Say total

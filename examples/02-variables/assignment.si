@@ -1,0 +1,12 @@
+# assignment.si — variable assignment example
+# Demonstrates inferred/explicit types, mutable bindings, and reassignment.
+# Key components: List values and the mutable label binding.
+# Inferred and explicit types with reassignment
+scores as List[Int] is list [1, 2, 3]
+mut label as String is "starter"
+
+label -> "updated"
+
+Say scores
+Say scores[1]
+Say label

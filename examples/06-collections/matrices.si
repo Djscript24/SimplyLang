@@ -1,0 +1,11 @@
+# matrices.si — matrix operations example
+# Demonstrates matrix indexing, addition, multiplication, and transpose.
+# Key components: two-by-two matrix values and operators.
+# Matrix indexing, addition, multiplication, and transpose
+left is matrix [[1, 2], [3, 4]]
+right is matrix [[5, 6], [7, 8]]
+
+Say left[0, 1]
+Say left + right
+Say left multiply right
+Say left transpose

@@ -1,0 +1,12 @@
+# arrays-lists.si — array and list example
+# Demonstrates fixed-length arrays and mutable list operations.
+# Key components: indexing, add, remove, and collection output.
+# Fixed-length arrays and mutable lists
+cities is array ["Jakarta", "Citra", "Lima"]
+mut queue is list ["first", "second"]
+
+queue add "third"
+queue remove "first"
+
+Say cities
+Say queue

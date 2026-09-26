@@ -1,0 +1,16 @@
+# function-dispatch.si — function dispatch benchmark
+# Measures repeated typed function calls inside a numeric while loop.
+# Key components: increment and a 10,000-iteration workload.
+# Runtime benchmark workload: repeated function dispatch
+fn increment(value as Int) gives Int:
+    return value + 1
+end
+
+mut index is 0
+mut total is 0
+while index < 10000:
+    total -> total + increment(index)
+    index -> index + 1
+end
+
+Say total

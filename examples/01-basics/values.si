@@ -1,0 +1,11 @@
+# values.si — primitive values example
+# Demonstrates declarations of strings, numbers, booleans, and readable output.
+# Key components: inferred and explicit values with Say statements.
+# Primitive values, comments, and readable output
+name is "Simply"
+version as Float is 3.14159
+ready is true
+
+Say "Hello, Simply!"
+Say version
+Say ready

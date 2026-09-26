@@ -1,0 +1,20 @@
+# hash-lookup.si — hash lookup benchmark
+# Measures repeated deterministic lookup of a hash field in a loop.
+# Key components: profile role lookup and match counting.
+# Runtime benchmark workload: repeated deterministic hash lookup
+profile is hash:
+    name is "Simply"
+    role is "language"
+    version is "0.1"
+end
+
+mut index is 0
+mut matches is 0
+while index < 10000:
+    if profile["role"] == "language":
+        matches -> matches + 1
+    end
+    index -> index + 1
+end
+
+Say matches

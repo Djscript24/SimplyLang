@@ -1,0 +1,23 @@
+# try-catch-finally.si — structured runtime error handling
+# Demonstrates throw, code-filtered catches, structured error fields, and cleanup.
+try:
+    throw "custom failure"
+catch ignored as E0202:
+    Say "wrong handler"
+catch error:
+    Say error.message
+finally:
+    Say "cleanup complete"
+end
+
+try:
+    try:
+        throw "inner failure"
+    finally:
+        Say "inner cleanup"
+    end
+catch error:
+    Say "outer caught: " + error.message
+finally:
+    Say "outer cleanup"
+end

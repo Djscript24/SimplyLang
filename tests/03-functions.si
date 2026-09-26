@@ -1,0 +1,8 @@
+# 03-functions.si — function language fixture
+# Checks a typed function declaration, return value, and invocation.
+# Key component: double function.
+fn double(value as Int) gives Int:
+    return value * 2
+end
+
+Say double(21)

@@ -1,0 +1,13 @@
+# partition-categories.si — inspect values grouped by partition rules.
+values is list [2, 5, 8, 11, 14]
+
+categories is pipeline:
+    values
+    partition item:
+        item < 8 -> low
+        item <= 10 -> medium
+        otherwise -> high
+    end
+end
+
+Say categories

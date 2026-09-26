@@ -1,0 +1,25 @@
+# aggregates.si — streaming Flow aggregate terminals
+# Covers derive, count, average, min, and max.
+values is list [2, 4, 6, 8]
+
+flow derived_count from values:
+    derive item + 1
+    count
+end
+
+flow mean from values:
+    average
+end
+
+flow lowest from values:
+    min
+end
+
+flow highest from values:
+    max
+end
+
+Say derived_count
+Say mean
+Say lowest
+Say highest

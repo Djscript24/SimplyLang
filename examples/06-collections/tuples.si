@@ -1,0 +1,10 @@
+# tuples.si — tuple example
+# Demonstrates tuple indexing and destructuring into named bindings.
+# Key components: coordinates tuple and x/y bindings.
+# Tuple indexing and destructuring
+coordinates is (12, 30)
+(x, y) is coordinates
+
+Say x
+Say y
+Say coordinates[0]

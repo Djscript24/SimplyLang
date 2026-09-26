@@ -1,0 +1,12 @@
+# arithmetic.si — arithmetic operators example
+# Demonstrates integer, float, mixed, precedence, and unary arithmetic.
+# Key components: numeric expressions and negation.
+# Integer, float, mixed arithmetic, precedence, and negation
+whole is 8
+fraction is 2.5
+
+Say whole + 4
+Say whole * 3 - 2
+Say fraction / 2
+Say whole + fraction
+Say -whole

@@ -1,0 +1,18 @@
+# nested-read.si — nested collection benchmark
+# Measures repeated reads through nested list and hash values.
+# Key components: records values and modular indexed access.
+# Runtime benchmark workload: repeated nested collection reads
+records is list [
+    hash:
+        values is list [10, 20, 30]
+    end
+]
+
+mut index is 0
+mut total is 0
+while index < 10000:
+    total -> total + records[0]["values"][index % 3]
+    index -> index + 1
+end
+
+Say total

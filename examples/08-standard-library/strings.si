@@ -1,0 +1,12 @@
+# strings.si — string built-ins example
+# Demonstrates trimming, splitting, replacement, and prefix/suffix checks.
+# Key components: text cleanup and string predicates.
+# String cleanup, splitting, replacement, and prefix/suffix checks
+text is "  Ada,Lin  "
+clean is trim(text)
+
+Say clean
+Say split(clean, ",")
+Say replace(text, "Ada", "Citra")
+Say starts_with(clean, "Ada")
+Say ends_with(clean, "Lin")

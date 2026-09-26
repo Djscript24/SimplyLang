@@ -1,0 +1,12 @@
+# builtins.si — standard built-ins example
+# Demonstrates range, length, count, and loading values from another source file.
+# Key components: numbers range and imported-values fixture.
+# Built-ins and source-value loading
+numbers is range(1, 5)
+Say numbers
+Say length(numbers)
+Say count(numbers)
+Say length("Simply")
+
+open "imported-values.si" as imported
+Say imported[1]

@@ -1,0 +1,15 @@
+# runtime-pipeline.si — pipeline benchmark
+# Measures a fused multi-stage pipeline over a large numeric range.
+# Key components: where, derive, where, and sum stages.
+# Runtime benchmark workload: fused multi-stage pipeline
+numbers is range(0, 10000)
+
+result is pipeline:
+    numbers
+    where item % 2 == 0
+    derive item * 3
+    where item > 1000
+    sum
+end
+
+Say result

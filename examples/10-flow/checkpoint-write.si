@@ -1,0 +1,11 @@
+# checkpoint-write.si — resumable CSV Flow output
+# The checkpoint is removed automatically after a successful run.
+
+flow cleaned from csv_rows("examples/10-flow/checkpoint-input.csv"):
+    chunk 2
+    checkpoint "examples/10-flow/checkpoint.state"
+    derive item
+    write_csv("examples/10-flow/checkpoint-output.csv")
+end
+
+Say "checkpointed output written"

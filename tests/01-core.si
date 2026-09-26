@@ -1,0 +1,6 @@
+# 01-core.si — core language fixture
+# Checks mutable assignment and expression output for the basic test command.
+# Key components: value reassignment and Say.
+mut value is 2
+value -> value + 3
+Say value

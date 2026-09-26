@@ -1,0 +1,12 @@
+# while.si — while-loop example
+# Demonstrates mutable state updated while a condition remains true.
+# Key components: loop reassignment and surrounding-scope visibility.
+# While loops keep the surrounding scope
+mut step is 0
+
+while step < 3:
+    Say step
+    step -> step + 1
+end
+
+Say step

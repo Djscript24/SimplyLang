@@ -1,0 +1,16 @@
+# collections.si — collection built-ins example
+# Demonstrates predicates, aggregation, joining, reversal, and emptiness checks.
+# Key components: any, all, total, join, reverse, and is_empty.
+# Collection predicates, aggregation, reversal, and emptiness
+flags is list [true, false]
+values is list [10, 20, 30]
+words is list ["Ada", "Lin"]
+empty is list []
+
+Say any(flags)
+Say all(flags)
+Say total(values)
+Say join(words, "-")
+Say reverse(values)
+Say is_empty(empty)
+Say is_empty(values)

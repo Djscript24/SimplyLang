@@ -1,0 +1,10 @@
+# closures.si — nested functions resolve lexical bindings
+fn make_adder(base as Int):
+    fn add(value as Int) gives Int:
+        return base + value
+    end
+    return add
+end
+
+adder is make_adder(40)
+Say adder(2)

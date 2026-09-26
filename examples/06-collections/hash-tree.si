@@ -1,0 +1,16 @@
+# hash-tree.si — hash and tree example
+# Demonstrates named fields, string indexing, and nested collection values.
+# Key components: profile hash and catalog tree.
+# Hashes and trees support fields, string indexing, and nesting
+profile is hash:
+    name is "Ada"
+    role is "builder"
+end
+
+catalog is tree:
+    featured is profile
+end
+
+Say profile.name
+Say profile["role"]
+Say catalog["featured"].name

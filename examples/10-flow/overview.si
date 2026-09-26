@@ -1,0 +1,11 @@
+# overview.si — declarative Simply Flow
+# Demonstrates where, derive, and a streaming numeric terminal.
+values is list [1, 2, 3, 4, 5]
+
+flow total from values:
+    where item >= 3
+    derive item * 10
+    sum
+end
+
+Say total

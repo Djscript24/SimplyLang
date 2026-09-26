@@ -1,0 +1,12 @@
+# quality-partition.si — classify scores using a Flow declaration.
+scores is array [125, 240, 375, 410, 560, 685, 790, 825, 930, 1045]
+
+flow quality from scores:
+    partition item:
+        item < 300 -> low
+        item <= 700 -> medium
+        otherwise -> high
+    end
+end
+
+Say quality

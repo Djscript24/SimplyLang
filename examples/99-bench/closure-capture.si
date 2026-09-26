@@ -1,0 +1,28 @@
+# closure-capture.si — selective closure capture benchmark
+# Measures closure creation with many visible bindings and one actual dependency.
+fn make_reader(base as Int):
+    unused01 is 1
+    unused02 is 2
+    unused03 is 3
+    unused04 is 4
+    unused05 is 5
+    unused06 is 6
+    unused07 is 7
+    unused08 is 8
+    unused09 is 9
+    unused10 is 10
+    fn read(offset as Int) gives Int:
+        return base + offset
+    end
+    return read
+end
+
+reader is make_reader(40)
+mut index is 0
+mut total is 0
+while index < 10000:
+    total -> total + reader(index)
+    index -> index + 1
+end
+
+Say total

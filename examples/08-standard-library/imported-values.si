@@ -1,0 +1,5 @@
+# imported-values.si — imported values fixture
+# Returns a list used by standard-library and smoke examples to exercise source loading.
+# Key component: the returned numeric list.
+# Import fixture used by builtins.si and smoke.si
+return list [10, 20, 30]

@@ -1,0 +1,29 @@
+# function-body-registration.si — function registration benchmark
+# Provides a larger function body for measuring function registration overhead.
+# Key component: large_body with a chain of local computations.
+# Runtime benchmark workload: registration cost for a larger function body
+fn large_body(value as Int) gives Int:
+    step01 is value + 1
+    step02 is step01 + 1
+    step03 is step02 + 1
+    step04 is step03 + 1
+    step05 is step04 + 1
+    step06 is step05 + 1
+    step07 is step06 + 1
+    step08 is step07 + 1
+    step09 is step08 + 1
+    step10 is step09 + 1
+    step11 is step10 + 1
+    step12 is step11 + 1
+    step13 is step12 + 1
+    step14 is step13 + 1
+    step15 is step14 + 1
+    step16 is step15 + 1
+    step17 is step16 + 1
+    step18 is step17 + 1
+    step19 is step18 + 1
+    step20 is step19 + 1
+    return step20
+end
+
+Say large_body(0)

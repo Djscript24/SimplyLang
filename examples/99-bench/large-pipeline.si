@@ -1,0 +1,13 @@
+# large-pipeline.si — large data pipeline workload
+# Measures fused where/derive/where/sum execution over one million integers.
+numbers is range(0, 1000000)
+
+result is pipeline:
+    numbers
+    where item % 3 == 0
+    derive item * 2
+    where item > 1000
+    sum
+end
+
+Say result

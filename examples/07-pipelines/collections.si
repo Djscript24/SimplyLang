@@ -1,0 +1,21 @@
+# collections.si — collection pipeline example
+# Demonstrates selection, derivation, and terminal sum/count pipeline stages.
+# Key components: two pipelines over a numeric list.
+# Select, derive, sum, and count in collection pipelines
+numbers is list [10, 20, 30, 40]
+
+total is pipeline:
+    numbers
+    where item >= 20
+    derive item * 2
+    sum
+end
+
+how_many is pipeline:
+    numbers
+    where item >= 20
+    count
+end
+
+Say total
+Say how_many

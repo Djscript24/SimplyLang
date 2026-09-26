@@ -1,0 +1,13 @@
+# break-continue.si — loop control example
+# Demonstrates continue and break inside a for loop.
+# Key components: conditional loop control and array iteration.
+# Continue skips one value; break stops the loop
+for value in array [1, 2, 3, 4, 5]:
+    if value == 2:
+        continue
+    end
+    if value == 5:
+        break
+    end
+    Say value
+end
