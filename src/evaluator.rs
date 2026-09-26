@@ -397,6 +397,7 @@ fn clamp_numeric(
         (Value::Int(value), Value::Int(minimum), Value::Int(maximum)) if minimum <= maximum => {
             Ok(Value::Int(value.clamp(minimum, maximum)))
         }
+
         (value, minimum, maximum) => {
             let (value, minimum, maximum) = match (value, minimum, maximum) {
                 (Value::Int(value), Value::Int(minimum), Value::Float(maximum)) => {
@@ -442,6 +443,200 @@ fn clamp_numeric(
             Ok(Value::Float(value.clamp(minimum, maximum)))
         }
     }
+}
+
+fn evaluate_math_builtin(
+    name: &str,
+    arguments: &[Value],
+    span: Option<&Span>,
+) -> Result<Option<Value>, SimplyError> {
+    let require_count = |expected: usize| {
+        if arguments.len() == expected {
+            Ok(())
+        } else {
+            Err(SimplyError::Runtime {
+                span: span.cloned().unwrap_or_else(|| Span::new(0, 0)),
+                code: DiagnosticCode::RuntimeGeneral,
+                message: format!("`{name}` expects {expected} arguments"),
+            })
+        }
+    };
+    let result = match name {
+        "sqrt" | "exp" | "log" | "log10" | "sin" | "cos" | "tan" | "floor" | "ceil" => {
+            require_count(1)?;
+            Some(operations::math_unary(name, arguments[0].clone(), span)?)
+        }
+        "pow" => {
+            require_count(2)?;
+            Some(operations::math_pow(
+                arguments[0].clone(),
+                arguments[1].clone(),
+                span,
+            )?)
+        }
+        "sign" => {
+            require_count(1)?;
+            Some(operations::math_sign(arguments[0].clone(), span)?)
+        }
+        "vector_add" | "vector_subtract" => {
+            require_count(2)?;
+            Some(operations::vector_add(
+                &arguments[0],
+                &arguments[1],
+                name == "vector_subtract",
+                span,
+            )?)
+        }
+        "vector_scale" => {
+            require_count(2)?;
+            Some(operations::vector_scale(
+                &arguments[0],
+                &arguments[1],
+                span,
+            )?)
+        }
+        "dot" => {
+            require_count(2)?;
+            Some(operations::vector_dot(&arguments[0], &arguments[1], span)?)
+        }
+        "norm" => {
+            require_count(1)?;
+            Some(operations::vector_norm(&arguments[0], span)?)
+        }
+        "distance" => {
+            require_count(2)?;
+            Some(operations::vector_distance(
+                &arguments[0],
+                &arguments[1],
+                span,
+            )?)
+        }
+        "normalize" => {
+            require_count(1)?;
+            Some(operations::vector_normalize(&arguments[0], span)?)
+        }
+        "shape" => {
+            require_count(1)?;
+            Some(operations::matrix_shape_value(&arguments[0], span)?)
+        }
+        "transpose" => {
+            require_count(1)?;
+            Some(operations::matrix_transpose_value(&arguments[0], span)?)
+        }
+        "matrix_add" | "matrix_subtract" => {
+            require_count(2)?;
+            Some(operations::matrix_add_values(
+                &arguments[0],
+                &arguments[1],
+                name == "matrix_subtract",
+                span,
+            )?)
+        }
+        "matrix_scale" => {
+            require_count(2)?;
+            Some(operations::matrix_scale(
+                &arguments[0],
+                &arguments[1],
+                span,
+            )?)
+        }
+        "multiply" => {
+            require_count(2)?;
+            Some(operations::matrix_multiply_values(
+                &arguments[0],
+                &arguments[1],
+                span,
+            )?)
+        }
+        "identity" => {
+            require_count(1)?;
+            let size = match arguments[0] {
+                Value::Int(size) if size > 0 => {
+                    usize::try_from(size).map_err(|_| SimplyError::Runtime {
+                        span: span.cloned().unwrap_or_else(|| Span::new(0, 0)),
+                        code: DiagnosticCode::RuntimeGeneral,
+                        message: "identity matrix size is out of bounds".into(),
+                    })?
+                }
+                _ => {
+                    return Err(SimplyError::Runtime {
+                        span: span.cloned().unwrap_or_else(|| Span::new(0, 0)),
+                        code: DiagnosticCode::RuntimeGeneral,
+                        message: "identity matrix size must be a positive integer".into(),
+                    });
+                }
+            };
+            Some(operations::matrix_identity(size, span)?)
+        }
+        "mean" | "median" | "variance" | "stddev" | "percentile" => {
+            require_count(if name == "percentile" { 2 } else { 1 })?;
+            let values = operations::statistics_values(&arguments[0], span)?;
+            let percentile = if name == "percentile" {
+                Some(match arguments[1] {
+                    Value::Int(value) => value as f64,
+                    Value::Float(value) if value.is_finite() => value,
+                    _ => {
+                        return Err(SimplyError::Runtime {
+                            span: span.cloned().unwrap_or_else(|| Span::new(0, 0)),
+                            code: DiagnosticCode::RuntimeGeneral,
+                            message: "`percentile` requires a finite numeric percentile".into(),
+                        });
+                    }
+                })
+            } else {
+                None
+            };
+            Some(operations::statistics_unary(
+                name, &values, percentile, span,
+            )?)
+        }
+        "covariance" | "correlation" => {
+            require_count(2)?;
+            let left = operations::statistics_values(&arguments[0], span)?;
+            let right = operations::statistics_values(&arguments[1], span)?;
+            Some(operations::statistics_pair(name, &left, &right, span)?)
+        }
+        _ => None,
+    };
+    Ok(result)
+}
+
+fn is_math_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "sqrt"
+            | "pow"
+            | "exp"
+            | "log"
+            | "log10"
+            | "sin"
+            | "cos"
+            | "tan"
+            | "floor"
+            | "ceil"
+            | "sign"
+            | "vector_add"
+            | "vector_subtract"
+            | "vector_scale"
+            | "dot"
+            | "norm"
+            | "distance"
+            | "normalize"
+            | "shape"
+            | "transpose"
+            | "matrix_add"
+            | "matrix_subtract"
+            | "matrix_scale"
+            | "multiply"
+            | "identity"
+            | "mean"
+            | "median"
+            | "variance"
+            | "stddev"
+            | "percentile"
+            | "covariance"
+            | "correlation"
+    )
 }
 
 fn total_to_f64(value: Value, span: Option<&Span>) -> Result<f64, SimplyError> {
@@ -1668,6 +1863,16 @@ impl Evaluator {
                 operations::binary(left, operator, right, self.current_span.as_ref())
             }
             Expr::Call { name, arguments } => {
+                if is_math_builtin(name) {
+                    let values = arguments
+                        .iter()
+                        .map(|argument| self.evaluate(argument))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    return evaluate_math_builtin(name, &values, self.current_span.as_ref())?
+                        .ok_or_else(|| {
+                            self.runtime_error(format!("unknown numerical builtin `{name}`"))
+                        });
+                }
                 if name == "send" {
                     if arguments.len() < 2 {
                         return Err(self.runtime_error_with_code(
@@ -1726,6 +1931,125 @@ impl Evaluator {
                         Value::Function(_) => "Function",
                     };
                     return Ok(Value::String(type_name.into()));
+                }
+                if name == "read_file" {
+                    if arguments.len() != 1 {
+                        return Err(self.runtime_error("`read_file` expects one path".into()));
+                    }
+                    let path = match self.evaluate(&arguments[0])? {
+                        Value::String(path) => path,
+                        _ => {
+                            return Err(
+                                self.runtime_error("`read_file` path must be a string".into())
+                            );
+                        }
+                    };
+                    return fs::read_to_string(&path)
+                        .map(Value::String)
+                        .map_err(|error| {
+                            self.runtime_error(format!("could not read file `{path}`: {error}"))
+                        });
+                }
+                if name == "write_file" {
+                    if arguments.len() != 2 {
+                        return Err(self.runtime_error(
+                            "`write_file` expects a path and string content".into(),
+                        ));
+                    }
+                    let path = match self.evaluate(&arguments[0])? {
+                        Value::String(path) => path,
+                        _ => {
+                            return Err(
+                                self.runtime_error("`write_file` path must be a string".into())
+                            );
+                        }
+                    };
+                    let content = match self.evaluate(&arguments[1])? {
+                        Value::String(content) => content,
+                        _ => {
+                            return Err(
+                                self.runtime_error("`write_file` content must be a string".into())
+                            );
+                        }
+                    };
+                    fs::write(&path, content).map_err(|error| {
+                        self.runtime_error(format!("could not write file `{path}`: {error}"))
+                    })?;
+                    return Ok(Value::Unit);
+                }
+                if name == "substring" {
+                    if arguments.len() != 3 {
+                        return Err(self.runtime_error(
+                            "`substring` expects a string, start index, and length".into(),
+                        ));
+                    }
+                    let value = match self.evaluate(&arguments[0])? {
+                        Value::String(value) => value,
+                        _ => return Err(self.runtime_error("`substring` expects a string".into())),
+                    };
+                    let start = match self.evaluate(&arguments[1])? {
+                        Value::Int(start) if start >= 0 => {
+                            usize::try_from(start).map_err(|_| {
+                                self.runtime_error("`substring` start is out of bounds".into())
+                            })?
+                        }
+                        _ => {
+                            return Err(self.runtime_error(
+                                "`substring` start must be a non-negative integer".into(),
+                            ));
+                        }
+                    };
+                    let length = match self.evaluate(&arguments[2])? {
+                        Value::Int(length) if length >= 0 => {
+                            usize::try_from(length).map_err(|_| {
+                                self.runtime_error("`substring` length is out of bounds".into())
+                            })?
+                        }
+                        _ => {
+                            return Err(self.runtime_error(
+                                "`substring` length must be a non-negative integer".into(),
+                            ));
+                        }
+                    };
+                    let character_count = value.chars().count();
+                    if start > character_count || length > character_count - start {
+                        return Err(self.runtime_error("substring is out of bounds".into()));
+                    }
+                    return Ok(Value::String(
+                        value.chars().skip(start).take(length).collect(),
+                    ));
+                }
+                if name == "characters" {
+                    if arguments.len() != 1 {
+                        return Err(self.runtime_error("`characters` expects one string".into()));
+                    }
+                    let value = match self.evaluate(&arguments[0])? {
+                        Value::String(value) => value,
+                        _ => {
+                            return Err(self.runtime_error("`characters` expects a string".into()));
+                        }
+                    };
+                    return Ok(Value::Array(shared_values(
+                        value
+                            .chars()
+                            .map(|character| Value::String(character.to_string()))
+                            .collect(),
+                    )));
+                }
+                if matches!(
+                    name.as_str(),
+                    "is_ascii_alpha" | "is_ascii_digit" | "is_whitespace"
+                ) {
+                    if arguments.len() != 1 {
+                        return Err(self.runtime_error(format!("`{name}` expects one character")));
+                    }
+                    let character = self.evaluate(&arguments[0])?;
+                    let character = self.single_character(character, name)?;
+                    return Ok(Value::Bool(match name.as_str() {
+                        "is_ascii_alpha" => character.is_ascii_alphabetic(),
+                        "is_ascii_digit" => character.is_ascii_digit(),
+                        _ => character.is_whitespace(),
+                    }));
                 }
                 if name == "contains" {
                     if arguments.len() != 2 {
@@ -3222,6 +3546,19 @@ impl Evaluator {
 
     fn runtime_error(&self, message: String) -> SimplyError {
         self.runtime_error_with_code(DiagnosticCode::RuntimeGeneral, message)
+    }
+
+    fn single_character(&self, value: Value, operation: &str) -> Result<char, SimplyError> {
+        let Value::String(value) = value else {
+            return Err(self.runtime_error(format!("`{operation}` expects a one-character string")));
+        };
+        let mut characters = value.chars();
+        match (characters.next(), characters.next()) {
+            (Some(character), None) => Ok(character),
+            _ => Err(self.runtime_error(format!(
+                "`{operation}` expects a string containing exactly one Unicode scalar value"
+            ))),
+        }
     }
 
     fn runtime_error_with_code(

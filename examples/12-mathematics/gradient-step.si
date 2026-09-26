@@ -1,0 +1,14 @@
+# One gradient-descent step for a one-parameter linear model.
+features is [1.0, 2.0, 3.0]
+targets is [2.0, 4.0, 6.0]
+mut slope as Float is 0.0
+learning_rate is 0.1
+
+predictions is vector_scale(features, slope)
+errors is vector_subtract(predictions, targets)
+mse is dot(errors, errors) / length(features)
+gradient is 2.0 * dot(features, errors) / length(features)
+slope -> slope - learning_rate * gradient
+
+Say mse
+Say slope

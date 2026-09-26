@@ -10,6 +10,21 @@ fn runs_basic_values() {
 }
 
 #[test]
+fn compiler_foundation_example_scans_its_source_file() {
+    let output = run_example("examples/11-compiler-foundations/mini-lexer.si");
+    for token in [
+        "identifier: Say",
+        "identifier: total",
+        "number: 42",
+        "operator: +",
+        "string: Ada",
+        "whitespace",
+    ] {
+        assert!(output.contains(token), "missing {token} in {output}");
+    }
+}
+
+#[test]
 fn every_runnable_example_is_a_conformance_regression() {
     let runnable_examples = [
         "examples/01-basics/values.si",
@@ -41,6 +56,7 @@ fn every_runnable_example_is_a_conformance_regression() {
         "examples/10-flow/parallel-scalar.si",
         "examples/10-flow/checkpoint-write.si",
         "examples/10-flow/csv-cleanup.si",
+        "examples/11-compiler-foundations/mini-lexer.si",
         "examples/99-smoke/smoke.si",
     ];
 

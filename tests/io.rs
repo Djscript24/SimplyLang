@@ -214,6 +214,96 @@ fn csv_pipeline_rejects_input_output_and_checkpoint_path_collisions() {
 }
 
 #[test]
+fn reads_and_overwrites_text_files() {
+    let id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("simply-file-api-{id}"));
+    fs::create_dir_all(&root).expect("failed to create file API test directory");
+    let input = root.join("input.txt");
+    let output = root.join("output.txt");
+    let source = root.join("main.si");
+    fs::write(&input, "existing source\n").expect("failed to write file API input");
+    fs::write(
+        &source,
+        format!(
+            "Say read_file(\"{}\")\n\
+             write_file(\"{}\", \"first\")\n\
+             write_file(\"{}\", \"overwritten\")\n\
+             Say read_file(\"{}\")\n",
+            input.display(),
+            output.display(),
+            output.display(),
+            output.display()
+        ),
+    )
+    .expect("failed to write file API source");
+
+    let result = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["run", source.to_str().expect("source path must be UTF-8")])
+        .output()
+        .expect("failed to execute file API source");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout),
+        "existing source\n\noverwritten\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&output).expect("failed to read overwritten output"),
+        "overwritten"
+    );
+    fs::remove_dir_all(root).expect("failed to clean up file API test directory");
+}
+
+#[test]
+fn file_io_failures_return_runtime_diagnostics() {
+    let id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("simply-file-api-errors-{id}"));
+    fs::create_dir_all(&root).expect("failed to create file API error directory");
+    let missing = root.join("missing.txt");
+    let absent_parent = root.join("missing-parent").join("output.txt");
+    let directory = root.join("directory");
+    let invalid_utf8 = root.join("invalid-utf8.txt");
+    fs::create_dir(&directory).expect("failed to create directory for write error test");
+    fs::write(&invalid_utf8, [0xff]).expect("failed to create invalid UTF-8 input");
+
+    for (source, expected) in [
+        (
+            format!("Say read_file(\"{}\")\n", missing.display()),
+            "could not read file",
+        ),
+        (
+            format!("Say read_file(\"{}\")\n", invalid_utf8.display()),
+            "could not read file",
+        ),
+        (
+            format!("write_file(\"{}\", \"content\")\n", absent_parent.display()),
+            "could not write file",
+        ),
+        (
+            format!("write_file(\"{}\", \"content\")\n", directory.display()),
+            "could not write file",
+        ),
+    ] {
+        let (success, error) = run_source(&source);
+        assert!(!success, "{source}");
+        assert!(error.contains("error[E0206]"), "{error}");
+        assert!(error.contains(expected), "{error}");
+    }
+
+    let (success, _, error) = check_source("Say read_file(10)\n");
+    assert!(!success);
+    assert!(error.contains("expected String, found Int"), "{error}");
+    let (success, _, error) = check_source("write_file(\"out.txt\", 10)\n");
+    assert!(!success);
+    assert!(error.contains("expected String, found Int"), "{error}");
+
+    fs::remove_dir_all(root).expect("failed to clean up file API error directory");
+}
+
+#[test]
 fn imports_a_returned_value_relative_to_the_source_file() {
     let directory = std::env::temp_dir().join(format!("simply-import-{}", std::process::id()));
     fs::create_dir_all(&directory).expect("failed to create import directory");

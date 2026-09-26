@@ -11,3 +11,21 @@ Arrays and lists are homogeneous. Tuple elements may have different types and tu
 Function parameters and declared return types are optional. A function without an explicit return annotation returns `Unit` when it reaches the end. A typed function must return a compatible value on every possible branch.
 
 Matrix multiplication validates rectangular numeric matrices and returns a `Matrix` whose cells are `Float`, including when both inputs contain only integers. Empty matrices and incompatible dimensions are runtime errors.
+
+Numerical built-ins accept `Int` and `Float` inputs. `dot` preserves `Int`
+results when both vectors contain integers and uses checked integer arithmetic;
+mixed or floating-point products use `Float`. Scalar transcendental functions,
+vector norms/distances/normalization, and statistical functions return `Float`.
+`sign` returns `Int`. Non-finite floating-point results are runtime errors.
+Population variance and covariance divide by the number of observations.
+Percentiles use linear interpolation on sorted values and accept inclusive
+percent values from 0 to 100.
+
+Vector functions accept non-empty arrays, lists, or tuples of numeric values.
+Element-wise paired operations require equal lengths. Matrix functions accept
+non-empty rectangular rows of numeric arrays or lists and reject ragged rows,
+non-numeric cells, or incompatible dimensions. Matrix multiplication uses the
+standard O(m × n × k) algorithm and returns floating-point cells; matrix
+transpose and element-wise operations are O(rows × columns). Mean, variance,
+standard deviation, covariance, and correlation are calculated in one pass;
+median and percentile sort a copy of their input.

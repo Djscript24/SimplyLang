@@ -23,6 +23,7 @@ Simply is currently an interpreter. The optimization work is intentionally split
   and runtime collections are `Rc`-backed.
 - Loop values are moved directly into the loop binding.
 - Matrix addition, multiplication, and transpose validate shape once and read numeric cells directly without allocating a temporary converted matrix.
+- Explicit vector and matrix math reuses the runtime's existing collection values. Vector dot products, norms, distances, and one-pass statistics are O(n); matrix multiplication is the straightforward O(m × n × k) algorithm. Median and percentile sort a working copy in O(n log n).
 - Lexer and parser vectors reserve an estimated capacity to reduce reallocations.
 - Runtime value scopes, evaluator type scopes, and semantic-analysis scopes maintain nearest-binding indexes, avoiding a scan through every nested frame on lookup.
 - Runtime and type scope stacks reuse popped hash maps across function calls and nested blocks, reducing allocation churn without changing shadowing semantics.

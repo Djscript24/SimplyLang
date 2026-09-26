@@ -487,6 +487,12 @@ impl Parser {
             TokenKind::True => Ok(Expr::Literal(Literal::Bool(true))),
             TokenKind::False => Ok(Expr::Literal(Literal::Bool(false))),
             TokenKind::Identifier(name) => Ok(Expr::Identifier(name)),
+            TokenKind::MultiplyWord if self.check(TokenKind::LeftParen) => {
+                Ok(Expr::Identifier("multiply".into()))
+            }
+            TokenKind::Transpose if self.check(TokenKind::LeftParen) => {
+                Ok(Expr::Identifier("transpose".into()))
+            }
             TokenKind::Array | TokenKind::List => {
                 self.expect(TokenKind::LeftBracket, "expected `[` after collection type")?;
                 let values = self.expression_list(TokenKind::RightBracket)?;

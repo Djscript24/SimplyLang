@@ -1,0 +1,7 @@
+# Vector arithmetic: dot product, Euclidean norm, and distance.
+a is [1, 2, 3]
+b is [4, 5, 6]
+
+Say dot(a, b)
+Say norm([3, 4])
+Say distance([1, 2], [4, 6])

@@ -45,6 +45,11 @@ pub(crate) fn index(
     }
     let index = collection_index(index, span)?;
     match target {
+        Value::String(value) => value
+            .chars()
+            .nth(index)
+            .map(|character| Value::String(character.to_string()))
+            .ok_or_else(|| error(span, "string index out of bounds")),
         Value::Array(values)
         | Value::List(values)
         | Value::Tuple(values)
@@ -116,7 +121,9 @@ fn coordinate(value: &Value, span: Option<&Span>) -> Result<usize, SimplyError> 
 
 fn collection_index(value: &Value, span: Option<&Span>) -> Result<usize, SimplyError> {
     match value {
-        Value::Int(value) if *value >= 0 => Ok(*value as usize),
+        Value::Int(value) if *value >= 0 => {
+            usize::try_from(*value).map_err(|_| error(span, "collection index out of bounds"))
+        }
         _ => Err(error(
             span,
             "collection index must be a non-negative integer",

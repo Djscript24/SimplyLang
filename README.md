@@ -25,6 +25,10 @@ runtime behavior, useful diagnostics, and a compact command-line workflow.
 - Structured lexer, parser, semantic, and runtime diagnostics.
 - Formatter, REPL, native Simply tests, and runtime benchmarks.
 - Deterministic hash/tree iteration and copy-on-write collection storage.
+- String indexing, slicing, character inspection, and text file I/O provide
+  foundations for future self-hosted compiler development.
+- Scalar mathematics, vector and matrix operations, and population statistics
+  provide a numerical foundation for future scientific and ML-oriented work.
 
 ## Quick Start
 
@@ -207,6 +211,17 @@ Say total
 The evaluator fuses supported `where`/`derive` chains ending in `sum` or
 `count`, avoiding intermediate collection materialization where possible.
 
+### Compiler foundations
+
+Strings can be indexed and sliced by Unicode scalar position, traversed in
+linear time after one `characters(text)` conversion, and inspected with
+`is_ascii_alpha`, `is_ascii_digit`, and `is_whitespace`, and read from or written
+to text files with `read_file` and `write_file`. The
+`examples/11-compiler-foundations/mini-lexer.si` example demonstrates reading a
+Simply source file, scanning it one character at a time, and building
+token-like values. These capabilities provide the foundation for future
+self-hosted compiler development; Simply is not self-hosted.
+
 ### Imports
 
 Import a Simply source file relative to the importing file:
@@ -232,10 +247,27 @@ The standard library includes:
 | `total(collection)` | Sum numeric arrays, lists, or tuples. |
 | `trim`, `split`, `replace` | Transform strings. |
 | `starts_with`, `ends_with` | Test string prefixes and suffixes. |
+| `characters(text)` | Materialize a string as an array of scalar strings. |
+| `substring(text, start, length)` | Slice a string by Unicode scalar positions. |
+| `is_ascii_alpha`, `is_ascii_digit`, `is_whitespace` | Inspect one character. |
+| `read_file(path)`, `write_file(path, content)` | Read and write UTF-8 text files. |
+| `sqrt`, `pow`, `exp`, `log`, `log10`, `sin`, `cos`, `tan` | Scalar mathematical functions. |
+| `floor`, `ceil`, `sign`, `abs`, `round`, `clamp` | Numeric rounding, sign, and bounds operations. |
+| `vector_add`, `vector_subtract`, `vector_scale`, `dot`, `norm`, `distance`, `normalize` | Numeric vector operations. |
+| `shape`, `transpose`, `matrix_add`, `matrix_subtract`, `matrix_scale`, `multiply`, `identity` | Rectangular numeric matrix operations. |
+| `mean`, `median`, `variance`, `stddev`, `percentile` | Descriptive statistics; variance uses the population convention. |
+| `covariance`, `correlation` | Pairwise population statistics for equal-length sequences. |
 | `is_empty(value)` | Test collections and strings. |
 | `reverse(sequence)` | Reverse arrays, lists, or tuples. |
 | `type_of(value)` / `print(value)` | Inspect values or print them. |
 | `send(receiver, message, ...)` | Dispatch a function by message name. |
+
+Numerical collection functions use existing Simply arrays, lists, and tuples;
+there is no separate tensor type. Vector and matrix dimensions are validated,
+matrix multiplication uses the standard O(m × n × k) algorithm, and invalid
+domains or non-finite results produce runtime diagnostics. See the
+[language reference](docs/language.md) and [type system](docs/types.md) for
+return types, statistical conventions, errors, and complexity.
 
 ## Command Reference
 
@@ -299,6 +331,8 @@ Function bodies and imported programs use shared storage where appropriate.
 ├── examples/               # Runnable programs grouped by feature and workload
 │   ├── 01-09-*/            # Language and standard-library examples
 │   ├── 10-flow/            # Declarative Flow, quality, CSV, and resume demos
+│   ├── 11-compiler-foundations/ # String, file, and miniature lexer example
+│   ├── 12-mathematics/     # Scalar, vector, matrix, statistics, and gradient examples
 │   ├── 99-smoke/           # Small smoke program
 │   └── 99-bench/           # Benchmark programs and large input fixtures
 ├── tests/                  # Native Simply fixtures and Rust integration tests

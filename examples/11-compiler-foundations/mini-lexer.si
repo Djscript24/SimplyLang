@@ -1,0 +1,58 @@
+# A small lexer-shaped example using Simply's public string and file APIs.
+source is read_file("examples/11-compiler-foundations/sample-source.si")
+source_characters is characters(source)
+mut tokens is list []
+mut index is 0
+mut character is ""
+
+while index < length(source_characters):
+    character -> source_characters[index]
+    if is_whitespace(character):
+        tokens add "whitespace"
+        index -> index + 1
+    else if is_ascii_alpha(character) or character == "_":
+        mut token is list [character]
+        index -> index + 1
+        while index < length(source_characters):
+            if is_ascii_alpha(source_characters[index]) or is_ascii_digit(source_characters[index]) or source_characters[index] == "_":
+                token add source_characters[index]
+                index -> index + 1
+            else:
+                break
+            end
+        end
+        tokens add "identifier: " + join(token, "")
+    else if is_ascii_digit(character):
+        mut token is list [character]
+        index -> index + 1
+        while index < length(source_characters):
+            if is_ascii_digit(source_characters[index]):
+                token add source_characters[index]
+                index -> index + 1
+            else:
+                break
+            end
+        end
+        tokens add "number: " + join(token, "")
+    else if character == "\"":
+        mut token is list []
+        index -> index + 1
+        while index < length(source_characters):
+            if source_characters[index] != "\"":
+                token add source_characters[index]
+                index -> index + 1
+            else:
+                break
+            end
+        end
+        if index < length(source_characters):
+            index -> index + 1
+        end
+        tokens add "string: " + join(token, "")
+    else:
+        tokens add "operator: " + character
+        index -> index + 1
+    end
+end
+
+Say tokens

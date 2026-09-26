@@ -44,7 +44,25 @@ type           = "String" | "Int" | "Float" | "Bool" | "Hash" | "Tree"
 
 Expressions also include array/list literals, tuples, named hash/tree blocks, matrix literals, indexing with `[]`, field access with `.`, function calls, and pipeline blocks.
 
-Built-in calls use the same call syntax as user functions. The standard library includes collection operations such as `range`, `length`, `count`, `contains`, `any`, `all`, `join`, `total`, `is_empty`, and `reverse`, plus string operations such as `trim`, `split`, `replace`, `starts_with`, and `ends_with`. Pipeline terminals include `sum`, `count`, `average`, `min`, `max`, and `write_csv(path)`. `csv_rows(path)` creates a lazy CSV pipeline source; `to_float(text)`, `to_int(text)`, `abs`, `round`, and `clamp` support numeric formulas; and `csv_row(...)` constructs an output row.
+Built-in calls use the same call syntax as user functions. The standard library includes collection operations such as `range`, `length`, `count`, `contains`, `any`, `all`, `join`, `total`, `is_empty`, and `reverse`, plus string operations such as `trim`, `split`, `replace`, `starts_with`, and `ends_with`. Strings support scalar-value indexing, `substring(text, start, length)`, `characters(text)` for one-pass scalar materialization, and the character predicates `is_ascii_alpha`, `is_ascii_digit`, and `is_whitespace`. `read_file(path)` and `write_file(path, content)` provide UTF-8 text file I/O without changing the separate meaning of module imports. Pipeline terminals include `sum`, `count`, `average`, `min`, `max`, and `write_csv(path)`. `csv_rows(path)` creates a lazy CSV pipeline source; `to_float(text)`, `to_int(text)`, `abs`, `round`, and `clamp` support numeric formulas; and `csv_row(...)` constructs an output row.
+
+Scalar math functions include `sqrt`, `pow`, `exp`, `log`, `log10`, `sin`,
+`cos`, `tan`, `floor`, `ceil`, and `sign`. Vector built-ins include
+`vector_add`, `vector_subtract`, `vector_scale`, `dot`, `norm`, `distance`, and
+`normalize`. Matrix built-ins include `shape`, `transpose`, `matrix_add`,
+`matrix_subtract`, `matrix_scale`, `multiply`, and `identity`. Statistical
+built-ins include `mean`, `median`, `variance`, `stddev`, `percentile`,
+`covariance`, and `correlation`. `multiply(...)` and `transpose(...)` are
+function-call forms of words that also participate in existing matrix syntax.
+
+String positions count Unicode scalar values, not bytes or grapheme clusters;
+combining marks therefore occupy separate positions.
+
+Text file paths are interpreted relative to the process working directory.
+File failures and out-of-range string access are reported as runtime errors.
+The compiler-foundations example demonstrates character-by-character source
+processing; these APIs are a foundation for future self-hosted compiler
+development, not a claim that Simply is self-hosted.
 
 The bounded declarative flow syntax is lowered to the same pipeline semantics:
 

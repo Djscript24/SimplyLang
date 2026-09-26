@@ -808,6 +808,34 @@ impl SemanticAnalyzer {
                 self.require_type(&Type::String, &argument_types[0])?;
                 Ok(Type::String)
             }
+            "read_file" => {
+                self.expect_count(name, &argument_types, 1)?;
+                self.require_type(&Type::String, &argument_types[0])?;
+                Ok(Type::String)
+            }
+            "write_file" => {
+                self.expect_count(name, &argument_types, 2)?;
+                self.require_type(&Type::String, &argument_types[0])?;
+                self.require_type(&Type::String, &argument_types[1])?;
+                Ok(Type::Unit)
+            }
+            "substring" => {
+                self.expect_count(name, &argument_types, 3)?;
+                self.require_type(&Type::String, &argument_types[0])?;
+                self.require_type(&Type::Int, &argument_types[1])?;
+                self.require_type(&Type::Int, &argument_types[2])?;
+                Ok(Type::String)
+            }
+            "characters" => {
+                self.expect_count(name, &argument_types, 1)?;
+                self.require_type(&Type::String, &argument_types[0])?;
+                Ok(Type::Array(Box::new(Type::String)))
+            }
+            "is_ascii_alpha" | "is_ascii_digit" | "is_whitespace" => {
+                self.expect_count(name, &argument_types, 1)?;
+                self.require_type(&Type::String, &argument_types[0])?;
+                Ok(Type::Bool)
+            }
             "to_float" => {
                 self.expect_count(name, &argument_types, 1)?;
                 self.require_type(&Type::String, &argument_types[0])?;
@@ -852,6 +880,103 @@ impl SemanticAnalyzer {
                     }
                 }
                 Ok(argument_types[0].clone())
+            }
+            "sqrt" | "exp" | "log" | "log10" | "sin" | "cos" | "tan" | "floor" | "ceil" => {
+                self.expect_count(name, &argument_types, 1)?;
+                self.require_numeric(&argument_types[0])?;
+                Ok(Type::Float)
+            }
+            "sign" => {
+                self.expect_count(name, &argument_types, 1)?;
+                self.require_numeric(&argument_types[0])?;
+                Ok(Type::Int)
+            }
+            "pow" => {
+                self.expect_count(name, &argument_types, 2)?;
+                self.require_numeric(&argument_types[0])?;
+                self.require_numeric(&argument_types[1])?;
+                Ok(Type::Float)
+            }
+            "vector_add" | "vector_subtract" => {
+                self.expect_count(name, &argument_types, 2)?;
+                let left = self.numeric_sequence_element(&argument_types[0])?;
+                let right = self.numeric_sequence_element(&argument_types[1])?;
+                let element = self.numeric_result(&left, &right)?;
+                Ok(Type::Array(Box::new(element)))
+            }
+            "vector_scale" => {
+                self.expect_count(name, &argument_types, 2)?;
+                self.require_numeric(&argument_types[1])?;
+                let element = self.numeric_sequence_element(&argument_types[0])?;
+                Ok(Type::Array(Box::new(
+                    self.numeric_result(&element, &argument_types[1])?,
+                )))
+            }
+            "dot" => {
+                self.expect_count(name, &argument_types, 2)?;
+                let left = self.numeric_sequence_element(&argument_types[0])?;
+                let right = self.numeric_sequence_element(&argument_types[1])?;
+                self.numeric_result(&left, &right)
+            }
+            "norm" => {
+                self.expect_count(name, &argument_types, 1)?;
+                self.numeric_sequence_element(&argument_types[0])?;
+                Ok(Type::Float)
+            }
+            "distance" => {
+                self.expect_count(name, &argument_types, 2)?;
+                self.numeric_sequence_element(&argument_types[0])?;
+                self.numeric_sequence_element(&argument_types[1])?;
+                Ok(Type::Float)
+            }
+            "normalize" => {
+                self.expect_count(name, &argument_types, 1)?;
+                self.numeric_sequence_element(&argument_types[0])?;
+                Ok(Type::Array(Box::new(Type::Float)))
+            }
+            "shape" => {
+                self.expect_count(name, &argument_types, 1)?;
+                self.require_matrix(&argument_types[0])?;
+                Ok(Type::Tuple(vec![Type::Int, Type::Int]))
+            }
+            "transpose" => {
+                self.expect_count(name, &argument_types, 1)?;
+                self.require_matrix(&argument_types[0])?;
+                Ok(Type::Matrix)
+            }
+            "matrix_add" | "matrix_subtract" | "multiply" => {
+                self.expect_count(name, &argument_types, 2)?;
+                self.require_matrix(&argument_types[0])?;
+                self.require_matrix(&argument_types[1])?;
+                Ok(Type::Matrix)
+            }
+            "matrix_scale" => {
+                self.expect_count(name, &argument_types, 2)?;
+                self.require_matrix(&argument_types[0])?;
+                self.require_numeric(&argument_types[1])?;
+                Ok(Type::Matrix)
+            }
+            "identity" => {
+                self.expect_count(name, &argument_types, 1)?;
+                self.require_type(&Type::Int, &argument_types[0])?;
+                Ok(Type::Matrix)
+            }
+            "mean" | "median" | "variance" | "stddev" => {
+                self.expect_count(name, &argument_types, 1)?;
+                self.require_numeric_iterable(&argument_types[0])?;
+                Ok(Type::Float)
+            }
+            "percentile" => {
+                self.expect_count(name, &argument_types, 2)?;
+                self.require_numeric_iterable(&argument_types[0])?;
+                self.require_numeric(&argument_types[1])?;
+                Ok(Type::Float)
+            }
+            "covariance" | "correlation" => {
+                self.expect_count(name, &argument_types, 2)?;
+                self.require_numeric_iterable(&argument_types[0])?;
+                self.require_numeric_iterable(&argument_types[1])?;
+                Ok(Type::Float)
             }
             "clamp" => {
                 self.expect_count(name, &argument_types, 3)?;
@@ -1288,6 +1413,10 @@ impl SemanticAnalyzer {
                 self.require_type(&Type::String, index)?;
                 Ok(Type::Unknown)
             }
+            Type::String => {
+                self.require_type(&Type::Int, index)?;
+                Ok(Type::String)
+            }
             Type::Matrix => match index {
                 Type::Tuple(types)
                     if types.len() == 2
@@ -1386,6 +1515,59 @@ impl SemanticAnalyzer {
             )),
         }
     }
+
+    fn numeric_sequence_element(&self, typ: &Type) -> Result<Type, SimplyError> {
+        let element = self.numeric_sequence_element_option(typ).ok_or_else(|| {
+            self.error(
+                DiagnosticCode::SemanticCollection,
+                format!("expected a numeric sequence, found {}", typ.name()),
+            )
+        })?;
+        self.require_numeric(&element)?;
+        Ok(element)
+    }
+
+    fn numeric_sequence_element_option(&self, typ: &Type) -> Option<Type> {
+        match typ {
+            Type::Array(element) | Type::List(element) => Some((**element).clone()),
+            Type::Tuple(elements) => {
+                let first = elements.first().cloned().unwrap_or(Type::Unknown);
+                if elements
+                    .iter()
+                    .all(|element| element.compatible_with(&first))
+                {
+                    Some(first)
+                } else {
+                    Some(Type::Unknown)
+                }
+            }
+            Type::Unknown => Some(Type::Unknown),
+            _ => None,
+        }
+    }
+
+    fn require_matrix(&self, typ: &Type) -> Result<(), SimplyError> {
+        let row_type = match typ {
+            Type::Matrix => return Ok(()),
+            Type::Array(row) | Type::List(row) => row,
+            Type::Unknown => return Ok(()),
+            _ => {
+                return Err(self.error(
+                    DiagnosticCode::SemanticCollection,
+                    format!("expected a matrix, found {}", typ.name()),
+                ));
+            }
+        };
+        match row_type.as_ref() {
+            Type::Array(element) | Type::List(element) => self.require_numeric(element),
+            Type::Unknown => Ok(()),
+            _ => Err(self.error(
+                DiagnosticCode::SemanticCollection,
+                "matrix rows must be numeric sequences",
+            )),
+        }
+    }
+
     fn numeric_result(&self, left: &Type, right: &Type) -> Result<Type, SimplyError> {
         self.require_numeric(left)?;
         self.require_numeric(right)?;
