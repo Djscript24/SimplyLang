@@ -10,4 +10,4 @@ person is hash:
     name is "Ada"
 end
 
-Say send(person, "greet")
+Sayln send(person, "greet")

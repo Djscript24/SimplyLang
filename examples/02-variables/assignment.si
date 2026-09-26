@@ -7,6 +7,6 @@ mut label as String is "starter"
 
 label -> "updated"
 
-Say scores
-Say scores[1]
-Say label
+Sayln scores
+Sayln scores[1]
+Sayln label

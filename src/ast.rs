@@ -30,6 +30,7 @@ pub enum Stmt {
         statement: Box<Stmt>,
     },
     Say(Expr),
+    Sayln(Expr),
     Expression(Expr),
     Import {
         path: String,

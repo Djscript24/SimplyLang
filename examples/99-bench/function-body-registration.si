@@ -26,4 +26,4 @@ fn large_body(value as Int) gives Int:
     return step20
 end
 
-Say large_body(0)
+Sayln large_body(0)

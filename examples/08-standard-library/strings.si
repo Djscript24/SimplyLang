@@ -5,8 +5,8 @@
 text is "  Ada,Lin  "
 clean is trim(text)
 
-Say clean
-Say split(clean, ",")
-Say replace(text, "Ada", "Citra")
-Say starts_with(clean, "Ada")
-Say ends_with(clean, "Lin")
+Sayln clean
+Sayln split(clean, ",")
+Sayln replace(text, "Ada", "Citra")
+Sayln starts_with(clean, "Ada")
+Sayln ends_with(clean, "Lin")

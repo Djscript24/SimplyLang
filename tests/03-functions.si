@@ -5,4 +5,4 @@ fn double(value as Int) gives Int:
     return value * 2
 end
 
-Say double(21)
+Sayln double(21)

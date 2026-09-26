@@ -14,7 +14,7 @@ fn partition_collects_each_category_in_order() {
                  otherwise -> high\n\
              end\n\
          end\n\
-         Say value\n",
+         Sayln value\n",
     );
     assert!(success, "{output}");
     assert!(output.contains("low: [125, 240]"), "{output}");
@@ -33,8 +33,8 @@ fn flow_partition_uses_the_shared_partition_semantics() {
                  otherwise -> high\n\
              end\n\
          end\n\
-         Say quality\n\
-         Say scores\n",
+         Sayln quality\n\
+         Sayln scores\n",
     );
     assert!(success, "{output}");
     assert!(output.contains("low: [125, 240]"), "{output}");
@@ -55,7 +55,7 @@ fn partition_uses_first_match_wins() {
                  otherwise -> large\n\
              end\n\
          end\n\
-         Say result\n",
+         Sayln result\n",
     );
     assert!(success, "{output}");
     assert!(output.contains("small: [10]"), "{output}");
@@ -74,8 +74,8 @@ fn partition_supports_two_categories_and_omits_unmatched_items() {
                  otherwise -> small\n\
              end\n\
          end\n\
-         Say result\n\
-         Say values\n",
+         Sayln result\n\
+         Sayln values\n",
     );
     assert!(success, "{output}");
     assert!(output.contains("large: [10, 20]"), "{output}");
@@ -102,8 +102,8 @@ fn partition_handles_empty_input_and_rules_without_otherwise() {
                  item > 5 -> medium\n\
              end\n\
          end\n\
-         Say empty_result\n\
-         Say unmatched_result\n",
+         Sayln empty_result\n\
+         Sayln unmatched_result\n",
     );
     assert!(success, "{output}");
     assert!(output.contains("positive: []"), "{output}");
@@ -124,7 +124,7 @@ fn partition_merges_rules_with_the_same_category_in_input_order() {
                  otherwise -> other\n\
              end\n\
          end\n\
-         Say result\n",
+         Sayln result\n",
     );
     assert!(success, "{output}");
     assert!(output.contains("shared: [1, 2]"), "{output}");
@@ -144,7 +144,7 @@ fn where_and_derive_compose_before_partition() {
                  otherwise -> large\n\
              end\n\
          end\n\
-         Say selected\n",
+         Sayln selected\n",
     );
     assert!(success, "{output}");
     assert!(output.contains("small: [4, 6]"), "{output}");
@@ -163,7 +163,7 @@ fn where_can_select_before_partition() {
                  otherwise -> large\n\
              end\n\
          end\n\
-         Say selected\n",
+         Sayln selected\n",
     );
     assert!(success, "{output}");
     assert!(output.contains("small: [2, 3]"), "{output}");
@@ -319,8 +319,8 @@ fn fuses_multi_stage_pipeline_terminals() {
              where item >= 6\n\
              count\n\
          end\n\
-         Say total\n\
-         Say count\n",
+         Sayln total\n\
+         Sayln count\n",
     );
     assert!(success);
     assert_eq!(stdout.lines().collect::<Vec<_>>(), ["21", "2"]);
@@ -330,14 +330,14 @@ fn fuses_multi_stage_pipeline_terminals() {
 fn ranges_are_lazy_but_keep_array_semantics() {
     let (success, output) = run_source_stdout(
         "values is range(0, 5)\n\
-         Say values[3]\n\
-         Say length(values)\n\
+         Sayln values[3]\n\
+         Sayln length(values)\n\
          total is pipeline:\n\
              values\n\
              derive item * 2\n\
              sum\n\
          end\n\
-         Say total\n",
+         Sayln total\n",
     );
     assert!(success);
     assert_eq!(output, "3\n5\n20\n");
@@ -353,8 +353,8 @@ fn multi_stage_pipeline_avoids_stage_materialization() {
              derive item * 10\n\
              where item > 10\n\
          end\n\
-         Say result[0]\n\
-         Say result[1]\n",
+         Sayln result[0]\n\
+         Sayln result[1]\n",
     );
     assert!(success);
     assert_eq!(output, "20\n40\n");
@@ -367,10 +367,10 @@ fn numeric_cleanup_formulas_are_composable() {
          b is abs(-3)\n\
          c is round(12.3456, 2)\n\
          d is clamp(150.0, 0.0, 100.0)\n\
-         Say a\n\
-         Say b\n\
-         Say c\n\
-         Say d\n",
+         Sayln a\n\
+         Sayln b\n\
+         Sayln c\n\
+         Sayln d\n",
     );
     assert!(success);
     assert_eq!(output, "42\n3\n12.35\n100\n");
@@ -392,9 +392,9 @@ fn pipeline_numeric_aggregates_stream_without_materializing() {
              values\n\
              max\n\
          end\n\
-         Say avg\n\
-         Say minimum\n\
-         Say maximum\n",
+         Sayln avg\n\
+         Sayln minimum\n\
+         Sayln maximum\n",
     );
     assert!(success);
     assert_eq!(output, "3\n1\n5\n");
@@ -443,13 +443,13 @@ fn aggregates_compose_with_where_and_derive_and_define_empty_behavior() {
              empty\n\
              count\n\
          end\n\
-         Say total\n\
-         Say amount\n\
-         Say mean\n\
-         Say minimum\n\
-         Say maximum\n\
-         Say empty_total\n\
-         Say empty_count\n",
+         Sayln total\n\
+         Sayln amount\n\
+         Sayln mean\n\
+         Sayln minimum\n\
+         Sayln maximum\n\
+         Sayln empty_total\n\
+         Sayln empty_count\n",
     );
     assert!(success, "{output}");
     assert_eq!(
@@ -485,7 +485,7 @@ fn nested_closure_captures_partition_condition_dependencies() {
              return classify\n\
          end\n\
          classifier is make_classifier(3)\n\
-         Say classifier(list [1, 4])\n";
+         Sayln classifier(list [1, 4])\n";
     let source_id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
         "simply-closure-partition-{}-{source_id}.si",
@@ -509,7 +509,7 @@ fn restores_item_after_pipeline_evaluation() {
     let path = std::env::temp_dir().join(format!("simply-pipeline-{}.si", std::process::id()));
     fs::write(
         &path,
-        "item is 99\nvalues is list [1, 2]\nresult is pipeline:\n    values\n    derive item * 2\n    count\nend\nSay item\n",
+        "item is 99\nvalues is list [1, 2]\nresult is pipeline:\n    values\n    derive item * 2\n    count\nend\nSayln item\n",
     )
     .expect("failed to write pipeline source");
     let output = Command::new(env!("CARGO_BIN_EXE_simply"))

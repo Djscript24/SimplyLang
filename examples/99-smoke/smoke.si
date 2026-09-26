@@ -30,7 +30,7 @@ person is hash:
 end
 
 if total(values) == 30 and filtered_total == 50 and send(person, "greet") == "Hello Ada" and name == "Simply":
-    Say "Smoke test passed"
+    Sayln "Smoke test passed"
 else:
-    Say "Smoke test failed"
+    Sayln "Smoke test failed"
 end

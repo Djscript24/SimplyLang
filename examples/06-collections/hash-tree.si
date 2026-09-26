@@ -11,6 +11,6 @@ catalog is tree:
     featured is profile
 end
 
-Say profile.name
-Say profile["role"]
-Say catalog["featured"].name
+Sayln profile.name
+Sayln profile["role"]
+Sayln catalog["featured"].name

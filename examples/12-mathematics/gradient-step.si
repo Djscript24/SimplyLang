@@ -10,5 +10,5 @@ mse is dot(errors, errors) / length(features)
 gradient is 2.0 * dot(features, errors) / length(features)
 slope -> slope - learning_rate * gradient
 
-Say mse
-Say slope
+Sayln mse
+Sayln slope

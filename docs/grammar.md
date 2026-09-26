@@ -21,7 +21,7 @@ pipeline_step  = "where" expression | "derive" expression
 partition_rule = expression "->" name | "otherwise" "->" name ;
 assignment     = [ "mut" ] name [ "as" type ] "is" expression ;
 reassignment   = name "->" [ newline ] expression ;
-say            = "Say" expression ;
+say            = "Say" expression | "Sayln" expression ;
 function       = "fn" name "(" [ parameters ] ")" [ "gives" type ] ":"
                  newline { statement newline } "end" ;
 conditional    = "if" expression ":" newline { statement newline }

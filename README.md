@@ -11,6 +11,7 @@ runtime behavior, useful diagnostics, and a compact command-line workflow.
 ## Highlights
 
 - Newline-oriented `.si` source files with concise syntax.
+- `Say` output without a newline and `Sayln` output with a newline.
 - Type inference with optional explicit annotations.
 - Immutable bindings by default; use `mut` for reassignment or mutation.
 - Functions with typed parameters and optional return types.
@@ -139,19 +140,19 @@ Array[T]  List[T]  Tuple[T1, T2, ...]
 
 ```simply
 if score >= 90:
-    Say "excellent"
+    Sayln "excellent"
 else if score >= 60:
-    Say "passed"
+    Sayln "passed"
 else:
-    Say "try again"
+    Sayln "try again"
 end
 
 for item in values:
-    Say item
+    Sayln item
 end
 
 while counter < 3:
-    Say counter
+    Sayln counter
     counter -> counter + 1
 end
 ```
@@ -167,7 +168,7 @@ fn add(left as Int, right as Int) gives Int:
 end
 
 result is add(2, 3)
-Say result
+Sayln result
 ```
 
 Function parameters are immutable by default and may be prefixed with `mut`.
@@ -205,7 +206,7 @@ total is pipeline:
     derive item * 2
     sum
 end
-Say total
+Sayln total
 ```
 
 The evaluator fuses supported `where`/`derive` chains ending in `sum` or

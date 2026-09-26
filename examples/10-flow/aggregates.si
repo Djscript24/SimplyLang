@@ -19,7 +19,7 @@ flow highest from values:
     max
 end
 
-Say derived_count
-Say mean
-Say lowest
-Say highest
+Sayln derived_count
+Sayln mean
+Sayln lowest
+Sayln highest

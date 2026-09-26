@@ -8,4 +8,4 @@ result is pipeline:
     derive item * 2
     sum
 end
-Say result
+Sayln result

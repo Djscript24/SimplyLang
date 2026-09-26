@@ -52,7 +52,7 @@ fn partitions_csv_rows_without_materializing_them() {
     fs::write(
         &source,
         format!(
-            "metrics is pipeline:\n    csv_rows(\"{}\")\n    partition item:\n        to_int(item[1]) >= 5 -> kept\n        otherwise -> dropped\n    end\nend\nSay metrics\n",
+            "metrics is pipeline:\n    csv_rows(\"{}\")\n    partition item:\n        to_int(item[1]) >= 5 -> kept\n        otherwise -> dropped\n    end\nend\nSayln metrics\n",
             input.display()
         ),
     )
@@ -92,8 +92,8 @@ fn runtime_accepts_unit_range_and_csv_stream_declared_types() {
              flow total from rows:\n\
                  count\n\
              end\n\
-             Say values\n\
-             Say total\n",
+             Sayln values\n\
+             Sayln total\n",
             input.display()
         ),
     )
@@ -225,10 +225,10 @@ fn reads_and_overwrites_text_files() {
     fs::write(
         &source,
         format!(
-            "Say read_file(\"{}\")\n\
+            "Sayln read_file(\"{}\")\n\
              write_file(\"{}\", \"first\")\n\
              write_file(\"{}\", \"overwritten\")\n\
-             Say read_file(\"{}\")\n",
+             Sayln read_file(\"{}\")\n",
             input.display(),
             output.display(),
             output.display(),
@@ -271,11 +271,11 @@ fn file_io_failures_return_runtime_diagnostics() {
 
     for (source, expected) in [
         (
-            format!("Say read_file(\"{}\")\n", missing.display()),
+            format!("Sayln read_file(\"{}\")\n", missing.display()),
             "could not read file",
         ),
         (
-            format!("Say read_file(\"{}\")\n", invalid_utf8.display()),
+            format!("Sayln read_file(\"{}\")\n", invalid_utf8.display()),
             "could not read file",
         ),
         (
@@ -293,7 +293,7 @@ fn file_io_failures_return_runtime_diagnostics() {
         assert!(error.contains(expected), "{error}");
     }
 
-    let (success, _, error) = check_source("Say read_file(10)\n");
+    let (success, _, error) = check_source("Sayln read_file(10)\n");
     assert!(!success);
     assert!(error.contains("expected String, found Int"), "{error}");
     let (success, _, error) = check_source("write_file(\"out.txt\", 10)\n");
@@ -310,7 +310,7 @@ fn imports_a_returned_value_relative_to_the_source_file() {
     let imported = directory.join("values.si");
     let main = directory.join("main.si");
     fs::write(&imported, "return list [4, 8, 15]\n").expect("failed to write imported source");
-    fs::write(&main, "open \"values.si\" as values\nSay values[1]\n")
+    fs::write(&main, "open \"values.si\" as values\nSayln values[1]\n")
         .expect("failed to write importing source");
 
     let output = Command::new(env!("CARGO_BIN_EXE_simply"))
@@ -338,7 +338,7 @@ fn resolves_nested_and_absolute_imports_without_using_the_working_directory() {
     fs::write(
         &main,
         format!(
-            "open \"nested/middle.si\" as nested\nopen \"{absolute_leaf}\" as absolute\nSay nested[0]\nSay absolute[0]\n"
+            "open \"nested/middle.si\" as nested\nopen \"{absolute_leaf}\" as absolute\nSayln nested[0]\nSayln absolute[0]\n"
         ),
     )
     .expect("failed to write main source");
@@ -409,7 +409,7 @@ fn resolves_nested_imports_independently_of_working_directory() {
     let imported = source_dir.join("values.si");
     let main = source_dir.join("main.si");
     fs::write(&imported, "return list [7, 8, 9]\n").expect("failed to write imported source");
-    fs::write(&main, "open \"values.si\" as values\nSay values[1]\n")
+    fs::write(&main, "open \"values.si\" as values\nSayln values[1]\n")
         .expect("failed to write main source");
 
     let output = Command::new(env!("CARGO_BIN_EXE_simply"))

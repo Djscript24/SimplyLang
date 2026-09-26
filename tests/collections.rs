@@ -3,12 +3,12 @@ use common::*;
 
 #[test]
 fn enforces_float_and_matrix_runtime_contracts() {
-    let (success, float_error) = run_source("Say 1e308 * 1e308\n");
+    let (success, float_error) = run_source("Sayln 1e308 * 1e308\n");
     assert!(!success);
     assert!(float_error.contains("floating-point result is not finite"));
 
     let (success, matrix_output) = run_source_stdout(
-        "left is matrix [[1, 2], [3, 4]]\nright is matrix [[5, 6], [7, 8]]\nSay left multiply right\n",
+        "left is matrix [[1, 2], [3, 4]]\nright is matrix [[5, 6], [7, 8]]\nSayln left multiply right\n",
     );
     assert!(success);
     assert!(matrix_output.contains("19"));
@@ -18,13 +18,13 @@ fn enforces_float_and_matrix_runtime_contracts() {
 #[test]
 fn collection_aliases_detach_before_mutation() {
     let (success, stdout) = run_source_stdout(
-        "values is list [1]\nmut copy is values\ncopy add 2\nSay values\nSay copy\n",
+        "values is list [1]\nmut copy is values\ncopy add 2\nSayln values\nSayln copy\n",
     );
     assert!(success);
     assert_eq!(stdout.lines().collect::<Vec<_>>(), ["[1]", "[1, 2]"]);
 
     let (success, stdout) = run_source_stdout(
-        "profile is hash:\n    name is \"Ada\"\nend\nmut copy is profile\ncopy[\"role\"] -> \"builder\"\nSay profile\nSay copy\n",
+        "profile is hash:\n    name is \"Ada\"\nend\nmut copy is profile\ncopy[\"role\"] -> \"builder\"\nSayln profile\nSayln copy\n",
     );
     assert!(success);
     assert!(
@@ -52,7 +52,7 @@ fn runs_standard_library_builtins() {
 #[test]
 fn runs_boolean_and_string_collection_builtins() {
     let (success, stdout) = run_source_stdout(
-        "flags is list [true, false]\nwords is list [\"Ada\", \"Lin\"]\nSay any(flags)\nSay all(flags)\nSay join(words, \"-\")\n",
+        "flags is list [true, false]\nwords is list [\"Ada\", \"Lin\"]\nSayln any(flags)\nSayln all(flags)\nSayln join(words, \"-\")\n",
     );
     assert!(success);
     assert_eq!(
@@ -60,7 +60,7 @@ fn runs_boolean_and_string_collection_builtins() {
         ["true", "false", "Ada-Lin"]
     );
 
-    let (success, _, error) = check_source("Say join(list [1], \",\")\n");
+    let (success, _, error) = check_source("Sayln join(list [1], \",\")\n");
     assert!(!success);
     assert!(error.contains("expected String, found Int"));
 }
@@ -68,12 +68,12 @@ fn runs_boolean_and_string_collection_builtins() {
 #[test]
 fn runs_direct_sum_builtin() {
     let (success, stdout) = run_source_stdout(
-        "values is list [10, 20, 30]\nSay total(values)\nSay total(array [1.5, 2.5])\n",
+        "values is list [10, 20, 30]\nSayln total(values)\nSayln total(array [1.5, 2.5])\n",
     );
     assert!(success);
     assert_eq!(stdout.lines().collect::<Vec<_>>(), ["60", "4"]);
 
-    let (success, _, error) = check_source("Say total(list [1, \"two\"])\n");
+    let (success, _, error) = check_source("Sayln total(list [1, \"two\"])\n");
     assert!(!success);
     assert!(error.contains("expected a number") || error.contains("String"));
 }
@@ -81,7 +81,7 @@ fn runs_direct_sum_builtin() {
 #[test]
 fn runs_string_builtins() {
     let (success, stdout) = run_source_stdout(
-        "text is \"  Ada,Lin  \"\nSay trim(text)\nSay split(trim(text), \",\")\nSay replace(text, \"Ada\", \"Citra\")\nSay starts_with(trim(text), \"Ada\")\nSay ends_with(trim(text), \"Lin\")\n",
+        "text is \"  Ada,Lin  \"\nSayln trim(text)\nSayln split(trim(text), \",\")\nSayln replace(text, \"Ada\", \"Citra\")\nSayln starts_with(trim(text), \"Ada\")\nSayln ends_with(trim(text), \"Lin\")\n",
     );
     assert!(success);
     assert_eq!(
@@ -93,7 +93,7 @@ fn runs_string_builtins() {
 #[test]
 fn runs_collection_utility_builtins() {
     let (success, stdout) = run_source_stdout(
-        "values is list [1, 2, 3]\nempty is list []\nSay reverse(values)\nSay is_empty(empty)\nSay is_empty(values)\nSay is_empty(\"\")\n",
+        "values is list [1, 2, 3]\nempty is list []\nSayln reverse(values)\nSayln is_empty(empty)\nSayln is_empty(values)\nSayln is_empty(\"\")\n",
     );
     assert!(success);
     assert_eq!(
@@ -105,7 +105,7 @@ fn runs_collection_utility_builtins() {
 #[test]
 fn empty_collections_keep_unknown_element_type_for_mutation() {
     let (success, output) =
-        run_source_stdout("mut values is list []\nvalues add \"ready\"\nSay values\n");
+        run_source_stdout("mut values is list []\nvalues add \"ready\"\nSayln values\n");
     assert!(success, "{output}");
     assert_eq!(output, "[ready]\n");
 }
@@ -113,20 +113,21 @@ fn empty_collections_keep_unknown_element_type_for_mutation() {
 #[test]
 fn builtin_semantics_match_runtime_collection_and_numeric_support() {
     let (success, output) = run_source_stdout(
-        "Say total(range(1, 4))\n\
-         Say clamp(5, 0.5, 4)\n\
-         Say clamp(5.0, 0, 4)\n",
+        "Sayln total(range(1, 4))\n\
+         Sayln clamp(5, 0.5, 4)\n\
+         Sayln clamp(5.0, 0, 4)\n",
     );
     assert!(success, "{output}");
     assert_eq!(output, "6\n4\n4\n");
-    let (success, output) = run_source_stdout("result is clamp(5, 0.5, 4)\nSay type_of(result)\n");
+    let (success, output) =
+        run_source_stdout("result is clamp(5, 0.5, 4)\nSayln type_of(result)\n");
     assert!(success, "{output}");
     assert_eq!(output, "Float\n");
 
     for source in [
-        "Say any(list [1, 2])\n",
-        "Say join(hash:\n    name is \"Ada\"\nend, \",\")\n",
-        "Say round(1e308, 15)\n",
+        "Sayln any(list [1, 2])\n",
+        "Sayln join(hash:\n    name is \"Ada\"\nend, \",\")\n",
+        "Sayln round(1e308, 15)\n",
     ] {
         let (success, _, error) = check_source(source);
         if source.contains("round") {
@@ -175,11 +176,11 @@ fn checks_empty_tuple_iteration_without_rejecting_valid_code() {
 
 #[test]
 fn checks_tuple_and_matrix_index_shapes() {
-    let (success, _, error) = check_source("point is (10, \"Ada\")\nSay point[2]\n");
+    let (success, _, error) = check_source("point is (10, \"Ada\")\nSayln point[2]\n");
     assert!(!success);
     assert!(error.contains("tuple index out of bounds"));
 
-    let (success, _, error) = check_source("m is matrix [[1, 2]]\nSay m[0]\n");
+    let (success, _, error) = check_source("m is matrix [[1, 2]]\nSayln m[0]\n");
     assert!(!success);
     assert!(
         error.contains("matrix index requires a tuple of two integers"),
@@ -190,14 +191,15 @@ fn checks_tuple_and_matrix_index_shapes() {
 #[test]
 fn indexes_tree_values_consistently_with_hash_values() {
     let (success, error) =
-        run_source("profile is tree:\n    name is \"Ada\"\nend\nSay profile[\"name\"]\n");
+        run_source("profile is tree:\n    name is \"Ada\"\nend\nSayln profile[\"name\"]\n");
     assert!(success, "unexpected tree index error: {error}");
 }
 
 #[test]
 fn rejects_ragged_matrices() {
-    let (success, error) =
-        run_source("left is matrix [[1, 2], [3]]\nright is matrix [[1], [2]]\nSay left + right\n");
+    let (success, error) = run_source(
+        "left is matrix [[1, 2], [3]]\nright is matrix [[1], [2]]\nSayln left + right\n",
+    );
     assert!(!success);
     assert!(error.contains("equal widths"));
 }

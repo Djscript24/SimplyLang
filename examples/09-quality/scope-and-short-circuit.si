@@ -12,10 +12,10 @@ end
 
 if true:
     value is "inner"
-    Say value
+    Sayln value
 end
 
-Say scale(7)
-Say value
-Say false and missing_value
-Say true or missing_value
+Sayln scale(7)
+Sayln value
+Sayln false and missing_value
+Sayln true or missing_value

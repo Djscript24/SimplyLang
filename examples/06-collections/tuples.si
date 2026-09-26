@@ -5,6 +5,6 @@
 coordinates is (12, 30)
 (x, y) is coordinates
 
-Say x
-Say y
-Say coordinates[0]
+Sayln x
+Sayln y
+Sayln coordinates[0]

@@ -5,8 +5,8 @@
 mut step is 0
 
 while step < 3:
-    Say step
+    Sayln step
     step -> step + 1
 end
 
-Say step
+Sayln step

@@ -5,9 +5,9 @@
 score is 87
 
 if score >= 90:
-    Say "excellent"
+    Sayln "excellent"
 else if score >= 60:
-    Say "passed"
+    Sayln "passed"
 else:
-    Say "try again"
+    Sayln "try again"
 end

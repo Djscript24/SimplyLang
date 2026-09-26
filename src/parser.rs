@@ -60,6 +60,10 @@ impl Parser {
             let expr = self.expression()?;
             return Ok(Stmt::Say(expr));
         }
+        if self.match_kind(TokenKind::Sayln) {
+            let expr = self.expression()?;
+            return Ok(Stmt::Sayln(expr));
+        }
 
         if self.match_kind(TokenKind::Open) {
             let path = match self.advance().kind.clone() {
@@ -900,6 +904,16 @@ mod tests {
         assert_eq!(
             inner(&program.statements[1]),
             &Stmt::Say(Expr::Literal(Literal::Int(42)))
+        );
+    }
+
+    #[test]
+    fn parses_sayln_statements() {
+        let tokens = Lexer::new("Sayln \"Hello\"\n").tokenize().unwrap();
+        let program = Parser::new(tokens).parse().unwrap();
+        assert_eq!(
+            inner(&program.statements[0]),
+            &Stmt::Sayln(Expr::Literal(Literal::String("Hello".into())))
         );
     }
 

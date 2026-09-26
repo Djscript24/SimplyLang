@@ -7,4 +7,4 @@ fn make_adder(base as Int):
 end
 
 adder is make_adder(40)
-Say adder(2)
+Sayln adder(2)

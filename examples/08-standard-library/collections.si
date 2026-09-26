@@ -7,10 +7,10 @@ values is list [10, 20, 30]
 words is list ["Ada", "Lin"]
 empty is list []
 
-Say any(flags)
-Say all(flags)
-Say total(values)
-Say join(words, "-")
-Say reverse(values)
-Say is_empty(empty)
-Say is_empty(values)
+Sayln any(flags)
+Sayln all(flags)
+Sayln total(values)
+Sayln join(words, "-")
+Sayln reverse(values)
+Sayln is_empty(empty)
+Sayln is_empty(values)

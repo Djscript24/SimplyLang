@@ -13,7 +13,7 @@ fn runs_basic_values() {
 fn compiler_foundation_example_scans_its_source_file() {
     let output = run_example("examples/11-compiler-foundations/mini-lexer.si");
     for token in [
-        "identifier: Say",
+        "identifier: Sayln",
         "identifier: total",
         "number: 42",
         "operator: +",
@@ -195,7 +195,7 @@ fn cli_commands_use_expected_exit_codes_and_streams() {
         std::process::id(),
         TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed)
     ));
-    fs::write(&malformed_path, "Say\n").expect("failed to write malformed source");
+    fs::write(&malformed_path, "Sayln\n").expect("failed to write malformed source");
     let malformed_format = Command::new(binary)
         .args(["fmt", malformed_path.to_str().expect("non-UTF-8 path")])
         .output()
@@ -208,10 +208,10 @@ fn cli_commands_use_expected_exit_codes_and_streams() {
 #[test]
 fn test_command_discovers_only_direct_si_files_in_tests() {
     let (success, stdout, stderr) = run_test_project(&[
-        ("tests/01-basic.si", "Say \"basic\"\n"),
-        ("tests/02-functions.si", "Say \"functions\"\n"),
-        ("tests/ignored.txt", "Say @\n"),
-        ("tests/nested/ignored.si", "Say @\n"),
+        ("tests/01-basic.si", "Sayln \"basic\"\n"),
+        ("tests/02-functions.si", "Sayln \"functions\"\n"),
+        ("tests/ignored.txt", "Sayln @\n"),
+        ("tests/nested/ignored.si", "Sayln @\n"),
         ("examples/imported-values.si", "return list [1]\n"),
     ]);
 
@@ -227,8 +227,8 @@ fn test_command_discovers_only_direct_si_files_in_tests() {
 #[test]
 fn test_command_continues_after_malformed_test_and_returns_failure() {
     let (success, stdout, stderr) = run_test_project(&[
-        ("tests/01-broken.si", "Say\n"),
-        ("tests/02-after-failure.si", "Say \"still runs\"\n"),
+        ("tests/01-broken.si", "Sayln\n"),
+        ("tests/02-after-failure.si", "Sayln \"still runs\"\n"),
     ]);
 
     assert!(!success);
@@ -237,7 +237,7 @@ fn test_command_continues_after_malformed_test_and_returns_failure() {
     assert!(stdout.contains("test result: FAILED"));
     assert!(stdout.contains("1 passed; 1 failed"));
     assert!(stderr.contains("error[E0104]"));
-    assert!(stderr.contains("1 | Say"));
+    assert!(stderr.contains("1 | Sayln"));
 }
 
 #[test]
@@ -253,7 +253,7 @@ fn repl_preserves_state_prints_expressions_and_recovers_from_errors() {
         .stdin
         .as_mut()
         .expect("REPL stdin was unavailable")
-        .write_all(b"x is 10\nSay \"from say\"\nx + 5\nSay missing\nx\n")
+        .write_all(b"x is 10\nSay \"from \"\nSayln \"say\"\nx + 5\nSayln missing\nx\n")
         .expect("failed to write REPL input");
     let output = child
         .wait_with_output()
@@ -264,9 +264,8 @@ fn repl_preserves_state_prints_expressions_and_recovers_from_errors() {
     assert!(stdout.contains("Simply 0.9.0"));
     assert!(stdout.contains("from say"));
     assert!(stdout.contains("15"));
-    assert!(stdout.contains("from say\n--------------------\n15\n"));
-    assert!(stdout.contains("15\n--------------------\n10\n"));
-    assert!(stdout.ends_with("10\n--------------------\n"));
+    assert!(stdout.contains("from say\n15\n"));
+    assert!(stdout.ends_with("10\n"));
     assert!(!stdout.contains("> "));
     assert!(!stdout.contains("... "));
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -299,13 +298,13 @@ fn repl_evaluates_pasted_multiline_blocks_as_single_statements() {
               \n\
               if true:\n\
                   value is \"inner\"\n\
-                  Say value\n\
+                  Sayln value\n\
               end\n\
               \n\
-              Say scale(7)\n\
-              Say value\n\
-              Say false and missing_value\n\
-              Say true or missing_value\n",
+              Sayln scale(7)\n\
+              Sayln value\n\
+              Sayln false and missing_value\n\
+              Sayln true or missing_value\n",
         )
         .expect("failed to write REPL input");
     drop(child.stdin.take());
@@ -317,19 +316,7 @@ fn repl_evaluates_pasted_multiline_blocks_as_single_statements() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
         stdout.lines().collect::<Vec<_>>(),
-        [
-            "Simply 0.9.0",
-            "inner",
-            "--------------------",
-            "21",
-            "--------------------",
-            "10",
-            "--------------------",
-            "false",
-            "--------------------",
-            "true",
-            "--------------------",
-        ]
+        ["Simply 0.9.0", "inner", "21", "10", "false", "true"]
     );
     assert!(!stdout.contains("> "));
     assert!(!stdout.contains("... "));
@@ -351,7 +338,7 @@ fn repl_exit_aliases_quit_without_evaluating_later_input() {
             .stdin
             .as_mut()
             .expect("REPL stdin was unavailable")
-            .write_all(format!("{command}\nSay \"should not run\"\n").as_bytes())
+            .write_all(format!("{command}\nSayln \"should not run\"\n").as_bytes())
             .expect("failed to write REPL input");
         let output = child
             .wait_with_output()

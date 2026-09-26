@@ -8,5 +8,5 @@ mut queue is list ["first", "second"]
 queue add "third"
 queue remove "first"
 
-Say cities
-Say queue
+Sayln cities
+Sayln queue

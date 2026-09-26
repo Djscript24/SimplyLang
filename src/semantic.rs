@@ -270,7 +270,7 @@ impl SemanticAnalyzer {
                     self.current_span = Some(span.clone());
                     self.analyze_statements(std::slice::from_ref(statement.as_ref()))?;
                 }
-                Stmt::Say(expression) | Stmt::Expression(expression) => {
+                Stmt::Say(expression) | Stmt::Sayln(expression) | Stmt::Expression(expression) => {
                     self.analyze_expression(expression)?;
                 }
                 Stmt::Import { alias, .. } => {

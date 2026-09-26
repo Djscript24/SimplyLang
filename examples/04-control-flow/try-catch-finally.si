@@ -3,21 +3,21 @@
 try:
     throw "custom failure"
 catch ignored as E0202:
-    Say "wrong handler"
+    Sayln "wrong handler"
 catch error:
-    Say error.message
+    Sayln error.message
 finally:
-    Say "cleanup complete"
+    Sayln "cleanup complete"
 end
 
 try:
     try:
         throw "inner failure"
     finally:
-        Say "inner cleanup"
+        Sayln "inner cleanup"
     end
 catch error:
-    Say "outer caught: " + error.message
+    Sayln "outer caught: " + error.message
 finally:
-    Say "outer cleanup"
+    Sayln "outer cleanup"
 end

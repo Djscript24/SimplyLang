@@ -1,8 +1,8 @@
 # Population statistics and linearly interpolated percentiles.
 measurements is [1, 2, 3, 4]
 
-Say mean(measurements)
-Say variance(measurements)
-Say stddev(measurements)
-Say median(measurements)
-Say percentile(measurements, 25)
+Sayln mean(measurements)
+Sayln variance(measurements)
+Sayln stddev(measurements)
+Sayln median(measurements)
+Sayln percentile(measurements, 25)

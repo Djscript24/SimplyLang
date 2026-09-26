@@ -1,9 +1,9 @@
 # loops.si — for-loop example
 # Demonstrates iterating over a list with a loop-local variable.
-# Key components: list iteration and Say.
+# Key components: list iteration and Sayln.
 # For-loop variables are local to the loop
 names is list ["Ada", "Lin", "Rio"]
 
 for name in names:
-    Say name
+    Sayln name
 end

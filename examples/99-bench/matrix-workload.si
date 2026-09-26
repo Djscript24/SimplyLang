@@ -13,4 +13,4 @@ while index < 100:
     index -> index + 1
 end
 
-Say result[0, 0]
+Sayln result[0, 0]

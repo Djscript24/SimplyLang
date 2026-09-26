@@ -18,7 +18,7 @@ fn nested_functions_resolve_lexical_bindings() {
              return add\n\
          end\n\
          adder is make_adder(40)\n\
-         Say adder(2)\n",
+         Sayln adder(2)\n",
     );
 
     assert!(success);
@@ -40,7 +40,7 @@ fn nested_closures_preserve_dependencies_and_shadowing() {
          end\n\
          make_adder is make_outer(10)\n\
          adder is make_adder(20)\n\
-         Say adder(2)\n",
+         Sayln adder(2)\n",
     );
 
     assert!(success);
@@ -63,13 +63,14 @@ fn sends_messages_to_value_objects() {
 
 #[test]
 fn checks_literal_messages_before_runtime() {
-    let (success, _, error) =
-        check_source("person is hash:\n    name is \"Ada\"\nend\nSay send(person, \"missing\")\n");
+    let (success, _, error) = check_source(
+        "person is hash:\n    name is \"Ada\"\nend\nSayln send(person, \"missing\")\n",
+    );
     assert!(!success);
     assert!(error.contains("unknown message `missing`"));
 
     let (success, _, error) = check_source(
-        "fn greet(self as Hash):\n    return self[\"name\"]\nend\nperson is hash:\n    name is \"Ada\"\nend\nSay send(person, \"greet\")\n",
+        "fn greet(self as Hash):\n    return self[\"name\"]\nend\nperson is hash:\n    name is \"Ada\"\nend\nSayln send(person, \"greet\")\n",
     );
     assert!(success, "valid message failed semantic checking: {error}");
 }
@@ -95,7 +96,7 @@ fn locates_duplicate_function_errors_at_the_duplicate_declaration() {
 #[test]
 fn requires_typed_functions_to_return_on_all_paths() {
     let (success, _, error) = check_source(
-        "fn choose(flag as Bool) gives Int:\n    if flag:\n        return 1\n    else:\n        Say \"missing return\"\n    end\nend\n",
+        "fn choose(flag as Bool) gives Int:\n    if flag:\n        return 1\n    else:\n        Sayln \"missing return\"\n    end\nend\n",
     );
     assert!(!success);
     assert!(error.contains("must return Int"));
@@ -108,8 +109,9 @@ fn requires_typed_functions_to_return_on_all_paths() {
 
 #[test]
 fn keeps_function_bindings_local() {
-    let (success, _, error) =
-        check_source("fn make():\n    local is 42\n    return local\nend\nSay make()\nSay local\n");
+    let (success, _, error) = check_source(
+        "fn make():\n    local is 42\n    return local\nend\nSayln make()\nSayln local\n",
+    );
     assert!(!success);
     assert!(error.contains("unknown variable `local`"));
 }

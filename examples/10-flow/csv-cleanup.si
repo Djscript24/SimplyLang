@@ -6,4 +6,4 @@ flow cleaned from csv_rows("examples/99-bench/random-large.csv"):
     write_csv("/tmp/simply-flow-cleaned.csv")
 end
 
-Say "CSV cleanup complete"
+Sayln "CSV cleanup complete"

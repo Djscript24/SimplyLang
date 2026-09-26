@@ -5,46 +5,47 @@ use common::*;
 fn indexes_strings_by_unicode_scalar_value() {
     let (success, output) = run_source_stdout(
         "text is \"Aé🦀Z\"\n\
-         Say text[0]\n\
-         Say text[1]\n\
-         Say text[3]\n",
+         Sayln text[0]\n\
+         Sayln text[1]\n\
+         Sayln text[3]\n",
     );
     assert!(success, "{output}");
     assert_eq!(output, "A\né\nZ\n");
 
-    let (success, output) = run_source_stdout("Say length(\"é\")\nSay substring(\"é\", 0, 1)\n");
+    let (success, output) =
+        run_source_stdout("Sayln length(\"é\")\nSayln substring(\"é\", 0, 1)\n");
     assert!(success, "{output}");
     assert_eq!(output, "2\ne\n");
 
-    let (success, error) = run_source("text is \"\"\nSay text[0]\n");
+    let (success, error) = run_source("text is \"\"\nSayln text[0]\n");
     assert!(!success);
     assert!(error.contains("string index out of bounds"), "{error}");
 
-    let (success, error) = run_source("text is \"abc\"\nSay text[3]\n");
+    let (success, error) = run_source("text is \"abc\"\nSayln text[3]\n");
     assert!(!success);
     assert!(error.contains("string index out of bounds"), "{error}");
 
-    let (success, _, error) = check_source("Say \"abc\"[0]\n");
+    let (success, _, error) = check_source("Sayln \"abc\"[0]\n");
     assert!(success, "{error}");
 }
 
 #[test]
 fn substrings_use_unicode_scalar_offsets_and_allow_empty_boundaries() {
     let (success, output) = run_source_stdout(
-        "Say substring(\"Aé🦀Z\", 0, 1)\n\
-         Say substring(\"Aé🦀Z\", 1, 2)\n\
-         Say substring(\"Aé🦀Z\", 3, 1)\n\
-         Say substring(\"Aé🦀Z\", 4, 0)\n\
-         Say substring(\"\", 0, 0)\n",
+        "Sayln substring(\"Aé🦀Z\", 0, 1)\n\
+         Sayln substring(\"Aé🦀Z\", 1, 2)\n\
+         Sayln substring(\"Aé🦀Z\", 3, 1)\n\
+         Sayln substring(\"Aé🦀Z\", 4, 0)\n\
+         Sayln substring(\"\", 0, 0)\n",
     );
     assert!(success, "{output}");
     assert_eq!(output, "A\né🦀\nZ\n\n\n");
 
     for source in [
-        "Say substring(\"abc\", 4, 0)\n",
-        "Say substring(\"abc\", 1, 3)\n",
-        "Say substring(\"abc\", -1, 1)\n",
-        "Say substring(\"abc\", 0, -1)\n",
+        "Sayln substring(\"abc\", 4, 0)\n",
+        "Sayln substring(\"abc\", 1, 3)\n",
+        "Sayln substring(\"abc\", -1, 1)\n",
+        "Sayln substring(\"abc\", 0, -1)\n",
     ] {
         let (success, error) = run_source(source);
         assert!(!success, "{source}");
@@ -60,17 +61,20 @@ fn substrings_use_unicode_scalar_offsets_and_allow_empty_boundaries() {
 #[test]
 fn character_predicates_cover_lexer_needs_and_validate_scalar_count() {
     let (success, output) = run_source_stdout(
-        "Say is_ascii_alpha(\"A\")\n\
-         Say is_ascii_alpha(\"é\")\n\
-         Say is_ascii_digit(\"7\")\n\
-         Say is_ascii_digit(\"٣\")\n\
-         Say is_whitespace(\" \")\n\
-         Say is_whitespace(\"\\n\")\n",
+        "Sayln is_ascii_alpha(\"A\")\n\
+         Sayln is_ascii_alpha(\"é\")\n\
+         Sayln is_ascii_digit(\"7\")\n\
+         Sayln is_ascii_digit(\"٣\")\n\
+         Sayln is_whitespace(\" \")\n\
+         Sayln is_whitespace(\"\\n\")\n",
     );
     assert!(success, "{output}");
     assert_eq!(output, "true\nfalse\ntrue\nfalse\ntrue\ntrue\n");
 
-    for source in ["Say is_ascii_alpha(\"\")\n", "Say is_ascii_digit(\"ab\")\n"] {
+    for source in [
+        "Sayln is_ascii_alpha(\"\")\n",
+        "Sayln is_ascii_digit(\"ab\")\n",
+    ] {
         let (success, error) = run_source(source);
         assert!(!success, "{source}");
         assert!(
@@ -79,7 +83,7 @@ fn character_predicates_cover_lexer_needs_and_validate_scalar_count() {
         );
     }
 
-    let (success, _, error) = check_source("Say is_ascii_digit(1)\n");
+    let (success, _, error) = check_source("Sayln is_ascii_digit(1)\n");
     assert!(!success);
     assert!(error.contains("expected String, found Int"), "{error}");
 }
@@ -87,15 +91,15 @@ fn character_predicates_cover_lexer_needs_and_validate_scalar_count() {
 #[test]
 fn characters_materializes_unicode_scalars_for_linear_traversal() {
     let (success, output) =
-        run_source_stdout("Say characters(\"Aé🦀é\")\nSay type_of(characters(\"\"))\n");
+        run_source_stdout("Sayln characters(\"Aé🦀é\")\nSayln type_of(characters(\"\"))\n");
     assert!(success, "{output}");
     assert_eq!(output, "[A, é, 🦀, e, ́]\nArray\n");
 
-    let (success, output) = run_source_stdout("Say characters(\"\")\n");
+    let (success, output) = run_source_stdout("Sayln characters(\"\")\n");
     assert!(success, "{output}");
     assert_eq!(output, "[]\n");
 
-    let (success, _, error) = check_source("Say characters(10)\n");
+    let (success, _, error) = check_source("Sayln characters(10)\n");
     assert!(!success);
     assert!(error.contains("expected String, found Int"), "{error}");
 }

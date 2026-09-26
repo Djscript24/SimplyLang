@@ -12,7 +12,7 @@ use std::{
 use std::os::fd::AsRawFd;
 
 use crate::{
-    ast::{Expr, PipelineStep, Stmt},
+    ast::{Expr, PipelineStep, Program, Stmt},
     error::{DiagnosticCode, SimplyError, Span},
     evaluator::Evaluator,
     formatter,
@@ -498,9 +498,10 @@ fn collect_statement_stats(statements: &[Stmt], stats: &mut ExplainStats, inside
                 stats.throws += 1;
                 collect_expression_stats(expression, stats);
             }
-            Stmt::Say(expression) | Stmt::Expression(expression) | Stmt::Return(expression) => {
-                collect_expression_stats(expression, stats)
-            }
+            Stmt::Say(expression)
+            | Stmt::Sayln(expression)
+            | Stmt::Expression(expression)
+            | Stmt::Return(expression) => collect_expression_stats(expression, stats),
             Stmt::Reassign { value, .. } | Stmt::CollectionOp { value, .. } => {
                 collect_expression_stats(value, stats)
             }
@@ -686,9 +687,14 @@ fn repl() -> i32 {
     let interactive = stdin.is_terminal();
     let mut input = String::new();
     let mut line = String::new();
+    let mut pending_programs: Vec<(Program, String)> = Vec::new();
 
     loop {
-        if interactive && !repl_input_pending(&stdin) {
+        let input_pending = interactive && repl_input_pending(&stdin);
+        if !input_pending {
+            run_pending_repl_programs(&mut evaluator, &mut pending_programs);
+        }
+        if interactive && !input_pending {
             let prompt = if input.is_empty() { "> " } else { "... " };
             print!("{}", stdout_paint(prompt, CYAN));
             if io::stdout().flush().is_err() {
@@ -697,9 +703,13 @@ fn repl() -> i32 {
         }
         line.clear();
         match stdin.read_line(&mut line) {
-            Ok(0) => return 0,
+            Ok(0) => {
+                run_pending_repl_programs(&mut evaluator, &mut pending_programs);
+                return 0;
+            }
             Ok(_) => {
                 if input.is_empty() && is_repl_exit_command(&line) {
+                    run_pending_repl_programs(&mut evaluator, &mut pending_programs);
                     return 0;
                 }
                 input.push_str(&line);
@@ -722,9 +732,7 @@ fn repl() -> i32 {
                         continue;
                     }
                 };
-                if let Err(error) = evaluator.run_repl(&program) {
-                    render_error("<repl>", error, &input);
-                }
+                pending_programs.push((program, input.clone()));
                 input.clear();
             }
             Err(error) => {
@@ -739,6 +747,17 @@ fn repl() -> i32 {
                 );
                 return 1;
             }
+        }
+    }
+}
+
+fn run_pending_repl_programs(
+    evaluator: &mut Evaluator,
+    pending_programs: &mut Vec<(Program, String)>,
+) {
+    for (program, source) in pending_programs.drain(..) {
+        if let Err(error) = evaluator.run_repl(&program) {
+            render_error("<repl>", error, &source);
         }
     }
 }

@@ -6,6 +6,7 @@ use crate::error::{DiagnosticCode, SimplyError, Span};
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     Say,
+    Sayln,
     Open,
     Fn,
     Return,
@@ -207,6 +208,7 @@ impl<'a> Lexer<'a> {
         let word = &self.source[start..self.index];
         let kind = match word {
             "Say" => TokenKind::Say,
+            "Sayln" => TokenKind::Sayln,
             "open" => TokenKind::Open,
             "fn" => TokenKind::Fn,
             "return" => TokenKind::Return,
@@ -436,7 +438,7 @@ mod tests {
 
     #[test]
     fn lexes_all_base_values() {
-        let tokens = Lexer::new("Say \"hello\"\nSay -42\nSay 3.14\nSay true\nSay false\n")
+        let tokens = Lexer::new("Say \"hello\"\nSayln -42\nSay 3.14\nSayln true\nSay false\n")
             .tokenize()
             .unwrap();
         let kinds: Vec<TokenKind> = tokens.into_iter().map(|t| t.kind).collect();
@@ -446,14 +448,14 @@ mod tests {
                 TokenKind::Say,
                 TokenKind::String("hello".into()),
                 TokenKind::Newline,
-                TokenKind::Say,
+                TokenKind::Sayln,
                 TokenKind::Minus,
                 TokenKind::Int(42),
                 TokenKind::Newline,
                 TokenKind::Say,
                 TokenKind::Float(314.0 / 100.0),
                 TokenKind::Newline,
-                TokenKind::Say,
+                TokenKind::Sayln,
                 TokenKind::True,
                 TokenKind::Newline,
                 TokenKind::Say,

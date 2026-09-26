@@ -3,7 +3,7 @@
 # Key components: greet, add, and keep_rate.
 # Typed parameters, return values, and Unit-returning functions
 fn greet(name as String):
-    Say "Hello " + name
+    Sayln "Hello " + name
 end
 
 fn add(left as Int, right as Int) gives Int:
@@ -16,5 +16,5 @@ end
 
 greet("Alex")
 total is add(10, 20)
-Say total
-Say keep_rate(0.85)
+Sayln total
+Sayln keep_rate(0.85)

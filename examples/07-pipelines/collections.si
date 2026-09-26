@@ -17,5 +17,5 @@ how_many is pipeline:
     count
 end
 
-Say total
-Say how_many
+Sayln total
+Sayln how_many

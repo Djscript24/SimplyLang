@@ -5,7 +5,7 @@
 left is matrix [[1, 2], [3, 4]]
 right is matrix [[5, 6], [7, 8]]
 
-Say left[0, 1]
-Say left + right
-Say left multiply right
-Say left transpose
+Sayln left[0, 1]
+Sayln left + right
+Sayln left multiply right
+Sayln left transpose

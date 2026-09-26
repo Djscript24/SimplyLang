@@ -11,7 +11,7 @@ fn declarative_flow_lowers_to_pipeline() {
              derive item * 2\n\
              sum\n\
          end\n\
-         Say total\n",
+         Sayln total\n",
     );
     assert!(success, "{output}");
     assert!(output.contains("18"), "{output}");
@@ -39,7 +39,7 @@ fn explain_flow_prints_deterministic_execution_plan() {
 
 #[test]
 fn explain_flow_identifies_non_flow_programs() {
-    let (success, output) = explain_flow_source("Say 42\n");
+    let (success, output) = explain_flow_source("Sayln 42\n");
     assert!(success, "{output}");
     assert!(output.contains("program kind: non-flow"), "{output}");
     assert!(output.contains("flows: none"), "{output}");
@@ -326,7 +326,7 @@ fn flow_parallel_hint_preserves_deterministic_result() {
              derive item * 2\n\
              sum\n\
          end\n\
-         Say total\n",
+         Sayln total\n",
     );
     assert!(success, "{output}");
     assert!(output.contains("20"), "{output}");
@@ -478,7 +478,7 @@ fn invalid_flow_checkpoint_is_reported() {
              derive item\n\
              write_csv(\"{}\")\n\
          end\n\
-         Say total\n",
+         Sayln total\n",
         input.display(),
         checkpoint.display(),
         output_path.display()

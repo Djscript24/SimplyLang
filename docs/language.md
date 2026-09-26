@@ -11,7 +11,8 @@ Simply source files use the `.si` extension. `#` starts a comment outside a stri
 
 - `name is expression` defines an immutable binding; prefix with `mut` for a mutable binding (`mut name as Type is expression`).
 - `name -> expression` reassigns an existing mutable binding.
-- `Say expression` prints a value.
+- `Say expression` prints a value without ending the line.
+- `Sayln expression` prints a value followed by a newline.
 - `fn name(parameters) gives Type: ... end` defines a function. Functions may be
   nested inside functions or control-flow blocks and resolve visible lexical bindings.
   A nested function can be returned, stored in a binding, and called later as a

@@ -2,7 +2,7 @@
 A is [[1, 2], [3, 4]]
 B is [[5, 6], [7, 8]]
 
-Say shape(A)
-Say multiply(A, B)
-Say transpose(A)
-Say multiply(A, identity(2))
+Sayln shape(A)
+Sayln multiply(A, B)
+Sayln transpose(A)
+Sayln multiply(A, identity(2))

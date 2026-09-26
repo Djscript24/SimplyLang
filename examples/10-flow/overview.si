@@ -8,4 +8,4 @@ flow total from values:
     sum
 end
 
-Say total
+Sayln total

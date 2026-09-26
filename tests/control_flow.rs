@@ -19,11 +19,11 @@ fn runs_break_and_continue() {
 fn catches_runtime_errors_and_always_runs_finally() {
     let (success, output) = run_source_stdout(
         "try:\n\
-             Say 1 / 0\n\
+             Sayln 1 / 0\n\
          catch error:\n\
-             Say \"caught: \" + error.message\n\
+             Sayln \"caught: \" + error.message\n\
          finally:\n\
-             Say \"cleanup\"\n\
+             Sayln \"cleanup\"\n\
          end\n",
     );
 
@@ -37,9 +37,9 @@ fn supports_throw_structured_errors_and_code_filtered_catches() {
         "try:\n\
              throw \"custom failure\"\n\
          catch ignored as E0202:\n\
-             Say \"wrong handler\"\n\
+             Sayln \"wrong handler\"\n\
          catch error:\n\
-             Say error.code + \": \" + error.message\n\
+             Sayln error.code + \": \" + error.message\n\
          end\n",
     );
 
@@ -54,12 +54,12 @@ fn supports_nested_try_blocks_and_propagates_to_outer_catch() {
              try:\n\
                  throw \"inner failure\"\n\
              finally:\n\
-                 Say \"inner cleanup\"\n\
+                 Sayln \"inner cleanup\"\n\
              end\n\
          catch error:\n\
-             Say \"outer caught: \" + error.message\n\
+             Sayln \"outer caught: \" + error.message\n\
          finally:\n\
-             Say \"outer cleanup\"\n\
+             Sayln \"outer cleanup\"\n\
          end\n",
     );
 
@@ -74,9 +74,9 @@ fn supports_nested_try_blocks_and_propagates_to_outer_catch() {
 fn finally_runs_before_propagating_an_uncaught_error() {
     let (success, output) = run_source_stdout(
         "try:\n\
-             Say 1 / 0\n\
+             Sayln 1 / 0\n\
          finally:\n\
-             Say \"cleanup\"\n\
+             Sayln \"cleanup\"\n\
          end\n",
     );
 
@@ -94,7 +94,7 @@ fn finally_control_flow_overrides_pending_control_flow() {
                  return 2\n\
              end\n\
          end\n\
-         Say value()\n",
+         Sayln value()\n",
     );
 
     assert!(success);
@@ -103,7 +103,8 @@ fn finally_control_flow_overrides_pending_control_flow() {
 
 #[test]
 fn keeps_branch_bindings_local_at_runtime() {
-    let (success, error) = run_source("if true:\n    branch_value is 42\nend\nSay branch_value\n");
+    let (success, error) =
+        run_source("if true:\n    branch_value is 42\nend\nSayln branch_value\n");
     assert!(!success);
     assert!(error.contains("unknown variable `branch_value`"));
 }

@@ -10,4 +10,4 @@ result is pipeline:
     sum
 end
 
-Say result
+Sayln result
