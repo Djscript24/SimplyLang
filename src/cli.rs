@@ -693,6 +693,9 @@ fn repl() -> i32 {
         match stdin.read_line(&mut line) {
             Ok(0) => return 0,
             Ok(_) => {
+                if input.is_empty() && is_repl_exit_command(&line) {
+                    return 0;
+                }
                 input.push_str(&line);
                 let tokens = match Lexer::new(&input).tokenize() {
                     Ok(tokens) => tokens,
@@ -732,6 +735,10 @@ fn repl() -> i32 {
             }
         }
     }
+}
+
+fn is_repl_exit_command(line: &str) -> bool {
+    matches!(line.trim(), ":q" | ":quit" | ":exit" | "quit" | "exit")
 }
 
 fn repl_block_depth(tokens: &[Token]) -> usize {

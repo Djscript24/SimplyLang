@@ -321,6 +321,39 @@ fn repl_evaluates_pasted_multiline_blocks_as_single_statements() {
 }
 
 #[test]
+fn repl_exit_aliases_quit_without_evaluating_later_input() {
+    for command in [":q", ":quit", ":exit", "quit", "exit"] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_simply"))
+            .arg("repl")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to start REPL");
+        child
+            .stdin
+            .as_mut()
+            .expect("REPL stdin was unavailable")
+            .write_all(format!("{command}\nSay \"should not run\"\n").as_bytes())
+            .expect("failed to write REPL input");
+        let output = child
+            .wait_with_output()
+            .expect("failed to read REPL output");
+
+        assert!(
+            output.status.success(),
+            "{command} did not exit successfully"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("should not run"),
+            "{command} did not stop the REPL"
+        );
+        assert!(output.stderr.is_empty(), "{command} wrote to stderr");
+    }
+}
+
+#[test]
 fn reports_failure_for_missing_example() {
     assert!(!Path::new("examples/does-not-exist.si").exists());
 }
