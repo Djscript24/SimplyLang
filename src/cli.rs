@@ -8,6 +8,9 @@ use std::{
     time::Instant,
 };
 
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+
 use crate::{
     ast::{Expr, PipelineStep, Stmt},
     error::{DiagnosticCode, SimplyError, Span},
@@ -680,14 +683,17 @@ fn repl() -> i32 {
     );
     let mut evaluator = Evaluator::new();
     let stdin = io::stdin();
+    let interactive = stdin.is_terminal();
     let mut input = String::new();
     let mut line = String::new();
 
     loop {
-        let prompt = if input.is_empty() { "> " } else { "... " };
-        print!("{}", stdout_paint(prompt, CYAN));
-        if io::stdout().flush().is_err() {
-            return 1;
+        if interactive && !repl_input_pending(&stdin) {
+            let prompt = if input.is_empty() { "> " } else { "... " };
+            print!("{}", stdout_paint(prompt, CYAN));
+            if io::stdout().flush().is_err() {
+                return 1;
+            }
         }
         line.clear();
         match stdin.read_line(&mut line) {
@@ -735,6 +741,22 @@ fn repl() -> i32 {
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn repl_input_pending(stdin: &io::Stdin) -> bool {
+    let mut descriptor = libc::pollfd {
+        fd: stdin.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // A zero timeout checks for buffered terminal input without blocking.
+    unsafe { libc::poll(&mut descriptor, 1, 0) > 0 && descriptor.revents & libc::POLLIN != 0 }
+}
+
+#[cfg(not(unix))]
+fn repl_input_pending(_stdin: &io::Stdin) -> bool {
+    false
 }
 
 fn is_repl_exit_command(line: &str) -> bool {
