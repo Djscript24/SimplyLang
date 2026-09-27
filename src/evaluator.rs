@@ -5,7 +5,7 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
     fs,
-    io::{self, BufRead, BufReader, IsTerminal, Read, Write},
+    io::{self, BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -22,7 +22,10 @@ use crate::{
     runtime::{
         collections, operations,
         scope::ScopeStack,
-        value::{FunctionValue, Value, owned_map_values, owned_values, shared_map, shared_values},
+        value::{
+            CsvStreamVersion, EnumValue, FunctionValue, StructInstance, Value, owned_map_values,
+            owned_values, shared_map, shared_values,
+        },
     },
     types::Type,
 };
@@ -740,10 +743,13 @@ fn collect_declared_names(statements: &[Stmt], names: &mut HashSet<String>) {
             Stmt::Assign { name, .. } | Stmt::Flow { name, .. } | Stmt::Function { name, .. } => {
                 names.insert(name.clone());
             }
-            Stmt::Destructure {
-                names: bindings, ..
-            } => {
-                names.extend(bindings.iter().map(|(name, _)| name.clone()));
+            Stmt::Destructure { pattern, .. } => {
+                names.extend(
+                    pattern
+                        .destructure_binding_names()
+                        .into_iter()
+                        .map(str::to_owned),
+                );
             }
             Stmt::For { name, .. } => {
                 names.insert(name.clone());
@@ -802,6 +808,14 @@ fn collect_statement_dependencies(
             Stmt::Assign { value, .. } | Stmt::Reassign { value, .. } => {
                 collect_expression_dependencies(value, bound, dependencies)
             }
+            Stmt::DestructureReassign { pattern, value } => {
+                collect_expression_dependencies(value, bound, dependencies);
+                for name in pattern.destructure_binding_names() {
+                    if !bound.contains(name) {
+                        dependencies.insert(name.to_owned());
+                    }
+                }
+            }
             Stmt::Flow { source, steps, .. } => {
                 collect_expression_dependencies(source, bound, dependencies);
                 collect_pipeline_step_dependencies(steps, bound, dependencies);
@@ -850,7 +864,12 @@ fn collect_statement_dependencies(
                 collect_expression_dependencies(condition, bound, dependencies);
                 collect_statement_dependencies(body, bound, dependencies);
             }
-            Stmt::Import { .. } | Stmt::Break | Stmt::Continue => {}
+            Stmt::Import { .. }
+            | Stmt::Struct { .. }
+            | Stmt::Enum { .. }
+            | Stmt::Message { .. }
+            | Stmt::Break
+            | Stmt::Continue => {}
         }
     }
 }
@@ -879,6 +898,102 @@ fn collect_expression_dependencies(
             }
             for argument in arguments {
                 collect_expression_dependencies(argument, bound, dependencies);
+            }
+        }
+        Expr::MessageDispatch {
+            receiver,
+            message,
+            arguments,
+        } => {
+            collect_expression_dependencies(receiver, bound, dependencies);
+            if !bound.contains(message) {
+                dependencies.insert(message.clone());
+            }
+            for argument in arguments {
+                collect_expression_dependencies(argument, bound, dependencies);
+            }
+        }
+        Expr::EnumVariant {
+            enum_name,
+            arguments,
+            ..
+        } => {
+            if !bound.contains(enum_name) {
+                dependencies.insert(enum_name.clone());
+            }
+            for argument in arguments {
+                collect_expression_dependencies(argument, bound, dependencies);
+            }
+        }
+        Expr::Match { value, arms } => {
+            collect_expression_dependencies(value, bound, dependencies);
+            for arm in arms {
+                let mut arm_bound = bound.clone();
+                collect_pattern_bindings(&arm.pattern, &mut arm_bound);
+                for statement in &arm.body {
+                    collect_statement_dependencies(
+                        std::slice::from_ref(statement),
+                        &arm_bound,
+                        dependencies,
+                    );
+                }
+                if let Some(guard) = &arm.guard {
+                    collect_expression_dependencies(guard, &arm_bound, dependencies);
+                }
+                if let Some(result) = &arm.result {
+                    collect_expression_dependencies(result, &arm_bound, dependencies);
+                }
+            }
+
+            fn collect_pattern_bindings(
+                pattern: &crate::ast::MatchPattern,
+                bindings: &mut HashSet<String>,
+            ) {
+                match pattern {
+                    crate::ast::MatchPattern::Literal(_)
+                    | crate::ast::MatchPattern::Range { .. } => {}
+                    crate::ast::MatchPattern::Or(alternatives) => {
+                        for alternative in alternatives {
+                            collect_pattern_bindings(alternative, bindings);
+                        }
+                    }
+                    crate::ast::MatchPattern::Identifier(name) => {
+                        bindings.insert(name.clone());
+                    }
+                    crate::ast::MatchPattern::Alias { name, pattern } => {
+                        bindings.insert(name.clone());
+                        collect_pattern_bindings(pattern, bindings);
+                    }
+                    crate::ast::MatchPattern::Tuple(patterns) => {
+                        for pattern in patterns {
+                            collect_pattern_bindings(pattern, bindings);
+                        }
+                    }
+                    crate::ast::MatchPattern::Sequence { patterns, rest } => {
+                        for pattern in patterns {
+                            collect_pattern_bindings(pattern, bindings);
+                        }
+                        if let Some(rest) = rest {
+                            bindings.insert(rest.clone());
+                        }
+                    }
+                    crate::ast::MatchPattern::EnumVariant {
+                        payload: Some(payload),
+                        ..
+                    } => collect_pattern_bindings(payload, bindings),
+                    crate::ast::MatchPattern::Struct { fields, .. } => {
+                        for pattern in fields {
+                            collect_pattern_bindings(pattern, bindings);
+                        }
+                    }
+                    crate::ast::MatchPattern::Hash(entries) => {
+                        for (_, pattern) in entries {
+                            collect_pattern_bindings(pattern, bindings);
+                        }
+                    }
+                    crate::ast::MatchPattern::EnumVariant { payload: None, .. }
+                    | crate::ast::MatchPattern::Wildcard => {}
+                }
             }
         }
         Expr::Array(values) | Expr::List(values) | Expr::Tuple(values) | Expr::Matrix(values) => {
@@ -937,11 +1052,36 @@ fn collect_pipeline_step_dependencies(
     }
 }
 
+#[derive(Clone)]
+struct StructDefinition {
+    fields: Vec<crate::ast::StructField>,
+}
+
+#[derive(Clone)]
+struct EnumDefinition {
+    variants: Vec<crate::ast::EnumVariant>,
+}
+
+#[derive(Clone)]
+struct MessageBehavior {
+    function: Rc<FunctionValue>,
+    field_count: usize,
+}
+
+struct ActiveMessageState {
+    instance: Rc<StructInstance>,
+    scope_index: usize,
+}
+
 #[derive(Default)]
 pub struct Evaluator {
     scopes: ScopeStack,
     variable_types: TypeScopes,
     function_scopes: Vec<HashMap<String, Arc<Function>>>,
+    struct_scopes: Vec<HashMap<String, StructDefinition>>,
+    enum_scopes: Vec<HashMap<String, EnumDefinition>>,
+    message_scopes: Vec<HashMap<(String, String), MessageBehavior>>,
+    active_message_states: Vec<ActiveMessageState>,
     current_span: Option<Span>,
     current_file: Option<PathBuf>,
     import_stack: Vec<PathBuf>,
@@ -1055,7 +1195,76 @@ impl Evaluator {
     }
 
     fn assign(&mut self, name: &str, value: Value) -> bool {
-        self.scopes.assign(name, value)
+        let binding_scope = self.scopes.binding_scope(name);
+        if !self.scopes.assign(name, value.clone()) {
+            return false;
+        }
+        if let Some(instance) = self
+            .active_message_states
+            .iter()
+            .rev()
+            .find(|state| {
+                Some(state.scope_index) == binding_scope
+                    && state.instance.fields.borrow().contains_key(name)
+            })
+            .map(|state| state.instance.clone())
+        {
+            instance.fields.borrow_mut().insert(name.to_owned(), value);
+        }
+        true
+    }
+
+    fn assign_many(&mut self, bindings: Vec<(String, Value)>) -> Result<(), SimplyError> {
+        let mut resolved = Vec::with_capacity(bindings.len());
+        for (name, value) in bindings {
+            let scope_index = self.scopes.binding_scope(&name).ok_or_else(|| {
+                self.runtime_error_with_code(
+                    DiagnosticCode::InvalidReassignment,
+                    format!("cannot reassign unknown variable `{name}`"),
+                )
+            })?;
+            if !self.scopes.is_mutable(&name) {
+                return Err(self.runtime_error_with_code(
+                    DiagnosticCode::InvalidReassignment,
+                    format!("cannot reassign immutable variable `{name}`; declare it with `mut`"),
+                ));
+            }
+            if let Some(expected) = self.variable_types.lookup(&name).cloned() {
+                self.ensure_reassignment_type(&value, &expected, &name)?;
+            }
+            resolved.push((scope_index, name, value));
+        }
+
+        let names = resolved
+            .iter()
+            .map(|(_, name, _)| name.clone())
+            .collect::<Vec<_>>();
+        self.scopes.assign_many(resolved).map_err(|error| {
+            self.runtime_error_with_code(DiagnosticCode::InvalidReassignment, error)
+        })?;
+        for name in names {
+            self.persist_active_message_field(&name);
+        }
+        Ok(())
+    }
+
+    fn persist_active_message_field(&self, name: &str) {
+        let binding_scope = self.scopes.binding_scope(name);
+        let Some(instance) = self
+            .active_message_states
+            .iter()
+            .rev()
+            .find(|state| {
+                Some(state.scope_index) == binding_scope
+                    && state.instance.fields.borrow().contains_key(name)
+            })
+            .map(|state| state.instance.clone())
+        else {
+            return;
+        };
+        if let Some(value) = self.lookup(name).cloned() {
+            instance.fields.borrow_mut().insert(name.to_owned(), value);
+        }
     }
 
     fn remove_current(&mut self, name: &str) -> Option<Value> {
@@ -1066,6 +1275,9 @@ impl Evaluator {
         self.scopes.push();
         self.variable_types.push();
         self.function_scopes.push(HashMap::new());
+        self.struct_scopes.push(HashMap::new());
+        self.enum_scopes.push(HashMap::new());
+        self.message_scopes.push(HashMap::new());
     }
 
     fn pop_scope(&mut self) {
@@ -1073,6 +1285,15 @@ impl Evaluator {
         self.variable_types.pop();
         if self.function_scopes.len() > 1 {
             self.function_scopes.pop();
+        }
+        if self.struct_scopes.len() > 1 {
+            self.struct_scopes.pop();
+        }
+        if self.enum_scopes.len() > 1 {
+            self.enum_scopes.pop();
+        }
+        if self.message_scopes.len() > 1 {
+            self.message_scopes.pop();
         }
     }
 }
@@ -1278,6 +1499,9 @@ impl Evaluator {
             scopes: ScopeStack::new(),
             variable_types: TypeScopes::new(),
             function_scopes: vec![HashMap::new()],
+            struct_scopes: vec![HashMap::new()],
+            enum_scopes: vec![HashMap::new()],
+            message_scopes: vec![HashMap::new()],
             output_enabled: true,
             ..Self::default()
         }
@@ -1285,6 +1509,153 @@ impl Evaluator {
 
     pub fn run(&mut self, program: &Program) -> Result<(), SimplyError> {
         self.run_with_output(program, true)
+    }
+
+    fn register_declarations(&mut self, statements: &[Stmt]) -> Result<(), SimplyError> {
+        for statement in statements.iter().filter_map(|statement| match statement {
+            Stmt::Located { statement, .. } => Some(statement.as_ref()),
+            statement => Some(statement),
+        }) {
+            if let Stmt::Enum { name, variants } = statement {
+                let existing_type = self.lookup_struct(name).is_some()
+                    || self
+                        .enum_scopes
+                        .iter()
+                        .any(|scope| scope.contains_key(name));
+                if existing_type {
+                    return Err(self.runtime_error_with_code(
+                        DiagnosticCode::DuplicateDeclaration,
+                        format!("type `{name}` is already declared"),
+                    ));
+                }
+                self.enum_scopes
+                    .last_mut()
+                    .expect("enum scope stack always has a scope")
+                    .insert(
+                        name.clone(),
+                        EnumDefinition {
+                            variants: variants.clone(),
+                        },
+                    );
+            }
+        }
+        for statement in statements.iter().filter_map(|statement| match statement {
+            Stmt::Located { statement, .. } => Some(statement.as_ref()),
+            statement => Some(statement),
+        }) {
+            if let Stmt::Struct { name, fields } = statement {
+                if self
+                    .struct_scopes
+                    .last()
+                    .is_some_and(|scope| scope.contains_key(name))
+                {
+                    return Err(self.runtime_error_with_code(
+                        DiagnosticCode::DuplicateDeclaration,
+                        format!("type `{name}` is already declared"),
+                    ));
+                }
+                if self
+                    .enum_scopes
+                    .iter()
+                    .any(|scope| scope.contains_key(name))
+                {
+                    return Err(self.runtime_error_with_code(
+                        DiagnosticCode::DuplicateDeclaration,
+                        format!("type `{name}` is already declared"),
+                    ));
+                }
+                self.struct_scopes
+                    .last_mut()
+                    .expect("struct scope stack always has a scope")
+                    .insert(
+                        name.clone(),
+                        StructDefinition {
+                            fields: fields.clone(),
+                        },
+                    );
+            }
+        }
+        for statement in statements.iter().filter_map(|statement| match statement {
+            Stmt::Located { statement, .. } => Some(statement.as_ref()),
+            statement => Some(statement),
+        }) {
+            if let Stmt::Message {
+                receiver_type,
+                name,
+                parameters,
+                body,
+            } = statement
+            {
+                let definition = self.lookup_struct(receiver_type).cloned().ok_or_else(|| {
+                    self.runtime_error_with_code(
+                        DiagnosticCode::RuntimeMessage,
+                        format!("unknown receiver type `{receiver_type}` for message `{name}`"),
+                    )
+                })?;
+                let key = (receiver_type.clone(), name.clone());
+                if self
+                    .message_scopes
+                    .last()
+                    .is_some_and(|scope| scope.contains_key(&key))
+                {
+                    return Err(self.runtime_error_with_code(
+                        DiagnosticCode::DuplicateDeclaration,
+                        format!("message `{name}` is already defined for `{receiver_type}`"),
+                    ));
+                }
+                let mut function_parameters = definition
+                    .fields
+                    .iter()
+                    .map(|field| (field.name.clone(), Some(field.field_type.clone()), true))
+                    .collect::<Vec<_>>();
+                function_parameters.extend(parameters.iter().cloned());
+                let function = Rc::new(FunctionValue {
+                    parameters: function_parameters,
+                    return_type: None,
+                    body: Arc::clone(body),
+                    captures: RefCell::new(HashMap::new()),
+                });
+                self.message_scopes
+                    .last_mut()
+                    .expect("message scope stack always has a scope")
+                    .insert(
+                        key,
+                        MessageBehavior {
+                            function,
+                            field_count: definition.fields.len(),
+                        },
+                    );
+            }
+        }
+        Ok(())
+    }
+
+    fn lookup_struct(&self, name: &str) -> Option<&StructDefinition> {
+        self.struct_scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name))
+    }
+
+    fn lookup_enum(&self, name: &str) -> Option<&EnumDefinition> {
+        self.enum_scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name))
+    }
+
+    pub(crate) fn enum_names(&self) -> impl Iterator<Item = String> + '_ {
+        self.enum_scopes
+            .iter()
+            .flat_map(|scope| scope.keys().cloned())
+    }
+
+    fn lookup_message(&self, type_name: &str, message: &str) -> Option<&MessageBehavior> {
+        let key = (type_name.to_owned(), message.to_owned());
+        self.message_scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(&key))
     }
 
     pub fn run_silent_resolved(
@@ -1303,6 +1674,7 @@ impl Evaluator {
         output_enabled: bool,
     ) -> Result<(), SimplyError> {
         self.output_enabled = output_enabled;
+        self.register_declarations(&program.statements)?;
         match self.execute_statements(&program.statements)? {
             Flow::None => Ok(()),
             _ => Err(self.runtime_error("control statement is outside its valid context".into())),
@@ -1310,6 +1682,7 @@ impl Evaluator {
     }
 
     pub fn run_repl(&mut self, program: &Program) -> Result<(), SimplyError> {
+        self.register_declarations(&program.statements)?;
         for statement in &program.statements {
             let (span, statement) = match statement {
                 Stmt::Located { span, statement } => (Some(span.clone()), statement.as_ref()),
@@ -1448,6 +1821,15 @@ impl Evaluator {
                             .runtime_error(format!("cannot reassign unknown variable `{name}`")));
                     }
                 }
+                Stmt::DestructureReassign { pattern, value } => {
+                    let value = self.evaluate(value)?;
+                    let Some(bindings) = self.match_value_pattern(pattern, &value)? else {
+                        return Err(self.runtime_error(
+                            "destructuring assignment target does not match the value".into(),
+                        ));
+                    };
+                    self.assign_many(bindings)?;
+                }
                 Stmt::CollectionOp {
                     name,
                     operation,
@@ -1478,6 +1860,7 @@ impl Evaluator {
                         }
                     };
                     collections::mutate_list(target, operation, value, name, span.as_ref())?;
+                    self.persist_active_message_field(name);
                 }
                 Stmt::SetIndex { name, index, value } => {
                     if !self.scopes.is_mutable(name) {
@@ -1505,33 +1888,43 @@ impl Evaluator {
                         }
                     };
                     collections::set_index(target, index_value, value, span.as_ref())?;
+                    self.persist_active_message_field(name);
                 }
-                Stmt::Destructure { names, value } => {
-                    let values = match self.evaluate(value)? {
-                        Value::Tuple(values) => owned_values(values),
-                        _ => {
-                            return Err(self.runtime_error("destructuring requires a tuple".into()));
-                        }
+                Stmt::Destructure {
+                    pattern,
+                    mutable,
+                    value,
+                } => {
+                    let value = self.evaluate(value)?;
+                    let Some(bindings) = self.match_value_pattern(pattern, &value)? else {
+                        return Err(self.runtime_error(
+                            "destructuring target does not match the value".into(),
+                        ));
                     };
-                    if names.len() != values.len() {
-                        return Err(
-                            self.runtime_error("tuple and names have different lengths".into())
-                        );
-                    }
-                    for ((name, mutable), value) in names.iter().zip(values) {
-                        self.variable_types.define(
-                            name.clone(),
-                            Self::type_of_value(&value),
-                            *mutable,
-                        );
-                        self.scopes
-                            .define(name.clone(), value, *mutable)
-                            .map_err(|error| {
-                                self.runtime_error_with_code(
-                                    DiagnosticCode::DuplicateDeclaration,
-                                    error,
-                                )
-                            })?;
+                    let typed_bindings = bindings
+                        .into_iter()
+                        .map(|(name, value)| {
+                            let typ = Self::type_of_value(&value);
+                            (name, value, typ, *mutable)
+                        })
+                        .collect::<Vec<_>>();
+                    self.scopes
+                        .define_many(
+                            typed_bindings
+                                .iter()
+                                .map(|(name, value, _, mutable)| {
+                                    (name.clone(), value.clone(), *mutable)
+                                })
+                                .collect(),
+                        )
+                        .map_err(|error| {
+                            self.runtime_error_with_code(
+                                DiagnosticCode::DuplicateDeclaration,
+                                error,
+                            )
+                        })?;
+                    for (name, _, typ, mutable) in typed_bindings {
+                        self.variable_types.define(name, typ, mutable);
                     }
                 }
                 Stmt::Function {
@@ -1583,6 +1976,7 @@ impl Evaluator {
                             )
                         })?;
                 }
+                Stmt::Struct { .. } | Stmt::Enum { .. } | Stmt::Message { .. } => {}
                 Stmt::Return(expr) => return Ok(Flow::Return(self.evaluate(expr)?)),
                 Stmt::Throw(expr) => {
                     let value = self.evaluate(expr)?;
@@ -1792,6 +2186,7 @@ impl Evaluator {
             import_cache: Rc::clone(&self.import_cache),
             ..Self::new()
         };
+        module.register_declarations(&program.statements)?;
         match module.execute_statements(&program.statements)? {
             Flow::Return(value) => Ok(value),
             Flow::None => {
@@ -1838,7 +2233,20 @@ impl Evaluator {
             }
             Expr::Pipeline { source, steps } => {
                 let source = match self.evaluate(source)? {
-                    Value::CsvStream(path) => return self.evaluate_csv_pipeline(&path, steps),
+                    Value::CsvStream {
+                        path,
+                        start_record,
+                        start_offset,
+                        source_version,
+                    } => {
+                        return self.evaluate_csv_pipeline(
+                            &path,
+                            start_record,
+                            start_offset,
+                            source_version.as_ref(),
+                            steps,
+                        );
+                    }
                     Value::Range { start, end } => {
                         return self.evaluate_range_pipeline(start, end, steps);
                     }
@@ -1876,6 +2284,85 @@ impl Evaluator {
                 operations::binary(left, operator, right, self.current_span.as_ref())
             }
             Expr::Call { name, arguments } => {
+                if let Some(definition) = self.lookup_struct(name).cloned() {
+                    let values = self.evaluate_values(arguments)?;
+                    return self.construct_struct(name, &definition, values);
+                }
+                if name == "Ask" {
+                    if !(1..=2).contains(&arguments.len()) {
+                        return Err(self
+                            .runtime_error("`Ask` expects a prompt and an optional type".into()));
+                    }
+                    let prompt = match self.evaluate(&arguments[0])? {
+                        Value::String(prompt) => prompt,
+                        _ => {
+                            return Err(self.runtime_error("`Ask` prompt must be a string".into()));
+                        }
+                    };
+                    let target_type = match arguments.get(1) {
+                        None => Type::String,
+                        Some(Expr::Identifier(type_name)) => match type_name.as_str() {
+                            "String" => Type::String,
+                            "Int" => Type::Int,
+                            "Float" => Type::Float,
+                            "Bool" => Type::Bool,
+                            _ => {
+                                return Err(self.runtime_error(format!(
+                                    "unsupported `Ask` type `{type_name}`"
+                                )));
+                            }
+                        },
+                        Some(_) => {
+                            return Err(self.runtime_error(
+                                "`Ask` type must be `Int`, `Float`, `String`, or `Bool`".into(),
+                            ));
+                        }
+                    };
+                    if self.output_enabled {
+                        let mut stdout = io::stdout().lock();
+                        stdout
+                            .write_all(prompt.as_bytes())
+                            .and_then(|()| stdout.flush())
+                            .map_err(|error| {
+                                self.runtime_error(format!("could not write `Ask` prompt: {error}"))
+                            })?;
+                    }
+                    let mut input = String::new();
+                    let bytes_read = io::stdin().lock().read_line(&mut input).map_err(|error| {
+                        self.runtime_error(format!("could not read `Ask` input: {error}"))
+                    })?;
+                    if bytes_read == 0 {
+                        return Err(self.runtime_error("no input received for `Ask`".into()));
+                    }
+                    let input = input.trim_end_matches(['\r', '\n']);
+                    return match target_type {
+                        Type::String => Ok(Value::String(input.to_owned())),
+                        Type::Int => input.trim().parse::<i64>().map(Value::Int).map_err(|_| {
+                            self.runtime_error_with_code(
+                                DiagnosticCode::RuntimeConversion,
+                                format!("`Ask` expected an Int, got `{input}`"),
+                            )
+                        }),
+                        Type::Float => match input.trim().parse::<f64>() {
+                            Ok(value) if value.is_finite() => Ok(Value::Float(value)),
+                            _ => Err(self.runtime_error_with_code(
+                                DiagnosticCode::RuntimeConversion,
+                                format!("`Ask` expected a finite Float, got `{input}`"),
+                            )),
+                        },
+                        Type::Bool if input.trim().eq_ignore_ascii_case("true") => {
+                            Ok(Value::Bool(true))
+                        }
+                        Type::Bool if input.trim().eq_ignore_ascii_case("false") => {
+                            Ok(Value::Bool(false))
+                        }
+                        Type::Bool => Err(self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeConversion,
+                            format!("`Ask` expected Bool (`true` or `false`), got `{input}`"),
+                        )),
+                        _ => unreachable!("Ask target type is validated above"),
+                    };
+                }
                 if is_math_builtin(name) {
                     let values = arguments
                         .iter()
@@ -1885,32 +2372,6 @@ impl Evaluator {
                         .ok_or_else(|| {
                             self.runtime_error(format!("unknown numerical builtin `{name}`"))
                         });
-                }
-                if name == "send" {
-                    if arguments.len() < 2 {
-                        return Err(self.runtime_error_with_code(
-                            DiagnosticCode::RuntimeMessage,
-                            "`send` expects a receiver and a message",
-                        ));
-                    }
-                    let receiver = self.evaluate(&arguments[0])?;
-                    let message = match self.evaluate(&arguments[1])? {
-                        Value::String(message) => message,
-                        _ => {
-                            return Err(self.runtime_error_with_code(
-                                DiagnosticCode::RuntimeMessage,
-                                "`send` message must be a string",
-                            ));
-                        }
-                    };
-                    let mut values = vec![receiver];
-                    values.extend(
-                        arguments[2..]
-                            .iter()
-                            .map(|argument| self.evaluate(argument))
-                            .collect::<Result<Vec<_>, _>>()?,
-                    );
-                    return self.invoke_function(&message, values);
                 }
                 if name == "print" {
                     if arguments.len() != 1 {
@@ -1934,7 +2395,7 @@ impl Evaluator {
                         Value::Float(_) => "Float",
                         Value::Bool(_) => "Bool",
                         Value::Range { .. } => "Array",
-                        Value::CsvStream(_) => "List",
+                        Value::CsvStream { .. } => "List",
                         Value::Array(_) => "Array",
                         Value::List(_) => "List",
                         Value::Tuple(_) => "Tuple",
@@ -1942,6 +2403,12 @@ impl Evaluator {
                         Value::Tree(_) => "Tree",
                         Value::Matrix(_) => "Matrix",
                         Value::Function(_) => "Function",
+                        Value::Struct(instance) => {
+                            return Ok(Value::String(instance.type_name.clone()));
+                        }
+                        Value::Enum(value) => {
+                            return Ok(Value::String(value.enum_name.clone()));
+                        }
                     };
                     return Ok(Value::String(type_name.into()));
                 }
@@ -2451,7 +2918,12 @@ impl Evaluator {
                             );
                         }
                     };
-                    return Ok(Value::CsvStream(path));
+                    return Ok(Value::CsvStream {
+                        path,
+                        start_record: 0,
+                        start_offset: 0,
+                        source_version: None,
+                    });
                 }
                 if name == "csv_row" {
                     let values = arguments
@@ -2466,6 +2938,75 @@ impl Evaluator {
                     .collect::<Result<Vec<_>, _>>()?;
                 self.invoke_function(name, values)
             }
+            Expr::MessageDispatch {
+                receiver,
+                message,
+                arguments,
+            } => {
+                let receiver = self.evaluate(receiver)?;
+                let argument_values = arguments
+                    .iter()
+                    .map(|argument| self.evaluate(argument))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.dispatch_message(receiver, message, argument_values)
+            }
+            Expr::EnumVariant {
+                enum_name,
+                variant_name,
+                arguments,
+            } => {
+                if let Some(definition) = self.lookup_enum(enum_name).cloned() {
+                    let Some(variant) = definition
+                        .variants
+                        .iter()
+                        .find(|variant| variant.name == *variant_name)
+                    else {
+                        return Err(self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeGeneral,
+                            format!("unknown variant `{enum_name}::{variant_name}`"),
+                        ));
+                    };
+                    let values = self.evaluate_values(arguments)?;
+                    let payload = match (&variant.payload_type, values.as_slice()) {
+                        (Some(expected), [value]) => {
+                            self.ensure_type(value, expected, variant_name)?;
+                            Some(Box::new(value.clone()))
+                        }
+                        (Some(expected), _) => {
+                            return Err(self.runtime_error_with_code(
+                                DiagnosticCode::InvalidFunctionCall,
+                                format!(
+                                    "variant `{enum_name}::{variant_name}` expects a payload of type {}",
+                                    expected.name()
+                                ),
+                            ));
+                        }
+                        (None, []) => None,
+                        (None, _) => {
+                            return Err(self.runtime_error_with_code(
+                                DiagnosticCode::InvalidFunctionCall,
+                                format!(
+                                    "unit variant `{enum_name}::{variant_name}` does not accept a payload"
+                                ),
+                            ));
+                        }
+                    };
+                    Ok(Value::Enum(Rc::new(EnumValue {
+                        enum_name: enum_name.clone(),
+                        variant_name: variant_name.clone(),
+                        payload,
+                    })))
+                } else {
+                    Err(self.runtime_error_with_code(
+                        DiagnosticCode::RuntimeMessage,
+                        format!("unknown enum type `{enum_name}`"),
+                    ))
+                }
+            }
+            Expr::Match { value, arms } => {
+                let value = self.evaluate(value)?;
+                self.evaluate_match(value, arms)
+            }
             Expr::Index { target, index } => {
                 let target = self.evaluate(target)?;
                 let index_value = self.evaluate(index)?;
@@ -2479,6 +3020,523 @@ impl Evaluator {
                 _ => Err(self.runtime_error("value has no fields".into())),
             },
         }
+    }
+
+    fn dispatch_message(
+        &mut self,
+        receiver: Value,
+        message: &str,
+        arguments: Vec<Value>,
+    ) -> Result<Value, SimplyError> {
+        if let Value::Enum(value) = &receiver {
+            return Err(self.runtime_error_with_code(
+                DiagnosticCode::RuntimeMessage,
+                format!(
+                    "enum value `{}::{}` does not support message dispatch",
+                    value.enum_name, value.variant_name
+                ),
+            ));
+        }
+        if let Value::Struct(instance) = &receiver {
+            let behavior = self
+                .lookup_message(&instance.type_name, message)
+                .cloned()
+                .ok_or_else(|| {
+                    self.runtime_error_with_code(
+                        DiagnosticCode::RuntimeMessage,
+                        format!(
+                            "message `{message}` is not understood by `{}`",
+                            instance.type_name
+                        ),
+                    )
+                })?;
+            let fields = self
+                .lookup_struct(&instance.type_name)
+                .ok_or_else(|| {
+                    self.runtime_error_with_code(
+                        DiagnosticCode::RuntimeMessage,
+                        format!("unknown struct type `{}`", instance.type_name),
+                    )
+                })?
+                .fields
+                .iter()
+                .map(|field| {
+                    instance
+                        .fields
+                        .borrow()
+                        .get(&field.name)
+                        .cloned()
+                        .ok_or_else(|| {
+                            self.runtime_error_with_code(
+                                DiagnosticCode::RuntimeMessage,
+                                format!(
+                                    "struct `{}` is missing declared field `{}`",
+                                    instance.type_name, field.name
+                                ),
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if arguments.len() + behavior.field_count != behavior.function.parameters.len() {
+                return Err(self.runtime_error_with_code(
+                    DiagnosticCode::InvalidFunctionCall,
+                    format!(
+                        "message `{message}` expects {} arguments, got {}",
+                        behavior.function.parameters.len() - behavior.field_count,
+                        arguments.len()
+                    ),
+                ));
+            }
+            let mut values = fields;
+            values.extend(arguments);
+            return self.invoke_message_value(message, behavior.function, values, instance.clone());
+        }
+
+        let message_exists = self.lookup(message).is_some()
+            || self
+                .function_scopes
+                .iter()
+                .rev()
+                .any(|scope| scope.contains_key(message));
+        if !message_exists {
+            return Err(self.runtime_error_with_code(
+                DiagnosticCode::RuntimeMessage,
+                format!(
+                    "unknown message `{message}` for a {} receiver",
+                    Self::value_type_name(&receiver)
+                ),
+            ));
+        }
+
+        let mut values = Vec::with_capacity(arguments.len() + 1);
+        values.push(receiver);
+        values.extend(arguments);
+        self.invoke_function(message, values)
+    }
+
+    fn evaluate_match(
+        &mut self,
+        value: Value,
+        arms: &[crate::ast::MatchArm],
+    ) -> Result<Value, SimplyError> {
+        for arm in arms {
+            let Some(bindings) = self.match_value_pattern(&arm.pattern, &value)? else {
+                continue;
+            };
+            self.push_scope();
+            let result = (|| {
+                for (binding, bound_value) in bindings {
+                    self.variable_types.define(
+                        binding.clone(),
+                        Self::type_of_value(&bound_value),
+                        false,
+                    );
+                    self.scopes
+                        .define(binding, bound_value, false)
+                        .map_err(|error| {
+                            self.runtime_error_with_code(
+                                DiagnosticCode::DuplicateDeclaration,
+                                error,
+                            )
+                        })?;
+                }
+                if let Some(guard) = &arm.guard {
+                    match self.evaluate(guard)? {
+                        Value::Bool(true) => {}
+                        Value::Bool(false) => return Ok(None),
+                        other => {
+                            return Err(self.runtime_error(format!(
+                                "match guard must evaluate to Bool, found {}",
+                                Self::value_type_name(&other)
+                            )));
+                        }
+                    }
+                }
+                self.execute_statements(&arm.body)
+                    .and_then(|flow| match flow {
+                        Flow::None => arm
+                            .result
+                            .as_ref()
+                            .map(|result| self.evaluate(result))
+                            .unwrap_or(Ok(Value::Unit)),
+                        Flow::Return(value) => Ok(value),
+                        Flow::Break | Flow::Continue => {
+                            Err(self.runtime_error("break/continue used outside a loop".into()))
+                        }
+                    })
+                    .map(Some)
+            })();
+            self.pop_scope();
+            if let Some(result) = result? {
+                return Ok(result);
+            }
+        }
+        Err(self.runtime_error(format!(
+            "no match arm for {}",
+            Self::value_type_name(&value)
+        )))
+    }
+
+    fn match_value_pattern(
+        &self,
+        pattern: &crate::ast::MatchPattern,
+        value: &Value,
+    ) -> Result<Option<Vec<(String, Value)>>, SimplyError> {
+        let matched = match pattern {
+            crate::ast::MatchPattern::Wildcard => Some(Vec::new()),
+            crate::ast::MatchPattern::Literal(literal) => {
+                let literal = match literal {
+                    crate::ast::Literal::String(value) => Value::String(value.clone()),
+                    crate::ast::Literal::Int(value) => Value::Int(*value),
+                    crate::ast::Literal::Float(value) => Value::Float(*value),
+                    crate::ast::Literal::Bool(value) => Value::Bool(*value),
+                };
+                literal.eq(value).then(Vec::new)
+            }
+            crate::ast::MatchPattern::Range { start, end } => {
+                let Value::Int(value) = value else {
+                    return Ok(None);
+                };
+                let starts_before_or_at = match start {
+                    Some(crate::ast::Literal::Int(start)) => *value >= *start,
+                    Some(_) => return Ok(None),
+                    None => true,
+                };
+                let ends_after_or_at = match end {
+                    Some(crate::ast::Literal::Int(end)) => *value <= *end,
+                    Some(_) => return Ok(None),
+                    None => true,
+                };
+                (starts_before_or_at && ends_after_or_at).then(Vec::new)
+            }
+            crate::ast::MatchPattern::Or(alternatives) => {
+                let mut bindings = None;
+                for alternative in alternatives {
+                    if let Some(matched) = self.match_value_pattern(alternative, value)? {
+                        bindings = Some(matched);
+                        break;
+                    }
+                }
+                bindings
+            }
+            crate::ast::MatchPattern::Identifier(name) => Some(vec![(name.clone(), value.clone())]),
+            crate::ast::MatchPattern::Alias { name, pattern } => {
+                let Some(mut bindings) = self.match_value_pattern(pattern, value)? else {
+                    return Ok(None);
+                };
+                bindings.push((name.clone(), value.clone()));
+                Some(bindings)
+            }
+            crate::ast::MatchPattern::Tuple(patterns) => {
+                let Value::Tuple(values) = value else {
+                    return Ok(None);
+                };
+                if patterns.len() != values.len() {
+                    return Ok(None);
+                }
+                let mut bindings = Vec::new();
+                for (pattern, value) in patterns.iter().zip(values.iter()) {
+                    let Some(nested) = self.match_value_pattern(pattern, value)? else {
+                        return Ok(None);
+                    };
+                    bindings.extend(nested);
+                }
+                Some(bindings)
+            }
+            crate::ast::MatchPattern::Sequence { patterns, rest } => {
+                let (values, rest_value) = match value {
+                    Value::Array(values) => {
+                        if values.len() < patterns.len()
+                            || (rest.is_none() && values.len() != patterns.len())
+                        {
+                            return Ok(None);
+                        }
+                        let tail = rest.as_ref().map(|_| {
+                            Value::Array(shared_values(values[patterns.len()..].to_vec()))
+                        });
+                        (values[..patterns.len()].to_vec(), tail)
+                    }
+                    Value::List(values) => {
+                        if values.len() < patterns.len()
+                            || (rest.is_none() && values.len() != patterns.len())
+                        {
+                            return Ok(None);
+                        }
+                        let tail = rest
+                            .as_ref()
+                            .map(|_| Value::List(shared_values(values[patterns.len()..].to_vec())));
+                        (values[..patterns.len()].to_vec(), tail)
+                    }
+                    Value::Range { start, end } => {
+                        let length = (i128::from(*end) - i128::from(*start)).max(0);
+                        if length < patterns.len() as i128
+                            || (rest.is_none() && length != patterns.len() as i128)
+                        {
+                            return Ok(None);
+                        }
+                        let mut values = Vec::with_capacity(patterns.len());
+                        for index in 0..patterns.len() {
+                            let index = i128::try_from(index).ok();
+                            let Some(value) = index
+                                .and_then(|index| i64::try_from(i128::from(*start) + index).ok())
+                            else {
+                                return Ok(None);
+                            };
+                            values.push(Value::Int(value));
+                        }
+                        let tail = if rest.is_some() {
+                            let rest_start = if length == 0 {
+                                *start
+                            } else {
+                                let offset = i128::try_from(patterns.len()).map_err(|_| {
+                                    self.runtime_error(
+                                        "sequence pattern length exceeds the supported range"
+                                            .into(),
+                                    )
+                                })?;
+                                i64::try_from(i128::from(*start) + offset).map_err(|_| {
+                                    self.runtime_error(
+                                        "range rest position exceeds the supported range".into(),
+                                    )
+                                })?
+                            };
+                            Some(Value::Range {
+                                start: rest_start,
+                                end: if length == 0 { rest_start } else { *end },
+                            })
+                        } else {
+                            None
+                        };
+                        (values, tail)
+                    }
+                    Value::CsvStream {
+                        path,
+                        start_record,
+                        start_offset,
+                        source_version,
+                    } => {
+                        let Some((values, tail)) = self.read_csv_sequence_prefix(
+                            path,
+                            *start_record,
+                            *start_offset,
+                            source_version.as_ref(),
+                            patterns.len(),
+                            rest.is_some(),
+                        )?
+                        else {
+                            return Ok(None);
+                        };
+                        (values, tail)
+                    }
+                    _ => return Ok(None),
+                };
+                let mut bindings = Vec::new();
+                for (pattern, value) in patterns.iter().zip(values.iter()) {
+                    let Some(nested) = self.match_value_pattern(pattern, value)? else {
+                        return Ok(None);
+                    };
+                    bindings.extend(nested);
+                }
+                if let (Some(name), Some(value)) = (rest, rest_value) {
+                    bindings.push((name.clone(), value));
+                }
+                Some(bindings)
+            }
+            crate::ast::MatchPattern::Hash(patterns) => {
+                let Value::Hash(values) = value else {
+                    return Ok(None);
+                };
+                let mut bindings = Vec::new();
+                for (key, pattern) in patterns {
+                    let Some(value) = values.get(key) else {
+                        return Ok(None);
+                    };
+                    let Some(nested) = self.match_value_pattern(pattern, value)? else {
+                        return Ok(None);
+                    };
+                    bindings.extend(nested);
+                }
+                Some(bindings)
+            }
+            crate::ast::MatchPattern::Struct { type_name, fields } => {
+                let Value::Struct(instance) = value else {
+                    return Ok(None);
+                };
+                if instance.type_name != *type_name {
+                    return Ok(None);
+                }
+                let Some(definition) = self.lookup_struct(type_name) else {
+                    return Ok(None);
+                };
+                if fields.len() != definition.fields.len() {
+                    return Ok(None);
+                }
+                let instance_fields = instance.fields.borrow();
+                let mut bindings = Vec::new();
+                for (pattern, field) in fields.iter().zip(&definition.fields) {
+                    let Some(value) = instance_fields.get(&field.name) else {
+                        return Ok(None);
+                    };
+                    let Some(nested) = self.match_value_pattern(pattern, value)? else {
+                        return Ok(None);
+                    };
+                    bindings.extend(nested);
+                }
+                Some(bindings)
+            }
+            crate::ast::MatchPattern::EnumVariant {
+                enum_name,
+                variant_name,
+                payload,
+            } => {
+                let Value::Enum(enum_value) = value else {
+                    return Ok(None);
+                };
+                if enum_value.enum_name != *enum_name || enum_value.variant_name != *variant_name {
+                    return Ok(None);
+                }
+                match (&enum_value.payload, payload) {
+                    (None, None) => Some(Vec::new()),
+                    (Some(value), Some(pattern)) => self.match_value_pattern(pattern, value)?,
+                    _ => None,
+                }
+            }
+        };
+        Ok(matched)
+    }
+
+    fn read_csv_sequence_prefix(
+        &self,
+        path: &str,
+        start_record: usize,
+        start_offset: u64,
+        source_version: Option<&CsvStreamVersion>,
+        expected_length: usize,
+        has_rest: bool,
+    ) -> Result<Option<(Vec<Value>, Option<Value>)>, SimplyError> {
+        let file = fs::File::open(path).map_err(|error| self.file_error(Path::new(path), error))?;
+        let current_version = Self::csv_stream_version(&file, path, self)?;
+        let mut reader = BufReader::new(file);
+        Self::seek_csv_stream(
+            &mut reader,
+            path,
+            start_record,
+            start_offset,
+            source_version,
+            &current_version,
+            self,
+        )?;
+        let mut rows = Vec::with_capacity(expected_length);
+        for _ in 0..expected_length {
+            let Some(record) = read_csv_record(&mut reader)
+                .map_err(|error| self.file_error(Path::new(path), error))?
+            else {
+                return Ok(None);
+            };
+            let line = record.strip_suffix('\n').unwrap_or(&record);
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let row = parse_csv_record(line).map_err(|message| {
+                self.runtime_error(format!("invalid CSV row in `{path}`: {message}"))
+            })?;
+            rows.push(Value::List(shared_values(row)));
+        }
+        let tail = if has_rest {
+            let suffix_record = start_record.checked_add(expected_length).ok_or_else(|| {
+                self.runtime_error("CSV stream position exceeds the supported range".into())
+            })?;
+            let suffix_offset = reader
+                .stream_position()
+                .map_err(|error| self.file_error(Path::new(path), error))?;
+            Some(Value::CsvStream {
+                path: path.to_owned(),
+                start_record: suffix_record,
+                start_offset: suffix_offset,
+                source_version: Some(current_version),
+            })
+        } else {
+            if read_csv_record(&mut reader)
+                .map_err(|error| self.file_error(Path::new(path), error))?
+                .is_some()
+            {
+                return Ok(None);
+            }
+            None
+        };
+        Ok(Some((rows, tail)))
+    }
+
+    fn csv_stream_version(
+        file: &fs::File,
+        path: &str,
+        evaluator: &Self,
+    ) -> Result<CsvStreamVersion, SimplyError> {
+        let metadata = file
+            .metadata()
+            .map_err(|error| evaluator.file_error(Path::new(path), error))?;
+        let modified = metadata
+            .modified()
+            .map_err(|error| evaluator.file_error(Path::new(path), error))?;
+        Ok(CsvStreamVersion {
+            length: metadata.len(),
+            modified,
+        })
+    }
+
+    fn seek_csv_stream(
+        reader: &mut BufReader<fs::File>,
+        path: &str,
+        start_record: usize,
+        start_offset: u64,
+        source_version: Option<&CsvStreamVersion>,
+        current_version: &CsvStreamVersion,
+        evaluator: &Self,
+    ) -> Result<(), SimplyError> {
+        if source_version.is_none_or(|source| source == current_version) {
+            reader
+                .seek(SeekFrom::Start(start_offset))
+                .map_err(|error| evaluator.file_error(Path::new(path), error))?;
+            return Ok(());
+        }
+
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| evaluator.file_error(Path::new(path), error))?;
+        for _ in 0..start_record {
+            if read_csv_record(reader)
+                .map_err(|error| evaluator.file_error(Path::new(path), error))?
+                .is_none()
+            {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn construct_struct(
+        &self,
+        name: &str,
+        definition: &StructDefinition,
+        values: Vec<Value>,
+    ) -> Result<Value, SimplyError> {
+        if values.len() != definition.fields.len() {
+            return Err(self.runtime_error_with_code(
+                DiagnosticCode::InvalidFunctionCall,
+                format!(
+                    "struct `{name}` expects {} fields, got {}",
+                    definition.fields.len(),
+                    values.len()
+                ),
+            ));
+        }
+        let mut fields = BTreeMap::new();
+        for (field, value) in definition.fields.iter().zip(values) {
+            self.ensure_type(&value, &field.field_type, &field.name)?;
+            fields.insert(field.name.clone(), value);
+        }
+        Ok(Value::Struct(Rc::new(StructInstance {
+            type_name: name.into(),
+            fields: Rc::new(RefCell::new(fields)),
+        })))
     }
 
     fn invoke_function(&mut self, name: &str, values: Vec<Value>) -> Result<Value, SimplyError> {
@@ -2498,10 +3556,12 @@ impl Evaluator {
                     .find_map(|scope| scope.get(name))
                     .cloned()
                     .ok_or_else(|| {
-                        self.runtime_error_with_code(
-                            DiagnosticCode::RuntimeMessage,
-                            format!("unknown function `{name}`"),
-                        )
+                        let description = if name.chars().next().is_some_and(char::is_uppercase) {
+                            format!("unknown struct type `{name}`")
+                        } else {
+                            format!("unknown function `{name}`")
+                        };
+                        self.runtime_error_with_code(DiagnosticCode::RuntimeMessage, description)
                     })?;
                 self.track_function(Rc::new(FunctionValue {
                     parameters: function.parameters.clone(),
@@ -2511,6 +3571,35 @@ impl Evaluator {
                 }))
             }
         };
+        self.invoke_function_value(name, function, values)
+    }
+
+    fn invoke_function_value(
+        &mut self,
+        name: &str,
+        function: Rc<FunctionValue>,
+        values: Vec<Value>,
+    ) -> Result<Value, SimplyError> {
+        self.invoke_function_value_with_message_state(name, function, values, None)
+    }
+
+    fn invoke_message_value(
+        &mut self,
+        name: &str,
+        function: Rc<FunctionValue>,
+        values: Vec<Value>,
+        instance: Rc<StructInstance>,
+    ) -> Result<Value, SimplyError> {
+        self.invoke_function_value_with_message_state(name, function, values, Some(instance))
+    }
+
+    fn invoke_function_value_with_message_state(
+        &mut self,
+        name: &str,
+        function: Rc<FunctionValue>,
+        values: Vec<Value>,
+        message_instance: Option<Rc<StructInstance>>,
+    ) -> Result<Value, SimplyError> {
         if function.parameters.len() != values.len() {
             return Err(self.runtime_error(format!(
                 "function `{name}` expects {} arguments, got {}",
@@ -2542,7 +3631,17 @@ impl Evaluator {
                     self.runtime_error_with_code(DiagnosticCode::DuplicateDeclaration, error)
                 })?;
         }
+        let is_message_invocation = message_instance.is_some();
+        if let Some(instance) = message_instance.as_ref() {
+            self.active_message_states.push(ActiveMessageState {
+                instance: instance.clone(),
+                scope_index: self.scopes.current_scope_index(),
+            });
+        }
         let result = self.execute_statements(&function.body);
+        if is_message_invocation {
+            self.active_message_states.pop();
+        }
         let result = match result {
             Ok(flow) => match flow {
                 Flow::None => Value::Unit,
@@ -2637,6 +3736,9 @@ impl Evaluator {
     fn evaluate_csv_pipeline(
         &mut self,
         input_path: &str,
+        start_record: usize,
+        start_offset: u64,
+        source_version: Option<&CsvStreamVersion>,
         steps: &[PipelineStep],
     ) -> Result<Value, SimplyError> {
         if steps
@@ -2796,7 +3898,17 @@ impl Evaluator {
                 _ => None,
             };
             let mut reader = BufReader::new(input);
-            let mut index = 0usize;
+            let current_version = Self::csv_stream_version(reader.get_ref(), input_path, self)?;
+            Self::seek_csv_stream(
+                &mut reader,
+                input_path,
+                start_record,
+                start_offset,
+                source_version,
+                &current_version,
+                self,
+            )?;
+            let mut index = start_record;
             while let Some(record) = read_csv_record(&mut reader)
                 .map_err(|error| self.file_error(Path::new(input_path), error))?
             {
@@ -3640,22 +4752,24 @@ impl Evaluator {
         expected.name()
     }
 
-    fn value_type_name(value: &Value) -> &'static str {
+    fn value_type_name(value: &Value) -> String {
         match value {
-            Value::Unit => "Unit",
-            Value::String(_) => "String",
-            Value::Int(_) => "Int",
-            Value::Float(_) => "Float",
-            Value::Bool(_) => "Bool",
-            Value::Range { .. } => "Array",
-            Value::CsvStream(_) => "List",
-            Value::Array(_) => "Array",
-            Value::List(_) => "List",
-            Value::Tuple(_) => "Tuple",
-            Value::Hash(_) => "Hash",
-            Value::Tree(_) => "Tree",
-            Value::Matrix(_) => "Matrix",
-            Value::Function(_) => "Function",
+            Value::Unit => "Unit".into(),
+            Value::String(_) => "String".into(),
+            Value::Int(_) => "Int".into(),
+            Value::Float(_) => "Float".into(),
+            Value::Bool(_) => "Bool".into(),
+            Value::Range { .. } => "Array".into(),
+            Value::CsvStream { .. } => "List".into(),
+            Value::Array(_) => "Array".into(),
+            Value::List(_) => "List".into(),
+            Value::Tuple(_) => "Tuple".into(),
+            Value::Hash(_) => "Hash".into(),
+            Value::Tree(_) => "Tree".into(),
+            Value::Matrix(_) => "Matrix".into(),
+            Value::Function(_) => "Function".into(),
+            Value::Struct(instance) => instance.type_name.clone(),
+            Value::Enum(value) => value.enum_name.clone(),
         }
     }
 
@@ -3671,8 +4785,10 @@ impl Evaluator {
             | (Value::Matrix(_), Type::Matrix)
             | (Value::Function(_), Type::Function { .. })
             | (_, Type::Unknown) => true,
+            (Value::Struct(instance), Type::Struct(expected)) => &instance.type_name == expected,
+            (Value::Enum(value), Type::Enum(expected)) => &value.enum_name == expected,
             (Value::Range { .. }, Type::Array(element)) => Type::Int.compatible_with(element),
-            (Value::CsvStream(_), Type::List(row)) if matches!(row.as_ref(), Type::List(field) if matches!(field.as_ref(), Type::String)) => {
+            (Value::CsvStream { .. }, Type::List(row)) if matches!(row.as_ref(), Type::List(field) if matches!(field.as_ref(), Type::String)) => {
                 true
             }
             (Value::Array(values), Type::Array(element))
@@ -3697,7 +4813,7 @@ impl Evaluator {
             Value::Float(_) => Type::Float,
             Value::Bool(_) => Type::Bool,
             Value::Range { .. } => Type::Array(Box::new(Type::Int)),
-            Value::CsvStream(_) => Type::List(Box::new(Type::List(Box::new(Type::String)))),
+            Value::CsvStream { .. } => Type::List(Box::new(Type::List(Box::new(Type::String)))),
             Value::Array(values) => Type::Array(Box::new(
                 values
                     .first()
@@ -3714,6 +4830,8 @@ impl Evaluator {
             Value::Hash(_) => Type::Hash,
             Value::Tree(_) => Type::Tree,
             Value::Matrix(_) => Type::Matrix,
+            Value::Struct(instance) => Type::Struct(instance.type_name.clone()),
+            Value::Enum(value) => Type::Enum(value.enum_name.clone()),
             Value::Function(function) => Type::Function {
                 parameters: function
                     .parameters
@@ -3731,6 +4849,156 @@ impl Evaluator {
 mod tests {
     use super::*;
     use crate::runtime::value::shared_values;
+
+    #[test]
+    fn runtime_checks_enum_payload_types_without_semantic_analysis() {
+        let program = Parser::new(
+            Lexer::new("enum Result:\n    Ok as Int\nend\nvalue is Result::Ok(\"bad\")\n")
+                .tokenize()
+                .expect("valid enum source should tokenize"),
+        )
+        .parse()
+        .expect("valid enum syntax should parse");
+        let error = Evaluator::new()
+            .run(&program)
+            .expect_err("runtime must reject a mismatched enum payload");
+        assert!(error.to_string().contains("expected Int"), "{error}");
+        assert!(error.to_string().contains("found String"), "{error}");
+    }
+
+    #[test]
+    fn runtime_rejects_enum_message_dispatch_even_if_a_global_function_exists() {
+        let program = Parser::new(
+            Lexer::new(
+                "enum State:\n    Ready\nend\n\
+                 fn greet(value):\n    return \"hello\"\nend\n\
+                 state is State::Ready\nstate :: greet\n",
+            )
+            .tokenize()
+            .expect("valid enum source should tokenize"),
+        )
+        .parse()
+        .expect("valid enum syntax should parse");
+        let error = Evaluator::new()
+            .run(&program)
+            .expect_err("enum values must not receive struct/global messages");
+        assert!(
+            error
+                .to_string()
+                .contains("does not support message dispatch"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn recursive_tuple_matching_checks_arity_and_keeps_failed_bindings_local() {
+        let source = "pair is (1, 2, 3)\n\
+                     result is match pair:\n\
+                         (first, second):\n    99\n\
+                         _:\n    42\n\
+                     end\n";
+        let program = Parser::new(
+            Lexer::new(source)
+                .tokenize()
+                .expect("valid tuple source should tokenize"),
+        )
+        .parse()
+        .expect("valid tuple source should parse");
+        let mut evaluator = Evaluator::new();
+        evaluator
+            .run(&program)
+            .expect("wildcard should match after arity mismatch");
+        assert_eq!(evaluator.lookup("result"), Some(&Value::Int(42)));
+
+        let source = "pair is (1, 2)\n\
+                     match pair:\n\
+                         (first, (second, third)):\n    first\n\
+                         _:\n    first\n\
+                     end\n";
+        let program = Parser::new(
+            Lexer::new(source)
+                .tokenize()
+                .expect("valid nested tuple source should tokenize"),
+        )
+        .parse()
+        .expect("valid nested tuple source should parse");
+        let error = Evaluator::new()
+            .run(&program)
+            .expect_err("failed tuple pattern must not leak partial bindings");
+        assert!(
+            error.to_string().contains("unknown variable `first`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn runtime_struct_matching_checks_nominal_identity_and_field_arity() {
+        let source = "type Person:\n    name as String\n    age as Int\nend\n\
+                     person is Person(\"Ada\", 37)\n\
+                     result is match person:\n\
+                         Person(name):\n    \"incorrect arity\"\n\
+                         _:\n    \"fallback\"\n\
+                     end\n";
+        let program = Parser::new(
+            Lexer::new(source)
+                .tokenize()
+                .expect("valid Struct pattern source should tokenize"),
+        )
+        .parse()
+        .expect("valid Struct pattern source should parse");
+        let mut evaluator = Evaluator::new();
+        evaluator
+            .run(&program)
+            .expect("runtime matcher should fall through on incorrect field arity");
+        assert_eq!(
+            evaluator.lookup("result"),
+            Some(&Value::String("fallback".into()))
+        );
+
+        let source = "type Person:\n    name as String\nend\n\
+                     type User:\n    name as String\nend\n\
+                     user is User(\"Ada\")\n\
+                     result is match user:\n\
+                         Person(name):\n    \"incorrect nominal type\"\n\
+                         _:\n    \"fallback\"\n\
+                     end\n";
+        let program = Parser::new(
+            Lexer::new(source)
+                .tokenize()
+                .expect("valid nominal pattern source should tokenize"),
+        )
+        .parse()
+        .expect("valid nominal pattern source should parse");
+        let mut evaluator = Evaluator::new();
+        evaluator
+            .run(&program)
+            .expect("runtime matcher should compare nominal Struct identities");
+        assert_eq!(
+            evaluator.lookup("result"),
+            Some(&Value::String("fallback".into()))
+        );
+    }
+
+    #[test]
+    fn runtime_rejects_non_boolean_match_guards_without_semantic_analysis() {
+        let source = "result is match 1:\n    _ if 1:\n        \"invalid\"\nend\n";
+        let program = Parser::new(
+            Lexer::new(source)
+                .tokenize()
+                .expect("guard source should tokenize"),
+        )
+        .parse()
+        .expect("guard source should parse");
+        let error = Evaluator::new()
+            .run(&program)
+            .expect_err("runtime must reject a non-Bool guard");
+        assert!(
+            error
+                .to_string()
+                .contains("match guard must evaluate to Bool"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn parallel_workers_execute_scalar_chunks_and_preserve_order() {
@@ -3804,5 +5072,83 @@ mod tests {
             )
             .expect_err("non-scalar items must not fall back to sequential execution");
         assert!(error.to_string().contains("scalar source items"), "{error}");
+    }
+
+    #[test]
+    fn csv_rest_suffix_records_the_byte_cursor_after_its_prefix() {
+        static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("simply-csv-cursor-{}-{id}.csv", std::process::id()));
+        let contents = "first\n\"second\nline\"\nthird\n";
+        fs::write(&path, contents).expect("failed to write CSV cursor fixture");
+        let path_string = path.to_str().expect("CSV cursor path must be UTF-8");
+        let suffix_offset = "first\n".len() as u64;
+
+        let (_, suffix) = Evaluator::new()
+            .read_csv_sequence_prefix(path_string, 0, 0, None, 1, true)
+            .expect("prefix read should succeed")
+            .expect("first record should exist");
+        let Some(Value::CsvStream {
+            start_record,
+            start_offset,
+            source_version,
+            ..
+        }) = suffix
+        else {
+            panic!("rest binding should preserve a lazy CSV stream");
+        };
+        assert_eq!(start_record, 1);
+        assert_eq!(start_offset, suffix_offset);
+
+        let (rows, next_suffix) = Evaluator::new()
+            .read_csv_sequence_prefix(
+                path_string,
+                start_record,
+                start_offset,
+                source_version.as_ref(),
+                1,
+                true,
+            )
+            .expect("suffix read should succeed")
+            .expect("second record should exist");
+        assert_eq!(
+            rows,
+            vec![Value::List(shared_values(vec![Value::String(
+                "second\nline".into(),
+            )]))]
+        );
+        let Some(Value::CsvStream {
+            start_record,
+            start_offset,
+            source_version,
+            ..
+        }) = next_suffix
+        else {
+            panic!("nested rest binding should preserve a lazy CSV stream");
+        };
+        assert_eq!(start_record, 2);
+        assert_eq!(start_offset, "first\n\"second\nline\"\n".len() as u64);
+
+        fs::write(&path, "new\nreplacement\nlast\n").expect("failed to replace CSV cursor fixture");
+        let (rows, _) = Evaluator::new()
+            .read_csv_sequence_prefix(
+                path_string,
+                1,
+                suffix_offset,
+                source_version.as_ref(),
+                1,
+                true,
+            )
+            .expect("modified CSV source should use record-position fallback")
+            .expect("replacement record should exist");
+        assert_eq!(
+            rows,
+            vec![Value::List(shared_values(vec![Value::String(
+                "replacement".into(),
+            )]))]
+        );
+
+        fs::remove_file(path).expect("failed to remove CSV cursor fixture");
     }
 }

@@ -17,6 +17,13 @@ Simply source files use the `.si` extension. `#` starts a comment outside a stri
   nested inside functions or control-flow blocks and resolve visible lexical bindings.
   A nested function can be returned, stored in a binding, and called later as a
   closure; captured bindings are immutable snapshots.
+- `type Name: ... end` declares a nominal struct with ordered, typed fields.
+  Construct instances positionally with `Name(value, ...)`.
+- `on Name receive message(parameters): ... end` defines behavior for that
+  struct. `instance :: message(arguments)` dispatches it, passing declared
+  fields into the message scope. Reassigning a field binding within a message
+  updates the persistent instance and is checked against the field's declared
+  type.
 - `return expression`, `if`, `for`, `while`, `break`, and `continue` provide control flow.
 - `try: ... catch error: ... finally: ... end` handles runtime errors. The `catch` binding
   receives a tree with `message`, `code`, `category`, `line`, and `column` fields. Multiple
@@ -31,7 +38,181 @@ Conditions must be `Bool`. `if` and `for` create local scopes; `while` does not.
 
 ## Expressions
 
-Literals are integers, floating-point numbers, booleans, and strings. Expressions include identifiers, function calls, unary operators, binary operators, indexing, field access, collections, and pipelines.
+Literals are integers, floating-point numbers, booleans, and strings. Expressions include identifiers, function calls, message dispatch, unary operators, binary operators, indexing, field access, collections, and pipelines. `receiver :: message` dispatches a named behavior; optional message arguments use ordinary expressions. For example, `person :: rename("Ada")`. Parentheses make a compound expression an explicit receiver, as in `(first + last) :: format`. Message dispatch returns the behavior's value and can be used anywhere an expression is accepted. Chained dispatch is not supported; parenthesize nested dispatch explicitly. For non-struct receivers, dispatch retains the existing named-function behavior with the receiver as its first argument. Struct receivers resolve messages by nominal receiver type before any global function of the same name. `send()` is not a public language function.
+
+Enums are nominal tagged values with unit or single-payload variants:
+
+```simply
+enum Result:
+    Ok as Int
+    Error as String
+end
+
+result is Result::Ok(42)
+message is match result:
+    Result::Ok(value):
+        value
+    Result::Error(error):
+        error
+end
+```
+
+Unit variants use `Result::None`; payload variants require one value of their
+declared type. Patterns recursively support identifiers, `_`, tuples, and enum
+variants with an optional single payload pattern, and positional Struct
+patterns. For example, `(left, (right, _))` matches nested tuples,
+`Result::Ok((left, right))` destructures a tuple payload, and
+`Person(name, Address(city))` matches nested Structs. Struct fields are matched
+in declaration order, using nominal type identity and exact field count;
+named-field patterns are not supported. Sequence patterns use brackets, such
+as `[1, 2]`, `[]`, or `[[1, 2], [3, 4]]`; fixed-length patterns match Array and
+List values only when the length is exact. A trailing rest binding, such as
+`[head, ...tail]` or `[first, second, ...rest]`, matches any length at least as
+large as its prefix and binds the remaining suffix. The rest binding is an
+identifier, may appear only once, and must be last; `[...rest]` matches
+sequences of any length. Array and List suffixes preserve their collection
+type, integer ranges preserve their lazy range representation, and CSV stream
+suffixes remain lazy. Elements may use nested literal, range, tuple, enum,
+Struct, wildcard, binding, or OR-patterns. Binding names exist only within
+their selected arm, and a failed nested pattern exposes no partial bindings. A trailing
+expression gives the arm and match expression its value; an arm without one
+returns `Unit`. Enum equality uses the existing equality operators and compares
+enum identity, variant, and payload.
+
+Patterns are checked against the scrutinee type, including tuple arity,
+nominal enum identity, and Struct identity/arity. Exhaustiveness and
+unreachable-arm checks recursively account for enum variants, tuple elements,
+and Struct fields. Wildcards, identifiers, and recursively irrefutable
+constructor patterns cover their expected type.
+Pattern validation rejects a shape or nested literal/range only when existing
+static type information proves it incompatible. Unknown values—including
+nested Hash values, because Hash has no generic value type—remain dynamically
+checked rather than being assigned an invented static type. Alias patterns
+share the nested pattern's type compatibility; OR alternatives and guards are
+validated by their ordinary recursive pattern and Bool-expression rules.
+An arm may add `if expression` after its pattern. Guards are evaluated only
+after the pattern matches, in a temporary scope containing its bindings; a
+false guard discards that scope and continues to the next arm. The expression
+must have type `Bool`, with no truthiness conversion. Guarded patterns do not
+contribute to exhaustiveness, and the checker does not reason symbolically
+about guard expressions. Runtime errors from a guard propagate normally.
+OR-patterns use `pattern | pattern`, are attempted left-to-right, and require
+all alternatives to bind the same names with compatible types. Unguarded
+alternatives contribute their union of coverage; a guarded OR-pattern does
+not.
+
+Literal patterns support exact Int, Float, String, and Bool values and compose
+recursively with tuples, enum payloads, Struct fields, and OR-patterns. Numeric
+types do not coerce, and strings match by exact equality. Bool is finite, so
+`true` and `false` together prove exhaustiveness; Float and String remain open
+domains and require a wildcard or identifier for exhaustive matching.
+Guards on literal patterns have the same scope and conservative coverage
+behavior as other guards.
+
+Int range patterns use inclusive integer bounds: `0..10` matches both endpoints,
+`10..` has no upper bound, and `..10` has no lower bound. At least one bound is
+required; bounds must be Int literals, and a closed range whose lower bound
+exceeds its upper bound is invalid. Int literals are singleton intervals for
+usefulness analysis. Overlapping or adjacent ranges combine for exhaustiveness,
+but gaps remain uncovered. Ranges compose with nested patterns and
+OR-patterns, and guarded ranges do not contribute to exhaustiveness.
+Sequence patterns recursively participate in usefulness analysis. Fixed-length
+patterns cover only their exact lengths. A rest pattern covers every length at
+least as large as its prefix; for example, `[]` plus `[head, ...tail]` covers
+all sequence lengths. Prefix element patterns still need to cover the element
+domain, and guarded patterns do not contribute to exhaustiveness.
+
+Hash patterns use `{key: pattern}`; keys may be string literals or bare field
+names, which are equivalent string keys. Listed keys are required, extra keys
+are ignored, and nested value patterns use the regular pattern semantics. For
+example, `{"name": person, age: 18..}` binds the `name` value when both keys
+exist and the age is at least 18. `{}` matches every Hash and can complete
+exhaustiveness; keyed patterns alone cannot, because arbitrary Hash values may
+omit those keys. Hash values have dynamic nested types, so nested
+structural checks are validated at runtime. Duplicate keys are rejected.
+
+Alias patterns bind the entire value matched by a nested pattern. For example,
+`whole @ Result::Ok(value)` binds both the complete enum value to `whole` and
+its payload to `value`; `adult @ 18..` binds the original Int after the range
+matches. If the nested pattern fails, no alias or nested bindings are exposed.
+Aliases compose recursively with tuples, enums, Structs, Hashes, and sequence
+patterns. Alias binds one pattern atom; parenthesize an OR pattern when the
+alias should cover its union, as in `whole @ (1 | 2)`. Aliases retain the
+nested pattern's usefulness and exhaustiveness behavior.
+
+### Destructuring declarations
+
+Destructuring declarations bind values from tuples and sequences outside
+`match`:
+
+```simply
+pair is (10, 20)
+(first, second) is pair
+(head, (left, right)) is (1, (2, 3))
+values is [4, 5, 6]
+[first_value, ...remaining] is values
+[...all_values] is values
+(_, ignored) is pair
+```
+
+Targets may combine identifiers, `_`, nested tuples, and nested sequences.
+Fixed-length sequence targets require an exact length; a final `...name` rest
+target accepts the remaining suffix, including an empty suffix. Array and List
+suffixes preserve their collection type, Range suffixes remain lazy ranges,
+and CSV stream suffixes remain lazy streams. Destructuring evaluates its
+right-hand value once and installs bindings only after the complete target has
+matched. Duplicate names are rejected, and `_` creates no binding.
+
+Destructuring does not support assertion-style Literal, Range, OR, or Alias
+patterns, nor Enum, Struct, or Hash targets. Those patterns remain available in
+`match`.
+
+Destructuring assignment updates existing mutable variables rather than
+creating bindings:
+
+```simply
+mut name is "Ada"
+mut age is 36
+(name, age) -> ("Grace", 37)
+[name, ...others] -> ["Lin", "Ada", "Grace"]
+(_, age) -> ("ignored", 38)
+```
+
+Every named target must already exist, be mutable, and have a compatible type.
+Wildcard targets are ignored. The RHS is evaluated once; the complete target
+shape and all targets are checked before any value is changed. Duplicate
+targets are rejected. A failed shape or CSV prefix read leaves targets
+unchanged. CSV rest values remain lazy descriptors; errors that occur only when
+a later consumer reads the suffix are reported by that consumer. Plain
+identifier reassignment continues to use `name -> value`.
+Payloads can contain nominal Struct values and preserve their shared identity,
+so changes made through messages remain visible after the value is extracted.
+Enum values do not support message dispatch.
+
+Struct fields are declared with a type and are available by name inside a
+message body. Construction uses declaration order:
+
+```simply
+type Person:
+    name as String
+    age as Int
+end
+
+on Person receive greet:
+    return "Hello " + name
+end
+
+person is Person("Budi", 17)
+Sayln person :: greet
+```
+
+Message fields are local bindings that can be reassigned using `->`; the
+assignment updates the receiver's persistent state and is checked against the
+declared field type. Struct values copied between variables alias the same
+instance. Messages can return values with the normal `return` statement, and
+dispatch evaluates to that value (or `Unit` when no value is returned).
+There is no direct struct field access syntax or automatic getter/setter
+generation; state is read and changed through messages.
 
 Operators, from lower to higher precedence, are `or`, `and`, equality, comparisons, `+ - multiply`, and `* / %`. Unary `not`, unary `-`, and `transpose` bind tightly. `and` and `or` short-circuit.
 
@@ -60,6 +241,12 @@ The built-ins are:
   to the process working directory. File access and invalid UTF-8 failures are
   reported as runtime diagnostics; `open` retains its separate module-import
   behavior.
+- `Ask("prompt")` writes a prompt and reads one line as a `String`.
+  `Ask("prompt", Int)`, `Ask("prompt", Float)`, `Ask("prompt", String)`, and
+  `Ask("prompt", Bool)` parse the line into the requested primitive type.
+  String input preserves leading and trailing spaces while removing its line
+  ending; typed input ignores surrounding whitespace. Invalid typed input and
+  end-of-file are runtime errors.
 - `any(collection)` and `all(collection)` for boolean collections.
 - `join(collection, separator)` for string collections.
 - `total(collection)` for numeric arrays, lists, and tuples.
@@ -124,7 +311,6 @@ The built-ins are:
 - Pipeline terminals `average`, `min`, and `max` aggregate numeric streams in a
   single pass.
 - `type_of(value)` and `print(value)` for inspection and output.
-- `send(receiver, "message", ...)` for explicit message dispatch.
 
 Argument counts and supported value types are checked before execution when statically knowable. Dynamic values remain runtime-validated.
 

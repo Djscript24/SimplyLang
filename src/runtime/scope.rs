@@ -47,6 +47,39 @@ impl ScopeStack {
         Ok(())
     }
 
+    pub(crate) fn define_many(
+        &mut self,
+        bindings: Vec<(String, Value, bool)>,
+    ) -> Result<(), String> {
+        let current = self
+            .scopes
+            .last()
+            .expect("runtime scope stack always has a global scope");
+        let mut names = HashSet::with_capacity(bindings.len());
+        for (name, _, _) in &bindings {
+            if current.contains_key(name) || !names.insert(name.as_str()) {
+                return Err(format!(
+                    "variable `{name}` is already declared in this scope or destructuring target"
+                ));
+            }
+        }
+
+        let scope_index = self.scopes.len() - 1;
+        let current = self
+            .scopes
+            .last_mut()
+            .expect("runtime scope stack always has a global scope");
+        for (name, value, mutable) in bindings {
+            current.insert(name.clone(), value);
+            self.bindings
+                .entry(name.clone())
+                .or_default()
+                .push(scope_index);
+            self.mutability.entry(name).or_default().push(mutable);
+        }
+        Ok(())
+    }
+
     pub(crate) fn lookup(&self, name: &str) -> Option<&Value> {
         if let Some(value) = self.scopes.last().and_then(|scope| scope.get(name)) {
             return Some(value);
@@ -72,6 +105,14 @@ impl ScopeStack {
             .unwrap_or(false)
     }
 
+    pub(crate) fn binding_scope(&self, name: &str) -> Option<usize> {
+        self.bindings.get(name)?.last().copied()
+    }
+
+    pub(crate) fn current_scope_index(&self) -> usize {
+        self.scopes.len() - 1
+    }
+
     pub(crate) fn contains(&self, name: &str) -> bool {
         self.lookup(name).is_some()
     }
@@ -83,6 +124,48 @@ impl ScopeStack {
         } else {
             false
         }
+    }
+
+    pub(crate) fn assign_many(
+        &mut self,
+        bindings: Vec<(usize, String, Value)>,
+    ) -> Result<(), String> {
+        let mut names = HashSet::with_capacity(bindings.len());
+        for (scope_index, name, _) in &bindings {
+            let is_visible_binding = self
+                .bindings
+                .get(name)
+                .and_then(|scopes| scopes.last())
+                .is_some_and(|visible_scope| visible_scope == scope_index);
+            let is_mutable = self
+                .mutability
+                .get(name)
+                .and_then(|values| values.last())
+                .copied()
+                .unwrap_or(false);
+            if !names.insert(name.as_str()) {
+                return Err(format!(
+                    "variable `{name}` appears more than once in destructuring assignment"
+                ));
+            }
+            if !is_visible_binding || !is_mutable {
+                return Err(format!(
+                    "variable `{name}` is no longer a mutable assignment target"
+                ));
+            }
+            if !self
+                .scopes
+                .get(*scope_index)
+                .is_some_and(|scope| scope.contains_key(name))
+            {
+                return Err(format!("unknown assignment target `{name}`"));
+            }
+        }
+
+        for (scope_index, name, value) in bindings {
+            self.scopes[scope_index].insert(name, value);
+        }
+        Ok(())
     }
 
     pub(crate) fn assign_current(&mut self, name: &str, value: Value) -> bool {
@@ -206,5 +289,64 @@ mod tests {
             .define("still_global".into(), Value::Bool(true), false)
             .unwrap();
         assert_eq!(scopes.lookup("still_global"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn define_many_does_not_partially_bind_when_preflight_fails() {
+        let mut scopes = ScopeStack::new();
+        scopes
+            .define("existing".into(), Value::Int(1), false)
+            .expect("initial binding should succeed");
+
+        let error = scopes
+            .define_many(vec![
+                ("new".into(), Value::Int(2), false),
+                ("existing".into(), Value::Int(3), false),
+            ])
+            .expect_err("duplicate declaration should fail");
+
+        assert!(error.contains("existing"));
+        assert_eq!(scopes.lookup("existing"), Some(&Value::Int(1)));
+        assert_eq!(scopes.lookup("new"), None);
+    }
+
+    #[test]
+    fn define_many_rejects_duplicate_targets_without_binding_anything() {
+        let mut scopes = ScopeStack::new();
+        let error = scopes
+            .define_many(vec![
+                ("same".into(), Value::Int(1), false),
+                ("same".into(), Value::Int(2), false),
+            ])
+            .expect_err("duplicate targets should fail");
+
+        assert!(error.contains("same"));
+        assert_eq!(scopes.lookup("same"), None);
+    }
+
+    #[test]
+    fn assign_many_preflights_every_target_before_mutating() {
+        let mut scopes = ScopeStack::new();
+        scopes
+            .define("first".into(), Value::Int(1), true)
+            .expect("first binding should succeed");
+        scopes
+            .define("second".into(), Value::Int(2), false)
+            .expect("second binding should succeed");
+        let first_scope = scopes.binding_scope("first").expect("first binding exists");
+        let second_scope = scopes
+            .binding_scope("second")
+            .expect("second binding exists");
+
+        let error = scopes
+            .assign_many(vec![
+                (first_scope, "first".into(), Value::Int(10)),
+                (second_scope, "second".into(), Value::Int(20)),
+            ])
+            .expect_err("immutable second target should fail preflight");
+
+        assert!(error.contains("second"));
+        assert_eq!(scopes.lookup("first"), Some(&Value::Int(1)));
+        assert_eq!(scopes.lookup("second"), Some(&Value::Int(2)));
     }
 }

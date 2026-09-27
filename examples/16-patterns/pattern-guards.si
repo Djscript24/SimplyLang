@@ -1,0 +1,39 @@
+# Guards run after patterns match and can read their bindings.
+enum Result:
+    Ok as Int
+    Error as String
+end
+
+result is Result::Ok(42)
+message is match result:
+    Result::Ok(value) if value > 100:
+        "large"
+    Result::Ok(value) if value > 0:
+        "positive"
+    Result::Ok(value):
+        "non-positive"
+    Result::Error(error):
+        error
+end
+Sayln message
+
+type Person:
+    name as String
+    age as Int
+end
+
+enum PersonResult:
+    Found as Person
+    Missing as String
+end
+
+person_result is PersonResult::Found(Person("Andi", 17))
+status is match person_result:
+    PersonResult::Found(Person(name, age)) if age >= 18:
+        name
+    PersonResult::Found(Person(name, _)):
+        "minor"
+    PersonResult::Missing(error):
+        error
+end
+Sayln status

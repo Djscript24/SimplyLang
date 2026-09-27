@@ -1,0 +1,36 @@
+# person.si — nominal struct construction and type-specific messages
+type Person:
+    name as String
+    age as Int
+end
+
+on Person receive greet:
+    return "Hello " + name
+end
+
+on Person receive introduce(to as String):
+    return "Hello " + to + ", I'm " + name
+end
+
+on Person receive rename(new_name as String):
+    name -> new_name
+end
+
+on Person receive birthday:
+    age -> age + 1
+end
+
+on Person receive get_age:
+    return age
+end
+
+person is Person("Budi", 17)
+person :: rename("Ada")
+person :: birthday
+Sayln person :: greet
+Sayln person :: introduce("Ada")
+Sayln person :: get_age
+
+alias is person
+person :: birthday
+Sayln alias :: get_age

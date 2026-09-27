@@ -1,0 +1,24 @@
+numbers is [1, 2, 3]
+
+result is match numbers:
+    []:
+        "empty"
+    [1, 2, 3]:
+        "exact"
+    [first, second, third]:
+        "three"
+    _:
+        "other"
+end
+
+values is [[1, 2], [3, 4]]
+
+nested_result is match values:
+    [[1, 2], [3, 4]]:
+        "matrix"
+    _:
+        "other"
+end
+
+Sayln result
+Sayln nested_result

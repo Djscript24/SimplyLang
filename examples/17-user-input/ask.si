@@ -1,0 +1,7 @@
+name is Ask("Name: ")
+age as Int is Ask("Age: ", Int)
+subscribed as Bool is Ask("Subscribe (true/false): ", Bool)
+
+Sayln name
+Sayln age + 1
+Sayln subscribed

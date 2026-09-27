@@ -3,8 +3,8 @@
 //! Key component: Parser handles declarations, expressions, blocks, and pipeline syntax.
 use crate::{
     ast::{
-        BinaryOperator, CatchClause, CollectionOperation, Expr, Literal, PartitionRule,
-        PipelineStep, Program, Stmt, UnaryOperator,
+        BinaryOperator, CatchClause, CollectionOperation, EnumVariant, Expr, Literal, MatchArm,
+        MatchPattern, PartitionRule, PipelineStep, Program, Stmt, StructField, UnaryOperator,
     },
     error::{DiagnosticCode, SimplyError, Span},
     lexer::{Token, TokenKind},
@@ -14,10 +14,18 @@ use crate::{
 pub struct Parser {
     tokens: Vec<Token>,
     current: usize,
+    enum_names: std::collections::HashSet<String>,
 }
 
 impl Parser {
-    pub fn new(mut tokens: Vec<Token>) -> Self {
+    pub fn new(tokens: Vec<Token>) -> Self {
+        Self::new_with_enum_names(tokens, std::iter::empty())
+    }
+
+    pub fn new_with_enum_names(
+        mut tokens: Vec<Token>,
+        known_enum_names: impl IntoIterator<Item = String>,
+    ) -> Self {
         let eof_span = tokens
             .last()
             .map(|token| token.span.clone())
@@ -28,7 +36,19 @@ impl Parser {
                 span: eof_span,
             });
         }
-        Self { tokens, current: 0 }
+        let mut enum_names = tokens
+            .windows(2)
+            .filter_map(|pair| match (&pair[0].kind, &pair[1].kind) {
+                (TokenKind::Enum, TokenKind::Identifier(name)) => Some(name.clone()),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        enum_names.extend(known_enum_names);
+        Self {
+            tokens,
+            current: 0,
+            enum_names,
+        }
     }
 
     pub fn parse(mut self) -> Result<Program, SimplyError> {
@@ -91,6 +111,22 @@ impl Parser {
             return self.function_statement();
         }
 
+        if self.match_kind(TokenKind::Type) {
+            return self.struct_statement();
+        }
+
+        if self.match_kind(TokenKind::Enum) {
+            return self.enum_statement();
+        }
+
+        if self.match_kind(TokenKind::On) {
+            return self.message_statement();
+        }
+
+        if self.match_kind(TokenKind::Match) {
+            return Ok(Stmt::Expression(self.match_expression()?));
+        }
+
         if self.match_kind(TokenKind::Return) {
             return Ok(Stmt::Return(self.expression()?));
         }
@@ -100,24 +136,32 @@ impl Parser {
         }
 
         let mutable = self.match_kind(TokenKind::Mut);
-        if self.match_kind(TokenKind::LeftParen) {
-            let mut names = Vec::new();
-            loop {
-                names.push((
-                    self.expect_identifier("expected destructured name")?,
-                    mutable,
-                ));
-                if !self.match_kind(TokenKind::Comma) {
-                    break;
-                }
+        if self.is_destructure_assignment_statement() {
+            let parenthesized = self.check(TokenKind::LeftParen);
+            let mut pattern = self.match_pattern()?;
+            if parenthesized && !matches!(&pattern, MatchPattern::Tuple(_)) {
+                pattern = MatchPattern::Tuple(vec![pattern]);
             }
-            self.expect(
-                TokenKind::RightParen,
-                "expected `)` after destructured names",
-            )?;
+            self.expect(TokenKind::Arrow, "expected `->` after destructuring target")?;
+            self.consume_newlines();
+            if self.check(TokenKind::Eof) {
+                return Err(self.error_here("expected a value after `->`"));
+            }
+            return Ok(Stmt::DestructureReassign {
+                pattern,
+                value: self.expression()?,
+            });
+        }
+        if self.is_destructure_statement() {
+            let parenthesized = self.check(TokenKind::LeftParen);
+            let mut pattern = self.match_pattern()?;
+            if parenthesized && !matches!(&pattern, MatchPattern::Tuple(_)) {
+                pattern = MatchPattern::Tuple(vec![pattern]);
+            }
             self.expect(TokenKind::Is, "expected `is` after destructured names")?;
             return Ok(Stmt::Destructure {
-                names,
+                pattern,
+                mutable,
                 value: self.expression()?,
             });
         }
@@ -153,6 +197,27 @@ impl Parser {
         }
         if self.match_kind(TokenKind::Continue) {
             return Ok(Stmt::Continue);
+        }
+
+        if !mutable
+            && matches!(
+                self.peek().kind,
+                TokenKind::String(_)
+                    | TokenKind::Int(_)
+                    | TokenKind::Float(_)
+                    | TokenKind::True
+                    | TokenKind::False
+                    | TokenKind::LeftParen
+                    | TokenKind::Minus
+                    | TokenKind::Not
+                    | TokenKind::Array
+                    | TokenKind::List
+                    | TokenKind::Hash
+                    | TokenKind::Matrix
+                    | TokenKind::Pipeline
+            )
+        {
+            return Ok(Stmt::Expression(self.expression()?));
         }
 
         let next_kind = self.tokens.get(self.current + 1).map(|token| &token.kind);
@@ -262,23 +327,7 @@ impl Parser {
     fn function_statement(&mut self) -> Result<Stmt, SimplyError> {
         let name = self.expect_identifier("expected function name")?;
         self.expect(TokenKind::LeftParen, "expected `(` after function name")?;
-        let mut parameters = Vec::new();
-        if !self.check(TokenKind::RightParen) {
-            loop {
-                let mutable = self.match_kind(TokenKind::Mut);
-                let parameter = self.expect_identifier("expected parameter name")?;
-                let parameter_type = if self.match_kind(TokenKind::As) {
-                    Some(self.type_name()?)
-                } else {
-                    None
-                };
-                parameters.push((parameter, parameter_type, mutable));
-                if !self.match_kind(TokenKind::Comma) {
-                    break;
-                }
-            }
-        }
-        self.expect(TokenKind::RightParen, "expected `)` after parameters")?;
+        let parameters = self.parameter_list()?;
         let return_type = if self.match_kind(TokenKind::Gives) {
             Some(self.type_name()?)
         } else {
@@ -292,6 +341,535 @@ impl Parser {
             name,
             parameters,
             return_type,
+            body: body.into(),
+        })
+    }
+
+    fn parameter_list(&mut self) -> Result<Vec<(String, Option<Type>, bool)>, SimplyError> {
+        let mut parameters = Vec::new();
+        let mut names = std::collections::HashSet::new();
+        if !self.check(TokenKind::RightParen) {
+            loop {
+                let mutable = self.match_kind(TokenKind::Mut);
+                let parameter = self.expect_identifier("expected parameter name")?;
+                if !names.insert(parameter.clone()) {
+                    return Err(SimplyError::Parse {
+                        span: self.tokens[self.current - 1].span.clone(),
+                        code: DiagnosticCode::UnexpectedToken,
+                        message: format!("duplicate parameter `{parameter}`"),
+                    });
+                }
+                let parameter_type = if self.match_kind(TokenKind::As) {
+                    Some(self.type_name()?)
+                } else {
+                    None
+                };
+                parameters.push((parameter, parameter_type, mutable));
+                if !self.match_kind(TokenKind::Comma) {
+                    break;
+                }
+                if self.check(TokenKind::RightParen) {
+                    return Err(self.error_here("expected a parameter after `,`"));
+                }
+            }
+        }
+        self.expect(TokenKind::RightParen, "expected `)` after parameters")?;
+        Ok(parameters)
+    }
+
+    fn struct_statement(&mut self) -> Result<Stmt, SimplyError> {
+        let name = self.expect_identifier("expected a struct name after `type`")?;
+        self.expect(TokenKind::Colon, "expected `:` after struct name")?;
+        self.consume_newlines();
+        let mut fields = Vec::new();
+        let mut field_names = std::collections::HashSet::new();
+        while !self.check(TokenKind::End) && !self.check(TokenKind::Eof) {
+            if self.match_kind(TokenKind::Newline) {
+                continue;
+            }
+            let field_name = self.expect_identifier("expected a field name")?;
+            let field_span = self.tokens[self.current - 1].span.clone();
+            if !field_names.insert(field_name.clone()) {
+                return Err(SimplyError::Parse {
+                    span: field_span,
+                    code: DiagnosticCode::UnexpectedToken,
+                    message: format!("duplicate field `{field_name}` in struct `{name}`"),
+                });
+            }
+            self.expect(TokenKind::As, "expected `as` after struct field name")?;
+            let field_type = self.type_name()?;
+            fields.push(StructField {
+                name: field_name,
+                field_type,
+            });
+            self.expect(TokenKind::Newline, "expected a new line after struct field")?;
+        }
+        self.expect(TokenKind::End, "expected `end` after struct declaration")?;
+        Ok(Stmt::Struct { name, fields })
+    }
+
+    fn enum_statement(&mut self) -> Result<Stmt, SimplyError> {
+        let name = self.expect_identifier("expected an enum name after `enum`")?;
+        self.expect(TokenKind::Colon, "expected `:` after enum name")?;
+        self.consume_newlines();
+        let mut variants = Vec::new();
+        let mut variant_names = std::collections::HashSet::new();
+        while !self.check(TokenKind::End) && !self.check(TokenKind::Eof) {
+            if self.match_kind(TokenKind::Newline) {
+                continue;
+            }
+            let variant = self.expect_identifier("expected an enum variant name")?;
+            if !variant_names.insert(variant.clone()) {
+                return Err(SimplyError::Parse {
+                    span: self.tokens[self.current - 1].span.clone(),
+                    code: DiagnosticCode::UnexpectedToken,
+                    message: format!("duplicate variant `{name}::{variant}`"),
+                });
+            }
+            let payload_type = if self.match_kind(TokenKind::As) {
+                Some(self.type_name()?)
+            } else {
+                None
+            };
+            variants.push(EnumVariant {
+                name: variant,
+                payload_type,
+            });
+            self.expect(TokenKind::Newline, "expected a new line after enum variant")?;
+        }
+        self.expect(TokenKind::End, "expected `end` after enum declaration")?;
+        Ok(Stmt::Enum { name, variants })
+    }
+
+    fn match_expression(&mut self) -> Result<Expr, SimplyError> {
+        let value = self.expression()?;
+        self.expect(TokenKind::Colon, "expected `:` after match value")?;
+        self.consume_newlines();
+        let mut arms = Vec::new();
+        while !self.check(TokenKind::End) && !self.check(TokenKind::Eof) {
+            if self.match_kind(TokenKind::Newline) {
+                continue;
+            }
+            let pattern = self.match_pattern()?;
+            let guard = if self.match_kind(TokenKind::If) {
+                Some(self.expression()?)
+            } else {
+                None
+            };
+            self.expect(
+                TokenKind::Colon,
+                "expected `:` after match pattern or guard",
+            )?;
+            self.consume_newlines();
+            let mut body = Vec::new();
+            while !self.check(TokenKind::End) && !self.is_match_pattern_start() {
+                if self.match_kind(TokenKind::Newline) {
+                    continue;
+                }
+                let span = self.peek().span.clone();
+                body.push(Stmt::Located {
+                    span,
+                    statement: Box::new(self.statement()?),
+                });
+                self.expect(
+                    TokenKind::Newline,
+                    "expected a new line after match arm statement",
+                )?;
+                self.consume_newlines();
+            }
+            let result = match body.last() {
+                Some(Stmt::Located { statement, .. }) => match statement.as_ref() {
+                    Stmt::Expression(expression) => Some(expression.clone()),
+                    _ => None,
+                },
+                Some(Stmt::Expression(expression)) => Some(expression.clone()),
+                _ => None,
+            };
+            if result.is_some() {
+                body.pop();
+            }
+            arms.push(MatchArm {
+                pattern,
+                guard,
+                body,
+                result,
+            });
+        }
+        self.expect(TokenKind::End, "expected `end` after match expression")?;
+        Ok(Expr::Match {
+            value: Box::new(value),
+            arms,
+        })
+    }
+
+    fn match_pattern(&mut self) -> Result<MatchPattern, SimplyError> {
+        let first = self.match_pattern_atom()?;
+        self.consume_newlines_before_pipe();
+        if !self.match_kind(TokenKind::Pipe) {
+            self.consume_newlines_before_match_header();
+            return Ok(first);
+        }
+
+        let mut alternatives = vec![first];
+        loop {
+            self.consume_newlines();
+            if self.check(TokenKind::Colon)
+                || self.check(TokenKind::If)
+                || self.check(TokenKind::RightParen)
+                || self.check(TokenKind::Comma)
+                || self.check(TokenKind::Eof)
+                || !self.is_match_pattern_atom_start()
+            {
+                return Err(self.error_here("expected a pattern after `|`"));
+            }
+            alternatives.push(self.match_pattern_atom()?);
+            self.consume_newlines_before_pipe();
+            if !self.match_kind(TokenKind::Pipe) {
+                break;
+            }
+        }
+        self.consume_newlines_before_match_header();
+        Ok(MatchPattern::Or(alternatives))
+    }
+
+    fn consume_newlines_before_pipe(&mut self) {
+        let mut offset = 0usize;
+        while matches!(
+            self.tokens
+                .get(self.current + offset)
+                .map(|token| &token.kind),
+            Some(TokenKind::Newline)
+        ) {
+            offset += 1;
+        }
+        if matches!(
+            self.tokens
+                .get(self.current + offset)
+                .map(|token| &token.kind),
+            Some(TokenKind::Pipe)
+        ) {
+            self.current += offset;
+        }
+    }
+
+    fn consume_newlines_before_match_header(&mut self) {
+        let mut offset = 0usize;
+        while matches!(
+            self.tokens
+                .get(self.current + offset)
+                .map(|token| &token.kind),
+            Some(TokenKind::Newline)
+        ) {
+            offset += 1;
+        }
+        if matches!(
+            self.tokens
+                .get(self.current + offset)
+                .map(|token| &token.kind),
+            Some(TokenKind::If | TokenKind::Colon)
+        ) {
+            self.current += offset;
+        }
+    }
+
+    fn is_match_pattern_atom_start(&self) -> bool {
+        matches!(
+            self.peek().kind,
+            TokenKind::Identifier(_)
+                | TokenKind::LeftParen
+                | TokenKind::LeftBracket
+                | TokenKind::LeftBrace
+                | TokenKind::DotDot
+                | TokenKind::String(_)
+                | TokenKind::Int(_)
+                | TokenKind::Float(_)
+                | TokenKind::True
+                | TokenKind::False
+                | TokenKind::Minus
+        )
+    }
+
+    fn match_pattern_atom(&mut self) -> Result<MatchPattern, SimplyError> {
+        if self.match_kind(TokenKind::DotDot) {
+            let end = self.range_pattern_endpoint()?;
+            if end.is_none() {
+                return Err(self.error_here("a range pattern must have at least one bound"));
+            }
+            return Ok(MatchPattern::Range { start: None, end });
+        }
+
+        let literal = match self.peek().kind.clone() {
+            TokenKind::String(value) => Some(Literal::String(value)),
+            TokenKind::Int(value) => Some(Literal::Int(value)),
+            TokenKind::Float(value) => Some(Literal::Float(value)),
+            TokenKind::True => Some(Literal::Bool(true)),
+            TokenKind::False => Some(Literal::Bool(false)),
+            _ => None,
+        };
+        if let Some(literal) = literal {
+            self.advance();
+            return self.finish_literal_pattern(literal);
+        }
+        if self.match_kind(TokenKind::Minus) {
+            let token = self.advance().clone();
+            let literal = match token.kind {
+                TokenKind::Int(value) => {
+                    Literal::Int(value.checked_neg().ok_or_else(|| SimplyError::Parse {
+                        span: token.span.clone(),
+                        code: DiagnosticCode::InvalidNumber,
+                        message: "integer pattern bound is out of range".into(),
+                    })?)
+                }
+                TokenKind::Float(value) => Literal::Float(-value),
+                _ => Err(SimplyError::Parse {
+                    span: token.span,
+                    code: DiagnosticCode::UnexpectedToken,
+                    message: "expected a numeric literal after `-` in pattern".into(),
+                })?,
+            };
+            return self.finish_literal_pattern(literal);
+        }
+        if self.match_kind(TokenKind::LeftParen) {
+            let mut patterns = Vec::new();
+            while !self.check(TokenKind::RightParen) {
+                patterns.push(self.match_pattern()?);
+                if !self.match_kind(TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(TokenKind::RightParen, "expected `)` after tuple pattern")?;
+            return Ok(match patterns.len() {
+                0 => MatchPattern::Tuple(patterns),
+                1 => patterns.pop().expect("single pattern was checked"),
+                _ => MatchPattern::Tuple(patterns),
+            });
+        }
+        if self.match_kind(TokenKind::LeftBracket) {
+            let mut patterns = Vec::new();
+            let mut rest = None;
+            while !self.check(TokenKind::RightBracket) {
+                if self.match_kind(TokenKind::DotDotDot) {
+                    let name = self.expect_identifier("expected a binding name after `...`")?;
+                    if name == "_" {
+                        return Err(self.error_here("rest pattern must bind an identifier"));
+                    }
+                    rest = Some(name);
+                    if self.match_kind(TokenKind::Comma) && !self.check(TokenKind::RightBracket) {
+                        return Err(
+                            self.error_here("rest pattern must be the final sequence element")
+                        );
+                    }
+                    if !self.check(TokenKind::RightBracket) {
+                        return Err(self.error_here("expected `]` after rest pattern"));
+                    }
+                    break;
+                }
+                patterns.push(self.match_pattern()?);
+                if !self.match_kind(TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(
+                TokenKind::RightBracket,
+                "expected `]` after sequence pattern",
+            )?;
+            return Ok(MatchPattern::Sequence { patterns, rest });
+        }
+        if self.match_kind(TokenKind::LeftBrace) {
+            let mut entries = Vec::new();
+            self.consume_newlines();
+            while !self.check(TokenKind::RightBrace) {
+                let key = match self.advance().clone() {
+                    Token {
+                        kind: TokenKind::String(key),
+                        ..
+                    } => key,
+                    Token {
+                        kind: TokenKind::Identifier(key),
+                        ..
+                    } => key,
+                    token => {
+                        return Err(SimplyError::Parse {
+                            span: token.span,
+                            code: DiagnosticCode::UnexpectedToken,
+                            message: "hash pattern keys must be string literals or field names"
+                                .into(),
+                        });
+                    }
+                };
+                if entries.iter().any(|(existing, _)| existing == &key) {
+                    return Err(self.error_here("duplicate key in hash pattern"));
+                }
+                self.expect(TokenKind::Colon, "expected `:` after hash pattern key")?;
+                entries.push((key, self.match_pattern()?));
+                self.consume_newlines();
+                if !self.match_kind(TokenKind::Comma) {
+                    break;
+                }
+                self.consume_newlines();
+            }
+            self.expect(TokenKind::RightBrace, "expected `}` after hash pattern")?;
+            return Ok(MatchPattern::Hash(entries));
+        }
+
+        let name = self.expect_identifier("expected a match pattern")?;
+        if name == "_" {
+            if self.check(TokenKind::DotDot) {
+                return Err(self.error_here("range pattern bounds must be literal values"));
+            }
+            if self.check(TokenKind::At) {
+                return Err(self.error_here("alias pattern requires a binding identifier"));
+            }
+            return Ok(MatchPattern::Wildcard);
+        }
+        if self.match_kind(TokenKind::At) {
+            let pattern = self.match_pattern_atom()?;
+            return Ok(MatchPattern::Alias {
+                name,
+                pattern: Box::new(pattern),
+            });
+        }
+        if self.check(TokenKind::DotDot) {
+            return Err(self.error_here("range pattern bounds must be literal values"));
+        }
+        if self.match_kind(TokenKind::LeftParen) {
+            let mut fields = Vec::new();
+            while !self.check(TokenKind::RightParen) {
+                fields.push(self.match_pattern()?);
+                if !self.match_kind(TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(TokenKind::RightParen, "expected `)` after struct pattern")?;
+            return Ok(MatchPattern::Struct {
+                type_name: name,
+                fields,
+            });
+        }
+        if !self.match_kind(TokenKind::DoubleColon) {
+            return Ok(MatchPattern::Identifier(name));
+        }
+
+        let variant_name = self.expect_identifier("expected an enum variant name")?;
+        let payload = if self.match_kind(TokenKind::LeftParen) {
+            let pattern = self.match_pattern()?;
+            self.expect(
+                TokenKind::RightParen,
+                "expected `)` after enum payload pattern",
+            )?;
+            Some(Box::new(pattern))
+        } else {
+            None
+        };
+        Ok(MatchPattern::EnumVariant {
+            enum_name: name,
+            variant_name,
+            payload,
+        })
+    }
+
+    fn finish_literal_pattern(&mut self, literal: Literal) -> Result<MatchPattern, SimplyError> {
+        if self.match_kind(TokenKind::DotDot) {
+            let end = self.range_pattern_endpoint()?;
+            return Ok(MatchPattern::Range {
+                start: Some(literal),
+                end,
+            });
+        }
+        Ok(MatchPattern::Literal(literal))
+    }
+
+    fn range_pattern_endpoint(&mut self) -> Result<Option<Literal>, SimplyError> {
+        let literal = match self.peek().kind.clone() {
+            TokenKind::Colon
+            | TokenKind::If
+            | TokenKind::Pipe
+            | TokenKind::RightParen
+            | TokenKind::RightBracket
+            | TokenKind::RightBrace
+            | TokenKind::Comma
+            | TokenKind::Newline
+            | TokenKind::Eof => return Ok(None),
+            TokenKind::String(value) => Literal::String(value),
+            TokenKind::Int(value) => Literal::Int(value),
+            TokenKind::Float(value) => Literal::Float(value),
+            TokenKind::True => Literal::Bool(true),
+            TokenKind::False => Literal::Bool(false),
+            TokenKind::Minus => {
+                self.advance();
+                let token = self.advance().clone();
+                return match token.kind {
+                    TokenKind::Int(value) => value
+                        .checked_neg()
+                        .map(|value| Some(Literal::Int(value)))
+                        .ok_or_else(|| SimplyError::Parse {
+                            span: token.span,
+                            code: DiagnosticCode::InvalidNumber,
+                            message: "integer pattern bound is out of range".into(),
+                        }),
+                    TokenKind::Float(value) => Ok(Some(Literal::Float(-value))),
+                    _ => Err(SimplyError::Parse {
+                        span: token.span,
+                        code: DiagnosticCode::UnexpectedToken,
+                        message: "range pattern bounds must be literal values".into(),
+                    }),
+                };
+            }
+            _ => {
+                return Err(self.error_here("range pattern bounds must be literal values"));
+            }
+        };
+        self.advance();
+        Ok(Some(literal))
+    }
+
+    fn is_match_pattern_start(&self) -> bool {
+        if !self.is_match_pattern_atom_start() {
+            return false;
+        }
+
+        let mut depth = 0usize;
+        for token in &self.tokens[self.current..] {
+            match &token.kind {
+                TokenKind::Newline | TokenKind::Eof => return false,
+                TokenKind::LeftParen => depth += 1,
+                TokenKind::LeftBracket | TokenKind::LeftBrace => depth += 1,
+                TokenKind::RightParen => {
+                    let Some(new_depth) = depth.checked_sub(1) else {
+                        return false;
+                    };
+                    depth = new_depth;
+                }
+                TokenKind::RightBracket | TokenKind::RightBrace => {
+                    let Some(new_depth) = depth.checked_sub(1) else {
+                        return false;
+                    };
+                    depth = new_depth;
+                }
+                TokenKind::Colon if depth == 0 => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn message_statement(&mut self) -> Result<Stmt, SimplyError> {
+        let receiver_type = self.expect_identifier("expected a receiver type after `on`")?;
+        self.expect(TokenKind::Receive, "expected `receive` after receiver type")?;
+        let name = self.expect_identifier("expected a message name after `receive`")?;
+        let parameters = if self.match_kind(TokenKind::LeftParen) {
+            self.parameter_list()?
+        } else {
+            Vec::new()
+        };
+        self.expect(TokenKind::Colon, "expected `:` after message declaration")?;
+        self.consume_newlines();
+        let body = self.block_until(TokenKind::End, TokenKind::End)?;
+        self.expect(TokenKind::End, "expected `end` after message declaration")?;
+        Ok(Stmt::Message {
+            receiver_type,
+            name,
+            parameters,
             body: body.into(),
         })
     }
@@ -402,11 +980,118 @@ impl Parser {
         while self.match_kind(TokenKind::Newline) {}
     }
 
+    fn is_destructure_statement(&self) -> bool {
+        self.is_destructure_target_statement(TokenKind::Is)
+    }
+
+    fn is_destructure_assignment_statement(&self) -> bool {
+        self.is_destructure_target_statement(TokenKind::Arrow)
+    }
+
+    fn is_destructure_target_statement(&self, terminator: TokenKind) -> bool {
+        let Some(kind) = self.tokens.get(self.current).map(|token| &token.kind) else {
+            return false;
+        };
+        let start = match kind {
+            TokenKind::LeftParen | TokenKind::LeftBracket | TokenKind::LeftBrace => self.current,
+            TokenKind::Identifier(_) => {
+                let Some(next) = self.tokens.get(self.current + 1).map(|token| &token.kind) else {
+                    return false;
+                };
+                match next {
+                    TokenKind::LeftParen => self.current + 1,
+                    TokenKind::DoubleColon => {
+                        let variant = self.current + 2;
+                        if !matches!(
+                            self.tokens.get(variant).map(|token| &token.kind),
+                            Some(TokenKind::Identifier(_))
+                        ) {
+                            return false;
+                        }
+                        if matches!(
+                            self.tokens.get(variant + 1).map(|token| &token.kind),
+                            Some(TokenKind::LeftParen)
+                        ) {
+                            variant + 1
+                        } else {
+                            return matches!(
+                                self.tokens.get(variant + 1).map(|token| &token.kind),
+                                Some(token) if token == &terminator
+                            );
+                        }
+                    }
+                    TokenKind::At => self.current + 2,
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        };
+        if matches!(kind, TokenKind::Identifier(_))
+            && matches!(
+                self.tokens.get(self.current + 1).map(|token| &token.kind),
+                Some(TokenKind::At)
+            )
+        {
+            let mut depth = 0usize;
+            for token in self.tokens.iter().skip(start) {
+                match &token.kind {
+                    TokenKind::LeftParen | TokenKind::LeftBracket | TokenKind::LeftBrace => {
+                        depth += 1;
+                    }
+                    TokenKind::RightParen | TokenKind::RightBracket | TokenKind::RightBrace => {
+                        depth = depth.saturating_sub(1);
+                    }
+                    token if *token == terminator && depth == 0 => return true,
+                    TokenKind::Eof | TokenKind::Newline if depth == 0 => return false,
+                    _ => {}
+                }
+            }
+            return false;
+        }
+        let opening = &self.tokens[start].kind;
+        let closing = match opening {
+            TokenKind::LeftParen => TokenKind::RightParen,
+            TokenKind::LeftBracket => TokenKind::RightBracket,
+            TokenKind::LeftBrace => TokenKind::RightBrace,
+            _ => return false,
+        };
+        let mut depth = 0usize;
+        for (index, token) in self.tokens.iter().enumerate().skip(start) {
+            match &token.kind {
+                TokenKind::LeftParen | TokenKind::LeftBracket | TokenKind::LeftBrace => {
+                    depth += 1;
+                }
+                TokenKind::RightParen | TokenKind::RightBracket | TokenKind::RightBrace => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return token.kind == closing
+                            && matches!(
+                                self.tokens.get(index + 1).map(|token| &token.kind),
+                                Some(token) if token == &terminator
+                            );
+                    }
+                }
+                TokenKind::Eof | TokenKind::Newline if depth > 0 => return false,
+                _ => {}
+            }
+        }
+        false
+    }
+
     fn expression(&mut self) -> Result<Expr, SimplyError> {
         self.parse_binary(0)
     }
 
     fn type_name(&mut self) -> Result<Type, SimplyError> {
+        if self.match_kind(TokenKind::LeftParen) {
+            let mut types = vec![self.type_name()?];
+            while self.match_kind(TokenKind::Comma) {
+                types.push(self.type_name()?);
+            }
+            self.expect(TokenKind::RightParen, "expected `)` after tuple type")?;
+            return Ok(Type::Tuple(types));
+        }
+
         let name = match self.advance().kind.clone() {
             TokenKind::Identifier(name) => name,
             TokenKind::Array => "Array".into(),
@@ -428,7 +1113,8 @@ impl Parser {
             "Tree" => Type::Tree,
             "Matrix" => Type::Matrix,
             "Tuple" => Type::Tuple(Vec::new()),
-            _ => return Err(self.error_here("expected a supported type")),
+            _ if self.enum_names.contains(&name) => Type::Enum(name.clone()),
+            _ => Type::Struct(name.clone()),
         };
         if self.match_kind(TokenKind::LeftBracket) {
             if name == "Tuple" {
@@ -515,11 +1201,16 @@ impl Parser {
             }
             TokenKind::Hash => Ok(Expr::Hash(self.named_block(TokenKind::Hash)?)),
             TokenKind::Pipeline => self.pipeline_expression(),
+            TokenKind::Match => self.match_expression(),
             TokenKind::Tree => Ok(Expr::Identifier("tree".into())),
             TokenKind::Count => Ok(Expr::Identifier("count".into())),
             TokenKind::LeftParen => {
                 let values = self.expression_list(TokenKind::RightParen)?;
-                Ok(Expr::Tuple(values))
+                if values.len() == 1 {
+                    Ok(values.into_iter().next().expect("one value was checked"))
+                } else {
+                    Ok(Expr::Tuple(values))
+                }
             }
             _ => Err(SimplyError::Parse {
                 span: token.span,
@@ -560,6 +1251,31 @@ impl Parser {
                 };
             } else {
                 break;
+            }
+        }
+        if self.match_kind(TokenKind::DoubleColon) {
+            let message = self.expect_message_name()?;
+            let arguments = if self.check(TokenKind::LeftParen) {
+                self.advance();
+                self.argument_list()?
+            } else {
+                Vec::new()
+            };
+            if let Expr::Identifier(enum_name) = &expression
+                && (self.enum_names.contains(enum_name)
+                    || enum_name.chars().next().is_some_and(char::is_uppercase))
+            {
+                expression = Expr::EnumVariant {
+                    enum_name: enum_name.clone(),
+                    variant_name: message,
+                    arguments,
+                };
+            } else {
+                expression = Expr::MessageDispatch {
+                    receiver: Box::new(expression),
+                    message,
+                    arguments,
+                };
             }
         }
         Ok(expression)
@@ -784,17 +1500,28 @@ impl Parser {
 
     fn call_expression(&mut self, name: String) -> Result<Expr, SimplyError> {
         self.expect(TokenKind::LeftParen, "expected `(` after function name")?;
+        let arguments = self.argument_list()?;
+        Ok(Expr::Call { name, arguments })
+    }
+
+    fn argument_list(&mut self) -> Result<Vec<Expr>, SimplyError> {
         let mut arguments = Vec::new();
+        self.consume_newlines();
         if !self.check(TokenKind::RightParen) {
             loop {
                 arguments.push(self.expression()?);
+                self.consume_newlines();
                 if !self.match_kind(TokenKind::Comma) {
                     break;
+                }
+                self.consume_newlines();
+                if self.check(TokenKind::RightParen) {
+                    return Err(self.error_here("expected an argument after `,`"));
                 }
             }
         }
         self.expect(TokenKind::RightParen, "expected `)` after arguments")?;
-        Ok(Expr::Call { name, arguments })
+        Ok(arguments)
     }
 
     fn binary_operator(&self) -> Option<(u8, BinaryOperator)> {
@@ -865,6 +1592,18 @@ impl Parser {
         match self.advance().kind.clone() {
             TokenKind::Identifier(name) => Ok(name),
             _ => Err(self.error_here(message)),
+        }
+    }
+
+    fn expect_message_name(&mut self) -> Result<String, SimplyError> {
+        let token = self.advance().clone();
+        match token.kind {
+            TokenKind::Identifier(name) => Ok(name),
+            _ => Err(SimplyError::Parse {
+                span: token.span,
+                code: DiagnosticCode::UnexpectedToken,
+                message: "expected an identifier after `::`".into(),
+            }),
         }
     }
 
@@ -942,6 +1681,48 @@ mod tests {
     }
 
     #[test]
+    fn parses_destructuring_assignment_without_changing_tuple_or_sequence_expressions() {
+        let program = Parser::new(
+            Lexer::new(
+                "(left, right) -> (1, 2)\n\
+                        [head, ...tail] -> values\n\
+                        (1, 2)\n\
+                        nums is [3, 4]\n",
+            )
+            .tokenize()
+            .unwrap(),
+        )
+        .parse()
+        .unwrap();
+
+        assert!(matches!(
+            inner(&program.statements[0]),
+            Stmt::DestructureReassign {
+                pattern: MatchPattern::Tuple(patterns),
+                value: Expr::Tuple(values),
+            } if patterns.len() == 2 && values.len() == 2
+        ));
+        assert!(matches!(
+            inner(&program.statements[1]),
+            Stmt::DestructureReassign {
+                pattern: MatchPattern::Sequence { patterns, rest: Some(rest) },
+                value: Expr::Identifier(value),
+            } if patterns.len() == 1 && rest == "tail" && value == "values"
+        ));
+        assert!(matches!(
+            inner(&program.statements[2]),
+            Stmt::Expression(Expr::Tuple(values)) if values.len() == 2
+        ));
+        assert!(matches!(
+            inner(&program.statements[3]),
+            Stmt::Assign {
+                value: Expr::Array(values),
+                ..
+            } if values.len() == 2
+        ));
+    }
+
+    #[test]
     fn explains_that_typed_assignments_need_is() {
         let tokens = Lexer::new("name as String \"Simply\"\n")
             .tokenize()
@@ -975,6 +1756,181 @@ mod tests {
             inner(&program.statements[1]),
             Stmt::Say(Expr::Call { .. })
         ));
+    }
+
+    #[test]
+    fn parses_dispatch_calls_and_nested_argument_expressions() {
+        let tokens = Lexer::new("result is get_person() :: rename(user :: name, \"Ada\")\n")
+            .tokenize()
+            .unwrap();
+        let program = Parser::new(tokens).parse().unwrap();
+        let Stmt::Assign { value, .. } = inner(&program.statements[0]) else {
+            panic!("expected assignment");
+        };
+        assert_eq!(
+            value,
+            &Expr::MessageDispatch {
+                receiver: Box::new(Expr::Call {
+                    name: "get_person".into(),
+                    arguments: vec![],
+                }),
+                message: "rename".into(),
+                arguments: vec![
+                    Expr::MessageDispatch {
+                        receiver: Box::new(Expr::Identifier("user".into())),
+                        message: "name".into(),
+                        arguments: vec![],
+                    },
+                    Expr::Literal(Literal::String("Ada".into())),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn treats_omitted_and_empty_message_arguments_equally() {
+        let program = Parser::new(
+            Lexer::new("person :: greet\nperson :: greet()\n")
+                .tokenize()
+                .unwrap(),
+        )
+        .parse()
+        .unwrap();
+        assert_eq!(inner(&program.statements[0]), inner(&program.statements[1]));
+    }
+
+    #[test]
+    fn parses_parenthesized_compound_and_nested_receivers() {
+        let tokens = Lexer::new("(left + right) :: combine\n(person :: address) :: city\n")
+            .tokenize()
+            .unwrap();
+        let program = Parser::new(tokens).parse().unwrap();
+        assert!(matches!(
+            inner(&program.statements[0]),
+            Stmt::Expression(Expr::MessageDispatch { receiver, .. })
+                if matches!(receiver.as_ref(), Expr::Binary { .. })
+        ));
+        assert!(matches!(
+            inner(&program.statements[1]),
+            Stmt::Expression(Expr::MessageDispatch {
+                receiver,
+                message,
+                ..
+            }) if message == "city"
+                && matches!(receiver.as_ref(), Expr::MessageDispatch { message, .. } if message == "address")
+        ));
+    }
+
+    #[test]
+    fn distinguishes_enum_construction_from_identifier_message_dispatch() {
+        let source = "enum Result:\n    Ok as Int\nend\n\
+                      result is Result::Ok(42)\n\
+                      person :: greet\n";
+        let program = Parser::new(Lexer::new(source).tokenize().unwrap())
+            .parse()
+            .unwrap();
+        assert!(matches!(
+            inner(&program.statements[1]),
+            Stmt::Assign {
+                value: Expr::EnumVariant { enum_name, variant_name, .. },
+                ..
+            } if enum_name == "Result" && variant_name == "Ok"
+        ));
+        assert!(matches!(
+            inner(&program.statements[2]),
+            Stmt::Expression(Expr::MessageDispatch { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_chained_and_malformed_message_dispatch() {
+        for source in [
+            "person :: address :: city\n",
+            "person ::\n",
+            ":: greet\n",
+            "person :: \"greet\"\n",
+            "person :: 123\n",
+            "person :: true\n",
+            "person :: rename(,)\n",
+            "person :: rename(\"Ada\"\n",
+            "person :: rename(\n",
+            "person :: rename(\"Ada\",)\n",
+        ] {
+            assert!(
+                Parser::new(Lexer::new(source).tokenize().unwrap())
+                    .parse()
+                    .is_err(),
+                "accepted invalid dispatch syntax: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn locates_invalid_message_selectors_at_the_selector() {
+        let error = Parser::new(Lexer::new("person :: \"greet\"\n").tokenize().unwrap())
+            .parse()
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SimplyError::Parse {
+                span: Span {
+                    line: 1,
+                    column: 11,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_struct_fields_and_typed_messages_as_dedicated_nodes() {
+        let source = "type Person:\n    name as String\n    age as Int\nend\n\
+                      on Person receive rename(value as String):\n    return value\nend\n";
+        let program = Parser::new(Lexer::new(source).tokenize().unwrap())
+            .parse()
+            .unwrap();
+        assert!(matches!(
+            inner(&program.statements[0]),
+            Stmt::Struct { name, fields }
+                if name == "Person"
+                    && fields.len() == 2
+                    && fields[0].name == "name"
+                    && fields[0].field_type == Type::String
+                    && fields[1].name == "age"
+                    && fields[1].field_type == Type::Int
+        ));
+        assert!(matches!(
+            inner(&program.statements[1]),
+            Stmt::Message {
+                receiver_type,
+                name,
+                parameters,
+                ..
+            } if receiver_type == "Person"
+                && name == "rename"
+                && parameters == &vec![("value".into(), Some(Type::String), false)]
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_fields_and_malformed_object_declarations() {
+        for source in [
+            "type Person:\n    name as String\n    name as String\nend\n",
+            "type Person:\n    name String\nend\n",
+            "type Person:\n    name as\nend\n",
+            "type Person:\n    name as String\n",
+            "on Person greet:\nend\n",
+            "on Person receive:\nend\n",
+            "on Person receive greet(value,):\nend\n",
+        ] {
+            assert!(
+                Parser::new(Lexer::new(source).tokenize().unwrap())
+                    .parse()
+                    .is_err(),
+                "accepted invalid object declaration: {source}"
+            );
+        }
     }
 
     #[test]

@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     ast::{
-        BinaryOperator, Expr, Literal, PipelineStep, Program, Stmt, UnaryOperator,
-        is_parallel_safe_expression,
+        BinaryOperator, Expr, Literal, MatchPattern, PipelineStep, Program, Stmt, StructField,
+        UnaryOperator, is_parallel_safe_expression,
     },
     error::{DiagnosticCode, SimplyError, Span},
     types::Type,
@@ -17,10 +17,28 @@ struct FunctionSignature {
     parameters: Vec<Option<Type>>,
     return_type: Option<Type>,
 }
+
+#[derive(Clone)]
+struct MessageSignature {
+    parameters: Vec<Option<Type>>,
+    return_type: Option<Type>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CoverageConstructor {
+    Enum { type_name: String, variant: String },
+    Tuple(usize),
+    Struct(String),
+    Bool(bool),
+}
+
 #[derive(Default)]
 pub struct SemanticAnalyzer {
     variables: ScopeStack,
     functions: HashMap<String, FunctionSignature>,
+    structs: HashMap<String, Vec<StructField>>,
+    enums: HashMap<String, Vec<crate::ast::EnumVariant>>,
+    messages: HashMap<(String, String), MessageSignature>,
     current_span: Option<Span>,
     loop_depth: usize,
     function_depth: usize,
@@ -194,8 +212,249 @@ impl SemanticAnalyzer {
     }
 
     pub fn analyze(&mut self, program: &Program) -> Result<(), SimplyError> {
+        self.collect_structs_and_messages(&program.statements)?;
         self.collect_functions(&program.statements)?;
         self.analyze_statements(&program.statements)
+    }
+
+    fn collect_structs_and_messages(&mut self, statements: &[Stmt]) -> Result<(), SimplyError> {
+        let statements = statements.iter().filter_map(|statement| match statement {
+            Stmt::Located { span, statement } => Some((Some(span.clone()), statement.as_ref())),
+            statement => Some((None, statement)),
+        });
+        let statements = statements.collect::<Vec<_>>();
+        for (span, statement) in &statements {
+            if let Some(span) = span {
+                self.current_span = Some(span.clone());
+            }
+            if let Stmt::Enum { name, variants } = statement {
+                if self.enums.contains_key(name) || self.structs.contains_key(name) {
+                    return Err(self.error(
+                        DiagnosticCode::DuplicateDeclaration,
+                        format!("type `{name}` is already declared"),
+                    ));
+                }
+                if variants.is_empty() {
+                    return Err(self.error(
+                        DiagnosticCode::UnexpectedToken,
+                        format!("enum `{name}` must declare at least one variant"),
+                    ));
+                }
+                self.enums.insert(name.clone(), variants.clone());
+            }
+        }
+        for (span, statement) in &statements {
+            if let Some(span) = span {
+                self.current_span = Some(span.clone());
+            }
+            if let Stmt::Struct { name, fields } = statement {
+                if self.structs.contains_key(name) || self.enums.contains_key(name) {
+                    return Err(self.error(
+                        DiagnosticCode::DuplicateDeclaration,
+                        format!("type `{name}` is already declared"),
+                    ));
+                }
+                self.structs.insert(name.clone(), fields.clone());
+            }
+        }
+        for (span, statement) in statements {
+            if let Some(span) = span {
+                self.current_span = Some(span);
+            }
+            match statement {
+                Stmt::Struct { fields, .. } => {
+                    for field in fields {
+                        self.validate_declared_type(&field.field_type)?;
+                    }
+                }
+                Stmt::Enum { variants, .. } => {
+                    for variant in variants {
+                        if let Some(payload_type) = &variant.payload_type {
+                            self.validate_declared_type(payload_type)?;
+                        }
+                    }
+                }
+                Stmt::Message {
+                    receiver_type,
+                    name,
+                    parameters,
+                    ..
+                } => {
+                    if !self.structs.contains_key(receiver_type) {
+                        return Err(self.error(
+                            DiagnosticCode::InvalidFunctionCall,
+                            format!("unknown receiver type `{receiver_type}` for message `{name}`"),
+                        ));
+                    }
+                    let key = (receiver_type.clone(), name.clone());
+                    if self.messages.contains_key(&key) {
+                        return Err(self.error(
+                            DiagnosticCode::DuplicateDeclaration,
+                            format!("message `{name}` is already defined for `{receiver_type}`"),
+                        ));
+                    }
+                    let fields = &self.structs[receiver_type];
+                    for (parameter, parameter_type, _) in parameters {
+                        if fields.iter().any(|field| &field.name == parameter) {
+                            return Err(self.error(
+                                DiagnosticCode::DuplicateDeclaration,
+                                format!(
+                                    "message parameter `{parameter}` conflicts with a field of `{receiver_type}`"
+                                ),
+                            ));
+                        }
+                        if let Some(parameter_type) = parameter_type {
+                            self.validate_declared_type(parameter_type)?;
+                        }
+                    }
+                    self.messages.insert(
+                        key,
+                        MessageSignature {
+                            parameters: parameters
+                                .iter()
+                                .map(|(_, parameter_type, _)| parameter_type.clone())
+                                .collect(),
+                            return_type: None,
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_destructure_assignment_pattern(
+        &self,
+        pattern: &MatchPattern,
+        actual: &Type,
+        targets: &mut Vec<String>,
+    ) -> Result<(), SimplyError> {
+        match pattern {
+            MatchPattern::Identifier(name) => {
+                self.validate_destructure_assignment_identifier(name, actual, targets)?;
+            }
+            MatchPattern::Wildcard => {}
+            MatchPattern::Tuple(patterns) => match actual {
+                Type::Tuple(types) if types.len() == patterns.len() => {
+                    for (pattern, typ) in patterns.iter().zip(types) {
+                        self.validate_destructure_assignment_pattern(pattern, typ, targets)?;
+                    }
+                }
+                Type::Tuple(types) => {
+                    return Err(self.error(
+                        DiagnosticCode::SemanticDestructure,
+                        format!(
+                            "tuple has {} values, but destructuring assignment target has {} elements",
+                            types.len(),
+                            patterns.len()
+                        ),
+                    ));
+                }
+                Type::Unknown => {
+                    for pattern in patterns {
+                        self.validate_destructure_assignment_pattern(
+                            pattern,
+                            &Type::Unknown,
+                            targets,
+                        )?;
+                    }
+                }
+                _ => {
+                    return Err(self.error(
+                        DiagnosticCode::SemanticDestructure,
+                        "tuple destructuring assignment requires a tuple value",
+                    ));
+                }
+            },
+            MatchPattern::Sequence { patterns, rest } => {
+                let (element_type, rest_type) = match actual {
+                    Type::Array(element) => {
+                        (element.as_ref().clone(), Type::Array(element.clone()))
+                    }
+                    Type::List(element) => (element.as_ref().clone(), Type::List(element.clone())),
+                    Type::Unknown => (Type::Unknown, Type::Unknown),
+                    _ => {
+                        return Err(self.error(
+                            DiagnosticCode::SemanticDestructure,
+                            format!(
+                                "sequence destructuring assignment requires an Array or List value, found {}",
+                                actual.name()
+                            ),
+                        ));
+                    }
+                };
+                for pattern in patterns {
+                    self.validate_destructure_assignment_pattern(pattern, &element_type, targets)?;
+                }
+                if let Some(name) = rest {
+                    self.validate_destructure_assignment_identifier(name, &rest_type, targets)?;
+                }
+            }
+            MatchPattern::Literal(_)
+            | MatchPattern::Range { .. }
+            | MatchPattern::Or(_)
+            | MatchPattern::Hash(_)
+            | MatchPattern::Alias { .. }
+            | MatchPattern::EnumVariant { .. }
+            | MatchPattern::Struct { .. } => {
+                return Err(self.error(
+                    DiagnosticCode::SemanticDestructure,
+                    "destructuring assignment targets support only identifiers, `_`, tuples, sequences, and rest bindings",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_destructure_assignment_identifier(
+        &self,
+        name: &str,
+        actual: &Type,
+        targets: &mut Vec<String>,
+    ) -> Result<(), SimplyError> {
+        let expected = self.variables.get(name).ok_or_else(|| {
+            self.error(
+                DiagnosticCode::UndefinedVariable,
+                format!("cannot destructure-assign unknown variable `{name}`"),
+            )
+        })?;
+        if !self.variables.is_mutable(name) {
+            return Err(self.error(
+                DiagnosticCode::InvalidReassignment,
+                format!("cannot reassign immutable variable `{name}`; declare it with `mut`"),
+            ));
+        }
+        if targets.iter().any(|target| target == name) {
+            return Err(self.error(
+                DiagnosticCode::SemanticDestructure,
+                format!("duplicate destructuring assignment target `{name}`"),
+            ));
+        }
+        self.require_type(expected, actual)?;
+        targets.push(name.to_owned());
+        Ok(())
+    }
+
+    fn validate_declared_type(&self, typ: &Type) -> Result<(), SimplyError> {
+        match typ {
+            Type::Struct(name) if !self.structs.contains_key(name) => Err(self.error(
+                DiagnosticCode::UndefinedVariable,
+                format!("unknown type `{name}`"),
+            )),
+            Type::Enum(name) if !self.enums.contains_key(name) => Err(self.error(
+                DiagnosticCode::UndefinedVariable,
+                format!("unknown enum type `{name}`"),
+            )),
+            Type::Array(element) | Type::List(element) => self.validate_declared_type(element),
+            Type::Tuple(elements) => {
+                for element in elements {
+                    self.validate_declared_type(element)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     fn define_variable(
@@ -206,6 +465,83 @@ impl SemanticAnalyzer {
     ) -> Result<(), SimplyError> {
         let span = self.current_span.clone().unwrap_or_else(|| Span::new(0, 0));
         self.variables.define_at(name, typ, mutable, span)
+    }
+
+    fn validate_destructure_pattern(
+        &self,
+        pattern: &MatchPattern,
+        expected: &Type,
+        bindings: &mut Vec<(String, Type)>,
+    ) -> Result<(), SimplyError> {
+        match pattern {
+            MatchPattern::Identifier(name) => bindings.push((name.clone(), expected.clone())),
+            MatchPattern::Wildcard => {}
+            MatchPattern::Tuple(patterns) => match expected {
+                Type::Tuple(types) if types.len() == patterns.len() => {
+                    for (pattern, typ) in patterns.iter().zip(types) {
+                        self.validate_destructure_pattern(pattern, typ, bindings)?;
+                    }
+                }
+                Type::Tuple(types) => {
+                    return Err(self.error(
+                        DiagnosticCode::SemanticDestructure,
+                        format!(
+                            "tuple has {} values, but destructuring target has {} elements",
+                            types.len(),
+                            patterns.len()
+                        ),
+                    ));
+                }
+                Type::Unknown => {
+                    for pattern in patterns {
+                        self.validate_destructure_pattern(pattern, &Type::Unknown, bindings)?;
+                    }
+                }
+                _ => {
+                    return Err(self.error(
+                        DiagnosticCode::SemanticDestructure,
+                        "tuple destructuring requires a tuple value",
+                    ));
+                }
+            },
+            MatchPattern::Sequence { patterns, rest } => {
+                let (element_type, rest_type) = match expected {
+                    Type::Array(element) => {
+                        (element.as_ref().clone(), Type::Array(element.clone()))
+                    }
+                    Type::List(element) => (element.as_ref().clone(), Type::List(element.clone())),
+                    Type::Unknown => (Type::Unknown, Type::Unknown),
+                    _ => {
+                        return Err(self.error(
+                            DiagnosticCode::SemanticDestructure,
+                            format!(
+                                "sequence destructuring requires an Array or List value, found {}",
+                                expected.name()
+                            ),
+                        ));
+                    }
+                };
+                for pattern in patterns {
+                    self.validate_destructure_pattern(pattern, &element_type, bindings)?;
+                }
+                if let Some(name) = rest {
+                    bindings.push((name.clone(), rest_type));
+                }
+            }
+            MatchPattern::Literal(_)
+            | MatchPattern::Range { .. }
+            | MatchPattern::Or(_)
+            | MatchPattern::Hash(_)
+            | MatchPattern::Alias { .. }
+            | MatchPattern::EnumVariant { .. }
+            | MatchPattern::Struct { .. } => {
+                return Err(self.error(
+                    DiagnosticCode::SemanticDestructure,
+                    "destructuring targets support only identifiers, `_`, tuples, sequences, and rest bindings",
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn collect_functions(&mut self, statements: &[Stmt]) -> Result<(), SimplyError> {
@@ -229,6 +565,20 @@ impl SemanticAnalyzer {
                 body,
             } = statement
             {
+                if self.structs.contains_key(name) || self.enums.contains_key(name) {
+                    return Err(self.error(
+                        DiagnosticCode::DuplicateDeclaration,
+                        format!("function `{name}` conflicts with a struct type"),
+                    ));
+                }
+                for (_, parameter_type, _) in parameters {
+                    if let Some(parameter_type) = parameter_type {
+                        self.validate_declared_type(parameter_type)?;
+                    }
+                }
+                if let Some(return_type) = return_type {
+                    self.validate_declared_type(return_type)?;
+                }
                 if self.functions.contains_key(name) {
                     return Err(self.error(
                         DiagnosticCode::DuplicateDeclaration,
@@ -276,6 +626,50 @@ impl SemanticAnalyzer {
                 Stmt::Import { alias, .. } => {
                     self.define_variable(alias.clone(), Type::Unknown, false)?;
                 }
+                Stmt::Struct { .. } => {}
+                Stmt::Enum { .. } => {}
+                Stmt::Message {
+                    receiver_type,
+                    name,
+                    parameters,
+                    body,
+                } => {
+                    let fields = self.structs[receiver_type].clone();
+                    let saved_function_depth = self.function_depth;
+                    let saved_return = self.function_return.clone();
+                    let saved_inferred_return = self.inferred_return.clone();
+                    let saved_saw_return = self.saw_return;
+                    let frame_start = self.variables.scopes.len();
+                    self.variables.push();
+                    self.function_return = None;
+                    self.inferred_return = None;
+                    self.function_depth += 1;
+                    self.saw_return = false;
+                    for field in &fields {
+                        self.define_variable(field.name.clone(), field.field_type.clone(), true)?;
+                    }
+                    for (parameter, parameter_type, mutable) in parameters {
+                        self.define_variable(
+                            parameter.clone(),
+                            parameter_type.clone().unwrap_or(Type::Unknown),
+                            *mutable,
+                        )?;
+                    }
+                    let body_result = self.analyze_statements(body);
+                    let inferred_return = self.inferred_return.clone();
+                    self.variables.truncate(frame_start);
+                    self.function_depth = saved_function_depth;
+                    self.function_return = saved_return;
+                    self.inferred_return = saved_inferred_return;
+                    self.saw_return = saved_saw_return;
+                    body_result?;
+                    if let Some(signature) = self
+                        .messages
+                        .get_mut(&(receiver_type.clone(), name.clone()))
+                    {
+                        signature.return_type = inferred_return;
+                    }
+                }
                 Stmt::Assign {
                     name,
                     mutable,
@@ -320,6 +714,11 @@ impl SemanticAnalyzer {
                         return Err(self.type_error(&expected, &actual, name));
                     }
                 }
+                Stmt::DestructureReassign { pattern, value } => {
+                    let actual = self.analyze_expression(value)?;
+                    let mut targets = Vec::new();
+                    self.validate_destructure_assignment_pattern(pattern, &actual, &mut targets)?;
+                }
                 Stmt::SetIndex { name, index, value } => {
                     if !self.variables.is_mutable(name) {
                         return Err(self.error(
@@ -351,31 +750,35 @@ impl SemanticAnalyzer {
                         }
                     }
                 }
-                Stmt::Destructure { names, value } => {
+                Stmt::Destructure {
+                    pattern,
+                    mutable,
+                    value,
+                } => {
                     let value_type = self.analyze_expression(value)?;
-                    match value_type {
-                        Type::Tuple(types) if types.len() == names.len() => {
-                            for ((name, mutable), value_type) in names.iter().zip(types) {
-                                self.define_variable(name.clone(), value_type, *mutable)?;
-                            }
-                        }
-                        Type::Tuple(types) => {
+                    let mut bindings = Vec::new();
+                    self.validate_destructure_pattern(pattern, &value_type, &mut bindings)?;
+
+                    let mut names = HashSet::new();
+                    for (name, _) in &bindings {
+                        if !names.insert(name.as_str())
+                            || self
+                                .variables
+                                .scopes
+                                .last()
+                                .is_some_and(|scope| scope.contains_key(name))
+                        {
                             return Err(self.error(
-                                DiagnosticCode::SemanticDestructure,
+                                DiagnosticCode::DuplicateDeclaration,
                                 format!(
-                                    "tuple has {} values, but {} names were provided",
-                                    types.len(),
-                                    names.len()
+                                    "variable `{name}` is already declared or bound more than once"
                                 ),
                             ));
                         }
-                        Type::Unknown => {}
-                        _ => {
-                            return Err(self.error(
-                                DiagnosticCode::SemanticDestructure,
-                                "destructuring requires a tuple",
-                            ));
-                        }
+                    }
+
+                    for (name, typ) in bindings {
+                        self.define_variable(name, typ, *mutable)?;
                     }
                 }
                 Stmt::CollectionOp {
@@ -690,6 +1093,32 @@ impl SemanticAnalyzer {
                 self.binary_type(operator, &left_type, &right_type)
             }
             Expr::Call { name, arguments } => self.call_type(name, arguments),
+            Expr::MessageDispatch {
+                receiver,
+                message,
+                arguments,
+            } => self.message_type(receiver, message, arguments),
+            Expr::EnumVariant {
+                enum_name,
+                variant_name,
+                arguments,
+            } => {
+                if self.enums.contains_key(enum_name) {
+                    self.enum_variant_type(enum_name, variant_name, arguments)
+                } else if self.variables.get(enum_name).is_none() {
+                    Err(self.error(
+                        DiagnosticCode::UndefinedVariable,
+                        format!("unknown enum type `{enum_name}`"),
+                    ))
+                } else {
+                    self.message_type(
+                        &Expr::Identifier(enum_name.clone()),
+                        variant_name,
+                        arguments,
+                    )
+                }
+            }
+            Expr::Match { value, arms } => self.match_type(value, arms),
             Expr::Index { target, index } => {
                 let target_type = self.analyze_expression(target)?;
                 let index_type = self.analyze_expression(index)?;
@@ -761,6 +1190,55 @@ impl SemanticAnalyzer {
     }
 
     fn call_type(&mut self, name: &str, arguments: &[Expr]) -> Result<Type, SimplyError> {
+        if let Some(fields) = self.structs.get(name).cloned() {
+            let argument_types = arguments
+                .iter()
+                .map(|argument| self.analyze_expression(argument))
+                .collect::<Result<Vec<_>, _>>()?;
+            if fields.len() != argument_types.len() {
+                return Err(self.error(
+                    DiagnosticCode::InvalidFunctionCall,
+                    format!(
+                        "struct `{name}` expects {} fields, got {}",
+                        fields.len(),
+                        argument_types.len()
+                    ),
+                ));
+            }
+            for (field, actual) in fields.iter().zip(&argument_types) {
+                self.require_type(&field.field_type, actual)?;
+            }
+            return Ok(Type::Struct(name.into()));
+        }
+        if name == "Ask" {
+            if !(1..=2).contains(&arguments.len()) {
+                return Err(self.error(
+                    DiagnosticCode::InvalidFunctionCall,
+                    "`Ask` expects a prompt and an optional type (`Int`, `Float`, `String`, or `Bool`)",
+                ));
+            }
+            let prompt_type = self.analyze_expression(&arguments[0])?;
+            self.require_type(&Type::String, &prompt_type)?;
+            return match arguments.get(1) {
+                None => Ok(Type::String),
+                Some(Expr::Identifier(type_name)) => match type_name.as_str() {
+                    "String" => Ok(Type::String),
+                    "Int" => Ok(Type::Int),
+                    "Float" => Ok(Type::Float),
+                    "Bool" => Ok(Type::Bool),
+                    _ => Err(self.error(
+                        DiagnosticCode::InvalidFunctionCall,
+                        format!(
+                            "unsupported `Ask` type `{type_name}`; expected `Int`, `Float`, `String`, or `Bool`"
+                        ),
+                    )),
+                },
+                Some(_) => Err(self.error(
+                    DiagnosticCode::InvalidFunctionCall,
+                    "`Ask` type must be `Int`, `Float`, `String`, or `Bool`",
+                )),
+            };
+        }
         let argument_types = arguments
             .iter()
             .map(|argument| self.analyze_expression(argument))
@@ -1045,49 +1523,6 @@ impl SemanticAnalyzer {
                 }
                 Ok(Type::Array(Box::new(Type::Int)))
             }
-            "send" => {
-                if argument_types.len() < 2 {
-                    return Err(self.error(
-                        DiagnosticCode::InvalidFunctionCall,
-                        "`send` expects a receiver and a message",
-                    ));
-                }
-                self.require_type(&Type::String, &argument_types[1])?;
-                let message = match &arguments[1] {
-                    Expr::Literal(Literal::String(message)) => Some(message.as_str()),
-                    _ => None,
-                };
-                let Some(message) = message else {
-                    return Ok(Type::Unknown);
-                };
-                let function = self.functions.get(message).cloned().ok_or_else(|| {
-                    self.error(
-                        DiagnosticCode::InvalidFunctionCall,
-                        format!("unknown message `{message}`"),
-                    )
-                })?;
-                if function.parameters.len() != argument_types.len() - 1 {
-                    return Err(self.error(
-                        DiagnosticCode::InvalidFunctionCall,
-                        format!(
-                            "message `{message}` expects {} arguments, got {}",
-                            function.parameters.len(),
-                            argument_types.len() - 1
-                        ),
-                    ));
-                }
-                for (expected, actual) in function.parameters.iter().zip(
-                    argument_types
-                        .iter()
-                        .take(1)
-                        .chain(argument_types.iter().skip(2)),
-                ) {
-                    if let Some(expected) = expected {
-                        self.require_type(expected, actual)?;
-                    }
-                }
-                Ok(function.return_type.unwrap_or(Type::Unit))
-            }
             _ => {
                 let Some(function) = self.functions.get(name).cloned() else {
                     if let Some(Type::Function { return_type, .. }) = self.variables.get(name) {
@@ -1095,6 +1530,12 @@ impl SemanticAnalyzer {
                     }
                     if matches!(self.variables.get(name), Some(&Type::Unknown)) {
                         return Ok(Type::Unknown);
+                    }
+                    if name.chars().next().is_some_and(char::is_uppercase) {
+                        return Err(self.error(
+                            DiagnosticCode::UndefinedVariable,
+                            format!("unknown struct type `{name}`"),
+                        ));
                     }
                     return Err(self.error(
                         DiagnosticCode::InvalidFunctionCall,
@@ -1117,6 +1558,1242 @@ impl SemanticAnalyzer {
                     }
                 }
                 Ok(function.return_type.unwrap_or(Type::Unit))
+            }
+        }
+    }
+
+    fn message_type(
+        &mut self,
+        receiver: &Expr,
+        message: &str,
+        arguments: &[Expr],
+    ) -> Result<Type, SimplyError> {
+        let receiver_type = self.analyze_expression(receiver)?;
+        if matches!(receiver_type, Type::Enum(_)) {
+            return Err(self.error(
+                DiagnosticCode::InvalidFunctionCall,
+                "enum values do not support message dispatch",
+            ));
+        }
+        let argument_types = arguments
+            .iter()
+            .map(|argument| self.analyze_expression(argument))
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Type::Struct(type_name) = &receiver_type {
+            let Some(signature) = self.messages.get(&(type_name.clone(), message.to_owned()))
+            else {
+                return Err(self.error(
+                    DiagnosticCode::InvalidFunctionCall,
+                    format!("message `{message}` is not defined for `{type_name}`"),
+                ));
+            };
+            if signature.parameters.len() != argument_types.len() {
+                return Err(self.error(
+                    DiagnosticCode::InvalidFunctionCall,
+                    format!(
+                        "message `{message}` expects {} arguments, got {}",
+                        signature.parameters.len(),
+                        argument_types.len()
+                    ),
+                ));
+            }
+            for (expected, actual) in signature.parameters.iter().zip(&argument_types) {
+                if let Some(expected) = expected {
+                    self.require_type(expected, actual)?;
+                }
+            }
+            return Ok(signature.return_type.clone().unwrap_or(Type::Unknown));
+        }
+        let Some(function) = self.functions.get(message).cloned() else {
+            return Ok(Type::Unknown);
+        };
+        let actual_types = std::iter::once(&receiver_type)
+            .chain(argument_types.iter())
+            .collect::<Vec<_>>();
+        if function.parameters.len() != actual_types.len() {
+            return Err(self.error(
+                DiagnosticCode::InvalidFunctionCall,
+                format!(
+                    "message `{message}` expects {} arguments, got {}",
+                    function.parameters.len(),
+                    actual_types.len()
+                ),
+            ));
+        }
+        for (expected, actual) in function.parameters.iter().zip(actual_types) {
+            if let Some(expected) = expected {
+                self.require_type(expected, actual)?;
+            }
+        }
+        Ok(function.return_type.unwrap_or(Type::Unit))
+    }
+
+    fn enum_variant_type(
+        &mut self,
+        enum_name: &str,
+        variant_name: &str,
+        arguments: &[Expr],
+    ) -> Result<Type, SimplyError> {
+        let Some(variants) = self.enums.get(enum_name).cloned() else {
+            return Err(self.error(
+                DiagnosticCode::UndefinedVariable,
+                format!("unknown enum type `{enum_name}`"),
+            ));
+        };
+        let Some(variant) = variants.iter().find(|variant| variant.name == variant_name) else {
+            return Err(self.error(
+                DiagnosticCode::UndefinedVariable,
+                format!("unknown variant `{enum_name}::{variant_name}`"),
+            ));
+        };
+        match (&variant.payload_type, arguments) {
+            (Some(payload_type), [payload]) => {
+                let actual = self.analyze_expression(payload)?;
+                self.require_type(payload_type, &actual)?;
+            }
+            (Some(payload_type), _) => {
+                return Err(self.error(
+                    DiagnosticCode::InvalidFunctionCall,
+                    format!(
+                        "variant `{enum_name}::{variant_name}` expects a payload of type {}",
+                        payload_type.name()
+                    ),
+                ));
+            }
+            (None, []) => {}
+            (None, _) => {
+                return Err(self.error(
+                    DiagnosticCode::InvalidFunctionCall,
+                    format!("unit variant `{enum_name}::{variant_name}` does not accept a payload"),
+                ));
+            }
+        }
+        Ok(Type::Enum(enum_name.to_owned()))
+    }
+
+    fn match_type(
+        &mut self,
+        value: &Expr,
+        arms: &[crate::ast::MatchArm],
+    ) -> Result<Type, SimplyError> {
+        let value_type = self.analyze_expression(value)?;
+        let mut coverage_matrix = Vec::<Vec<MatchPattern>>::new();
+        let mut result_type: Option<Type> = None;
+
+        for arm in arms {
+            let mut bindings = Vec::new();
+            self.validate_match_pattern(&arm.pattern, &value_type, &mut bindings)?;
+            if !self.pattern_is_useful(&coverage_matrix, &arm.pattern, &value_type) {
+                return Err(
+                    self.error(DiagnosticCode::UnexpectedToken, "unreachable match pattern")
+                );
+            }
+            if arm.guard.is_none() {
+                coverage_matrix.push(vec![arm.pattern.clone()]);
+            }
+
+            let frame_start = self.variables.scopes.len();
+            self.variables.push();
+            let saved_saw_return = self.saw_return;
+            self.saw_return = false;
+            let branch_result = (|| {
+                for (binding, binding_type) in bindings {
+                    self.define_variable(binding, binding_type, false)?;
+                }
+                if let Some(guard) = &arm.guard {
+                    let guard_type = self.analyze_expression(guard)?;
+                    self.require_type(&Type::Bool, &guard_type)?;
+                }
+                self.analyze_statements(&arm.body)?;
+                arm.result
+                    .as_ref()
+                    .map(|result| self.analyze_expression(result))
+                    .unwrap_or(Ok(Type::Unit))
+            })();
+            self.variables.truncate(frame_start);
+            self.saw_return = saved_saw_return;
+            let branch_type = branch_result?;
+            match &result_type {
+                None => result_type = Some(branch_type),
+                Some(expected) if *expected == Type::Unknown => result_type = Some(branch_type),
+                Some(_) if branch_type == Type::Unknown => {}
+                Some(expected) => self.require_type(expected, &branch_type)?,
+            }
+        }
+
+        if self.pattern_is_useful(&coverage_matrix, &MatchPattern::Wildcard, &value_type) {
+            if let Type::Enum(enum_name) = &value_type
+                && let Some(variants) = self.enums.get(enum_name)
+            {
+                for variant in variants {
+                    let pattern = MatchPattern::EnumVariant {
+                        enum_name: enum_name.clone(),
+                        variant_name: variant.name.clone(),
+                        payload: variant
+                            .payload_type
+                            .as_ref()
+                            .map(|_| Box::new(MatchPattern::Wildcard)),
+                    };
+                    if self.pattern_is_useful(&coverage_matrix, &pattern, &value_type) {
+                        let constructor = CoverageConstructor::Enum {
+                            type_name: enum_name.clone(),
+                            variant: variant.name.clone(),
+                        };
+                        let has_variant_arm = coverage_matrix.iter().any(|row| {
+                            row.first()
+                                .and_then(|pattern| self.pattern_constructor(pattern))
+                                .is_some_and(|(found, _)| found == constructor)
+                        });
+                        if !has_variant_arm {
+                            return Err(self.error(
+                                DiagnosticCode::UnexpectedToken,
+                                format!("missing variant `{enum_name}::{}`", variant.name),
+                            ));
+                        }
+                        break;
+                    }
+                }
+            }
+            return Err(self.error(
+                DiagnosticCode::TypeMismatch,
+                format!(
+                    "non-exhaustive match: value of type {} is not fully covered",
+                    value_type.name()
+                ),
+            ));
+        }
+
+        Ok(result_type.unwrap_or(Type::Unit))
+    }
+
+    fn pattern_is_useful(
+        &self,
+        matrix: &[Vec<MatchPattern>],
+        pattern: &MatchPattern,
+        typ: &Type,
+    ) -> bool {
+        self.pattern_vector_is_useful(matrix, &[pattern.clone()], std::slice::from_ref(typ))
+    }
+
+    fn pattern_contains_alias(pattern: &MatchPattern) -> bool {
+        match pattern {
+            MatchPattern::Alias { .. } => true,
+            MatchPattern::Or(patterns)
+            | MatchPattern::Tuple(patterns)
+            | MatchPattern::Struct {
+                fields: patterns, ..
+            } => patterns.iter().any(Self::pattern_contains_alias),
+            MatchPattern::Sequence { patterns, .. } => {
+                patterns.iter().any(Self::pattern_contains_alias)
+            }
+            MatchPattern::Hash(entries) => entries
+                .iter()
+                .any(|(_, pattern)| Self::pattern_contains_alias(pattern)),
+            MatchPattern::EnumVariant {
+                payload: Some(pattern),
+                ..
+            } => Self::pattern_contains_alias(pattern),
+            MatchPattern::Identifier(_)
+            | MatchPattern::Literal(_)
+            | MatchPattern::Range { .. }
+            | MatchPattern::EnumVariant { payload: None, .. }
+            | MatchPattern::Wildcard => false,
+        }
+    }
+
+    fn without_aliases(pattern: &MatchPattern) -> MatchPattern {
+        match pattern {
+            MatchPattern::Alias { pattern, .. } => Self::without_aliases(pattern),
+            MatchPattern::Or(patterns) => {
+                MatchPattern::Or(patterns.iter().map(Self::without_aliases).collect())
+            }
+            MatchPattern::Tuple(patterns) => {
+                MatchPattern::Tuple(patterns.iter().map(Self::without_aliases).collect())
+            }
+            MatchPattern::Sequence { patterns, rest } => MatchPattern::Sequence {
+                patterns: patterns.iter().map(Self::without_aliases).collect(),
+                rest: rest.clone(),
+            },
+            MatchPattern::Hash(entries) => MatchPattern::Hash(
+                entries
+                    .iter()
+                    .map(|(key, pattern)| (key.clone(), Self::without_aliases(pattern)))
+                    .collect(),
+            ),
+            MatchPattern::EnumVariant {
+                enum_name,
+                variant_name,
+                payload,
+            } => MatchPattern::EnumVariant {
+                enum_name: enum_name.clone(),
+                variant_name: variant_name.clone(),
+                payload: payload
+                    .as_ref()
+                    .map(|pattern| Box::new(Self::without_aliases(pattern))),
+            },
+            MatchPattern::Struct { type_name, fields } => MatchPattern::Struct {
+                type_name: type_name.clone(),
+                fields: fields.iter().map(Self::without_aliases).collect(),
+            },
+            MatchPattern::Identifier(_)
+            | MatchPattern::Literal(_)
+            | MatchPattern::Range { .. }
+            | MatchPattern::Wildcard => pattern.clone(),
+        }
+    }
+
+    fn pattern_vector_is_useful(
+        &self,
+        matrix: &[Vec<MatchPattern>],
+        candidate: &[MatchPattern],
+        types: &[Type],
+    ) -> bool {
+        if candidate.iter().any(Self::pattern_contains_alias)
+            || matrix.iter().flatten().any(Self::pattern_contains_alias)
+        {
+            let normalized_matrix = matrix
+                .iter()
+                .map(|row| row.iter().map(Self::without_aliases).collect())
+                .collect::<Vec<Vec<_>>>();
+            let normalized_candidate = candidate
+                .iter()
+                .map(Self::without_aliases)
+                .collect::<Vec<_>>();
+            return self.pattern_vector_is_useful(&normalized_matrix, &normalized_candidate, types);
+        }
+
+        if candidate.is_empty() {
+            return matrix.is_empty();
+        }
+        let Some((head, tail)) = candidate.split_first() else {
+            return matrix.is_empty();
+        };
+        let Some(typ) = types.first() else {
+            return false;
+        };
+        let rest_types = &types[1..];
+
+        if let MatchPattern::Or(alternatives) = head {
+            let mut alternatives_matrix = matrix.to_vec();
+            let mut useful = false;
+            for alternative in alternatives {
+                let mut alternative_candidate = vec![alternative.clone()];
+                alternative_candidate.extend_from_slice(tail);
+                useful |= self.pattern_vector_is_useful(
+                    &alternatives_matrix,
+                    &alternative_candidate,
+                    types,
+                );
+                alternatives_matrix.push(alternative_candidate);
+            }
+            return useful;
+        }
+
+        if typ == &Type::Int {
+            let intervals = self.int_pattern_intervals(head);
+            if !intervals.is_empty() {
+                return self.int_pattern_vector_is_useful(matrix, &intervals, tail, rest_types);
+            }
+        }
+        if typ == &Type::Unknown
+            && (!self.int_pattern_intervals(head).is_empty())
+            && (matches!(head, MatchPattern::Range { .. })
+                || matches!(head, MatchPattern::Literal(Literal::Int(_))))
+        {
+            return self.int_pattern_vector_is_useful(
+                matrix,
+                &self.int_pattern_intervals(head),
+                tail,
+                rest_types,
+            );
+        }
+
+        if let MatchPattern::Literal(literal) = head
+            && (!matches!(literal, Literal::Bool(_)) || !matches!(typ, Type::Bool))
+        {
+            let specialized = self.specialize_literal_matrix(matrix, literal);
+            return self.pattern_vector_is_useful(&specialized, tail, rest_types);
+        }
+
+        let sequence_element_type = match typ {
+            Type::Array(element) | Type::List(element) => Some((**element).clone()),
+            Type::Unknown if matches!(head, MatchPattern::Sequence { .. }) => Some(Type::Unknown),
+            _ => None,
+        };
+        if let Some(element_type) = sequence_element_type {
+            if let MatchPattern::Sequence { patterns, rest } = head {
+                return self.sequence_pattern_vector_is_useful(
+                    matrix,
+                    patterns,
+                    rest.is_some(),
+                    tail,
+                    rest_types,
+                    &element_type,
+                );
+            }
+            if matches!(head, MatchPattern::Wildcard | MatchPattern::Identifier(_)) {
+                let max_length = self.max_sequence_prefix_length(matrix, 0);
+                return (0..=max_length + 1).any(|length| {
+                    let candidate = vec![MatchPattern::Wildcard; length];
+                    self.sequence_pattern_vector_is_useful(
+                        matrix,
+                        &candidate,
+                        false,
+                        tail,
+                        rest_types,
+                        &element_type,
+                    )
+                });
+            }
+        }
+
+        if matches!(typ, Type::Hash | Type::Unknown) {
+            if let MatchPattern::Hash(entries) = head {
+                let candidate = self.expand_hash_pattern(entries, tail);
+                let specialized = matrix
+                    .iter()
+                    .flat_map(|row| self.expand_hash_row(row, entries))
+                    .collect::<Vec<_>>();
+                let mut candidate_types = vec![Type::Unknown; entries.len()];
+                candidate_types.extend_from_slice(rest_types);
+                return self.pattern_vector_is_useful(&specialized, &candidate, &candidate_types);
+            }
+            if matches!(head, MatchPattern::Wildcard | MatchPattern::Identifier(_))
+                && typ == &Type::Hash
+            {
+                let defaults = self.hash_default_matrix(matrix);
+                return self.pattern_vector_is_useful(&defaults, tail, rest_types);
+            }
+        }
+
+        if let Some((constructor, arguments)) = self.pattern_constructor(head) {
+            let Some(argument_types) = self.constructor_argument_types(&constructor, typ) else {
+                return false;
+            };
+            let specialized = self.specialize_matrix(matrix, &constructor, arguments.len());
+            let mut specialized_candidate = arguments;
+            specialized_candidate.extend_from_slice(tail);
+            let mut specialized_types = argument_types;
+            specialized_types.extend_from_slice(rest_types);
+            return self.pattern_vector_is_useful(
+                &specialized,
+                &specialized_candidate,
+                &specialized_types,
+            );
+        }
+
+        if let Some(constructors) = self.finite_constructors(typ) {
+            let complete = constructors.iter().all(|(constructor, _)| {
+                matrix.iter().any(|row| {
+                    row.first().is_some_and(|pattern| {
+                        self.pattern_may_match_constructor(pattern, constructor)
+                    })
+                })
+            });
+            if complete {
+                for (constructor, argument_types) in constructors {
+                    let arity = argument_types.len();
+                    let specialized = self.specialize_matrix(matrix, &constructor, arity);
+                    let mut specialized_candidate = vec![MatchPattern::Wildcard; arity];
+                    specialized_candidate.extend_from_slice(tail);
+                    let mut specialized_types = argument_types;
+                    specialized_types.extend_from_slice(rest_types);
+                    if self.pattern_vector_is_useful(
+                        &specialized,
+                        &specialized_candidate,
+                        &specialized_types,
+                    ) {
+                        return true;
+                    }
+                }
+                false
+            } else {
+                let defaults = self.default_matrix(matrix);
+                self.pattern_vector_is_useful(&defaults, tail, rest_types)
+            }
+        } else {
+            let defaults = self.default_matrix(matrix);
+            self.pattern_vector_is_useful(&defaults, tail, rest_types)
+        }
+    }
+
+    fn int_pattern_intervals(&self, pattern: &MatchPattern) -> Vec<(i128, i128)> {
+        match pattern {
+            MatchPattern::Alias { pattern, .. } => self.int_pattern_intervals(pattern),
+            MatchPattern::Literal(Literal::Int(value)) => {
+                let value = i128::from(*value);
+                vec![(value, value)]
+            }
+            MatchPattern::Range { start, end } => {
+                let start = match start {
+                    Some(Literal::Int(value)) => i128::from(*value),
+                    Some(_) => return Vec::new(),
+                    None => i128::from(i64::MIN),
+                };
+                let end = match end {
+                    Some(Literal::Int(value)) => i128::from(*value),
+                    Some(_) => return Vec::new(),
+                    None => i128::from(i64::MAX),
+                };
+                (start <= end).then_some((start, end)).into_iter().collect()
+            }
+            MatchPattern::Wildcard | MatchPattern::Identifier(_) => {
+                vec![(i128::from(i64::MIN), i128::from(i64::MAX))]
+            }
+            MatchPattern::Or(alternatives) => alternatives
+                .iter()
+                .flat_map(|alternative| self.int_pattern_intervals(alternative))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn int_pattern_vector_is_useful(
+        &self,
+        matrix: &[Vec<MatchPattern>],
+        candidate_intervals: &[(i128, i128)],
+        tail: &[MatchPattern],
+        rest_types: &[Type],
+    ) -> bool {
+        let mut boundaries = Vec::new();
+        for (start, end) in candidate_intervals {
+            boundaries.push(*start);
+            boundaries.push(*end + 1);
+        }
+        for row in matrix {
+            let Some((head, _)) = row.split_first() else {
+                continue;
+            };
+            for (start, end) in self.int_pattern_intervals(head) {
+                boundaries.push(start);
+                boundaries.push(end + 1);
+            }
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+
+        for window in boundaries.windows(2) {
+            let start = window[0];
+            let end = window[1] - 1;
+            if !candidate_intervals
+                .iter()
+                .any(|(lower, upper)| *lower <= start && end <= *upper)
+            {
+                continue;
+            }
+
+            let specialized = matrix
+                .iter()
+                .filter_map(|row| {
+                    let (head, tail) = row.split_first()?;
+                    self.int_pattern_intervals(head)
+                        .iter()
+                        .any(|(lower, upper)| *lower <= start && end <= *upper)
+                        .then(|| tail.to_vec())
+                })
+                .collect::<Vec<_>>();
+            if self.pattern_vector_is_useful(&specialized, tail, rest_types) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn pattern_constructor(
+        &self,
+        pattern: &MatchPattern,
+    ) -> Option<(CoverageConstructor, Vec<MatchPattern>)> {
+        match pattern {
+            MatchPattern::Alias { pattern, .. } => self.pattern_constructor(pattern),
+            MatchPattern::EnumVariant {
+                enum_name,
+                variant_name,
+                payload,
+            } => Some((
+                CoverageConstructor::Enum {
+                    type_name: enum_name.clone(),
+                    variant: variant_name.clone(),
+                },
+                payload
+                    .iter()
+                    .map(|pattern| pattern.as_ref().clone())
+                    .collect(),
+            )),
+            MatchPattern::Tuple(patterns) => {
+                Some((CoverageConstructor::Tuple(patterns.len()), patterns.clone()))
+            }
+            MatchPattern::Struct { type_name, fields } => Some((
+                CoverageConstructor::Struct(type_name.clone()),
+                fields.clone(),
+            )),
+            MatchPattern::Literal(Literal::Bool(value)) => {
+                Some((CoverageConstructor::Bool(*value), Vec::new()))
+            }
+            MatchPattern::Range { .. }
+            | MatchPattern::Literal(_)
+            | MatchPattern::Sequence { .. }
+            | MatchPattern::Hash(_)
+            | MatchPattern::Wildcard
+            | MatchPattern::Identifier(_)
+            | MatchPattern::Or(_) => None,
+        }
+    }
+
+    fn pattern_may_match_constructor(
+        &self,
+        pattern: &MatchPattern,
+        constructor: &CoverageConstructor,
+    ) -> bool {
+        match pattern {
+            MatchPattern::Alias { pattern, .. } => {
+                self.pattern_may_match_constructor(pattern, constructor)
+            }
+            MatchPattern::Or(alternatives) => alternatives
+                .iter()
+                .any(|alternative| self.pattern_may_match_constructor(alternative, constructor)),
+            MatchPattern::Literal(Literal::Bool(value)) => {
+                *constructor == CoverageConstructor::Bool(*value)
+            }
+            MatchPattern::Wildcard | MatchPattern::Identifier(_) => true,
+            _ => self
+                .pattern_constructor(pattern)
+                .is_some_and(|(found, _)| found == *constructor),
+        }
+    }
+
+    fn finite_constructors(&self, typ: &Type) -> Option<Vec<(CoverageConstructor, Vec<Type>)>> {
+        match typ {
+            Type::Enum(name) => Some(
+                self.enums
+                    .get(name)?
+                    .iter()
+                    .map(|variant| {
+                        (
+                            CoverageConstructor::Enum {
+                                type_name: name.clone(),
+                                variant: variant.name.clone(),
+                            },
+                            variant.payload_type.iter().cloned().collect(),
+                        )
+                    })
+                    .collect(),
+            ),
+            Type::Tuple(types) => Some(vec![(
+                CoverageConstructor::Tuple(types.len()),
+                types.clone(),
+            )]),
+            Type::Struct(name) => Some(vec![(
+                CoverageConstructor::Struct(name.clone()),
+                self.structs
+                    .get(name)?
+                    .iter()
+                    .map(|field| field.field_type.clone())
+                    .collect(),
+            )]),
+            Type::Bool => Some(vec![
+                (CoverageConstructor::Bool(true), Vec::new()),
+                (CoverageConstructor::Bool(false), Vec::new()),
+            ]),
+            _ => None,
+        }
+    }
+
+    fn specialize_literal_matrix(
+        &self,
+        matrix: &[Vec<MatchPattern>],
+        literal: &Literal,
+    ) -> Vec<Vec<MatchPattern>> {
+        let mut specialized = Vec::new();
+        for row in matrix {
+            let Some((head, tail)) = row.split_first() else {
+                continue;
+            };
+            match head {
+                MatchPattern::Literal(found) if found == literal => {
+                    specialized.push(tail.to_vec());
+                }
+                MatchPattern::Wildcard | MatchPattern::Identifier(_) => {
+                    specialized.push(tail.to_vec());
+                }
+                MatchPattern::Or(alternatives) => {
+                    for alternative in alternatives {
+                        let expanded = std::iter::once(alternative.clone())
+                            .chain(tail.iter().cloned())
+                            .collect::<Vec<_>>();
+                        specialized.extend(
+                            self.specialize_literal_matrix(
+                                std::slice::from_ref(&expanded),
+                                literal,
+                            ),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        specialized
+    }
+
+    fn constructor_argument_types(
+        &self,
+        constructor: &CoverageConstructor,
+        typ: &Type,
+    ) -> Option<Vec<Type>> {
+        if typ == &Type::Unknown {
+            return Some(match constructor {
+                CoverageConstructor::Tuple(arity) => vec![Type::Unknown; *arity],
+                CoverageConstructor::Struct(name) => self
+                    .structs
+                    .get(name)?
+                    .iter()
+                    .map(|field| field.field_type.clone())
+                    .collect(),
+                CoverageConstructor::Enum { type_name, variant } => self
+                    .enums
+                    .get(type_name)?
+                    .iter()
+                    .find(|definition| definition.name == *variant)?
+                    .payload_type
+                    .iter()
+                    .cloned()
+                    .collect(),
+                CoverageConstructor::Bool(_) => Vec::new(),
+            });
+        }
+        self.finite_constructors(typ)?
+            .into_iter()
+            .find_map(|(found, arguments)| (found == *constructor).then_some(arguments))
+    }
+
+    fn sequence_pattern_vector_is_useful(
+        &self,
+        matrix: &[Vec<MatchPattern>],
+        patterns: &[MatchPattern],
+        has_rest: bool,
+        tail: &[MatchPattern],
+        rest_types: &[Type],
+        element_type: &Type,
+    ) -> bool {
+        let max_length = self.max_sequence_prefix_length(matrix, patterns.len());
+        let lengths = if has_rest {
+            (patterns.len()..=max_length.max(patterns.len()) + 1).collect::<Vec<_>>()
+        } else {
+            vec![patterns.len()]
+        };
+        for length in lengths {
+            let mut candidate = patterns.to_vec();
+            candidate.resize(length, MatchPattern::Wildcard);
+            if !has_rest && length != patterns.len() {
+                continue;
+            }
+            candidate.extend_from_slice(tail);
+            let mut specialized = Vec::new();
+            for row in matrix {
+                let Some((head, row_tail)) = row.split_first() else {
+                    continue;
+                };
+                for mut expanded in self.expand_sequence_pattern(head, length) {
+                    expanded.extend_from_slice(row_tail);
+                    specialized.push(expanded);
+                }
+            }
+            let mut types = vec![element_type.clone(); length];
+            types.extend_from_slice(rest_types);
+            if self.pattern_vector_is_useful(&specialized, &candidate, &types) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn expand_hash_pattern(
+        &self,
+        entries: &[(String, MatchPattern)],
+        tail: &[MatchPattern],
+    ) -> Vec<MatchPattern> {
+        let mut expanded = entries
+            .iter()
+            .map(|(_, pattern)| pattern.clone())
+            .collect::<Vec<_>>();
+        expanded.extend_from_slice(tail);
+        expanded
+    }
+
+    fn expand_hash_row(
+        &self,
+        row: &[MatchPattern],
+        candidate_entries: &[(String, MatchPattern)],
+    ) -> Vec<Vec<MatchPattern>> {
+        let Some((head, tail)) = row.split_first() else {
+            return Vec::new();
+        };
+        match head {
+            MatchPattern::Wildcard | MatchPattern::Identifier(_) => {
+                let mut expanded = vec![MatchPattern::Wildcard; candidate_entries.len()];
+                expanded.extend_from_slice(tail);
+                vec![expanded]
+            }
+            MatchPattern::Hash(entries)
+                if entries
+                    .iter()
+                    .all(|(key, _)| candidate_entries.iter().any(|(found, _)| found == key)) =>
+            {
+                let mut expanded = candidate_entries
+                    .iter()
+                    .map(|(key, _)| {
+                        entries
+                            .iter()
+                            .find(|(found, _)| found == key)
+                            .map(|(_, pattern)| pattern.clone())
+                            .unwrap_or(MatchPattern::Wildcard)
+                    })
+                    .collect::<Vec<_>>();
+                expanded.extend_from_slice(tail);
+                vec![expanded]
+            }
+            MatchPattern::Or(alternatives) => alternatives
+                .iter()
+                .flat_map(|alternative| {
+                    self.expand_hash_row(
+                        &std::iter::once(alternative.clone())
+                            .chain(tail.iter().cloned())
+                            .collect::<Vec<_>>(),
+                        candidate_entries,
+                    )
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn hash_default_matrix(&self, matrix: &[Vec<MatchPattern>]) -> Vec<Vec<MatchPattern>> {
+        let mut defaults = Vec::new();
+        for row in matrix {
+            let Some((head, tail)) = row.split_first() else {
+                continue;
+            };
+            match head {
+                MatchPattern::Wildcard | MatchPattern::Identifier(_) => {
+                    defaults.push(tail.to_vec())
+                }
+                MatchPattern::Hash(entries) if entries.is_empty() => defaults.push(tail.to_vec()),
+                MatchPattern::Or(alternatives) => {
+                    if alternatives.iter().any(|alternative| {
+                        matches!(
+                            alternative,
+                            MatchPattern::Wildcard | MatchPattern::Identifier(_)
+                        ) || matches!(alternative, MatchPattern::Hash(entries) if entries.is_empty())
+                    }) {
+                        defaults.push(tail.to_vec());
+                    }
+                }
+                _ => {}
+            }
+        }
+        defaults
+    }
+
+    fn max_sequence_prefix_length(&self, matrix: &[Vec<MatchPattern>], current: usize) -> usize {
+        matrix.iter().fold(current, |maximum, row| {
+            row.first().map_or(maximum, |pattern| {
+                self.sequence_pattern_prefix_max(pattern, maximum)
+            })
+        })
+    }
+
+    fn sequence_pattern_prefix_max(&self, pattern: &MatchPattern, current: usize) -> usize {
+        match pattern {
+            MatchPattern::Sequence { patterns, .. } => current.max(patterns.len()),
+            MatchPattern::Or(alternatives) => {
+                alternatives.iter().fold(current, |maximum, pattern| {
+                    self.sequence_pattern_prefix_max(pattern, maximum)
+                })
+            }
+            _ => current,
+        }
+    }
+
+    fn expand_sequence_pattern(
+        &self,
+        pattern: &MatchPattern,
+        length: usize,
+    ) -> Vec<Vec<MatchPattern>> {
+        match pattern {
+            MatchPattern::Wildcard | MatchPattern::Identifier(_) => {
+                vec![vec![MatchPattern::Wildcard; length]]
+            }
+            MatchPattern::Sequence { patterns, rest } => {
+                if patterns.len() > length || (rest.is_none() && patterns.len() != length) {
+                    return Vec::new();
+                }
+                let mut expanded = patterns.clone();
+                expanded.resize(length, MatchPattern::Wildcard);
+                vec![expanded]
+            }
+            MatchPattern::Or(alternatives) => alternatives
+                .iter()
+                .flat_map(|alternative| self.expand_sequence_pattern(alternative, length))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn specialize_matrix(
+        &self,
+        matrix: &[Vec<MatchPattern>],
+        constructor: &CoverageConstructor,
+        arity: usize,
+    ) -> Vec<Vec<MatchPattern>> {
+        let mut specialized = Vec::new();
+        for row in matrix {
+            let Some((head, tail)) = row.split_first() else {
+                continue;
+            };
+            match self.pattern_constructor(head) {
+                Some((found, arguments)) if found == *constructor => {
+                    let mut new_row = arguments;
+                    new_row.extend_from_slice(tail);
+                    specialized.push(new_row);
+                }
+                None => {
+                    if matches!(head, MatchPattern::Wildcard | MatchPattern::Identifier(_)) {
+                        let mut new_row = vec![MatchPattern::Wildcard; arity];
+                        new_row.extend_from_slice(tail);
+                        specialized.push(new_row);
+                    } else if let MatchPattern::Or(alternatives) = head {
+                        for alternative in alternatives {
+                            let expanded = self.specialize_matrix(
+                                &[std::iter::once(alternative.clone())
+                                    .chain(tail.iter().cloned())
+                                    .collect()],
+                                constructor,
+                                arity,
+                            );
+                            specialized.extend(expanded);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        specialized
+    }
+
+    fn default_matrix(&self, matrix: &[Vec<MatchPattern>]) -> Vec<Vec<MatchPattern>> {
+        let mut defaults = Vec::new();
+        for row in matrix {
+            let Some((head, tail)) = row.split_first() else {
+                continue;
+            };
+            match head {
+                MatchPattern::Wildcard | MatchPattern::Identifier(_) => {
+                    defaults.push(tail.to_vec())
+                }
+                MatchPattern::Or(alternatives) => {
+                    if alternatives.iter().any(|alternative| {
+                        matches!(
+                            alternative,
+                            MatchPattern::Wildcard | MatchPattern::Identifier(_)
+                        )
+                    }) {
+                        defaults.push(tail.to_vec());
+                    }
+                }
+                _ => {}
+            }
+        }
+        defaults
+    }
+
+    fn validate_match_pattern(
+        &self,
+        pattern: &MatchPattern,
+        expected: &Type,
+        bindings: &mut Vec<(String, Type)>,
+    ) -> Result<bool, SimplyError> {
+        match pattern {
+            MatchPattern::Wildcard => Ok(true),
+            MatchPattern::Identifier(name) => {
+                bindings.push((name.clone(), expected.clone()));
+                Ok(true)
+            }
+            MatchPattern::Alias { name, pattern } => {
+                bindings.push((name.clone(), expected.clone()));
+                self.validate_match_pattern(pattern, expected, bindings)
+            }
+            MatchPattern::Or(alternatives) => {
+                if alternatives.len() < 2 {
+                    return Err(self.error(
+                        DiagnosticCode::UnexpectedToken,
+                        "OR-pattern requires at least two alternatives",
+                    ));
+                }
+                let mut canonical_bindings: Option<Vec<(String, Type)>> = None;
+                let mut irrefutable = false;
+                let mut alternatives_matrix = Vec::new();
+                for alternative in alternatives {
+                    if !self.pattern_is_useful(&alternatives_matrix, alternative, expected) {
+                        return Err(self.error(
+                            DiagnosticCode::UnexpectedToken,
+                            "redundant OR-pattern alternative",
+                        ));
+                    }
+                    let mut alternative_bindings = Vec::new();
+                    irrefutable |= self.validate_match_pattern(
+                        alternative,
+                        expected,
+                        &mut alternative_bindings,
+                    )?;
+                    alternative_bindings.sort_by(|left, right| left.0.cmp(&right.0));
+                    if let Some(expected_bindings) = &mut canonical_bindings {
+                        let same_names = expected_bindings.len() == alternative_bindings.len()
+                            && expected_bindings
+                                .iter()
+                                .zip(&alternative_bindings)
+                                .all(|((left_name, _), (right_name, _))| left_name == right_name);
+                        let compatible_types = same_names
+                            && expected_bindings.iter().zip(&alternative_bindings).all(
+                                |((_, left_type), (_, right_type))| {
+                                    left_type.compatible_with(right_type)
+                                        && right_type.compatible_with(left_type)
+                                },
+                            );
+                        if !compatible_types {
+                            let message = if !same_names {
+                                "OR-pattern alternatives must bind the same names"
+                            } else {
+                                "OR-pattern alternatives must bind compatible types"
+                            };
+                            return Err(self.error(DiagnosticCode::TypeMismatch, message));
+                        }
+                        for ((_, common_type), (_, alternative_type)) in
+                            expected_bindings.iter_mut().zip(&alternative_bindings)
+                        {
+                            if *common_type == Type::Unknown {
+                                *common_type = alternative_type.clone();
+                            }
+                        }
+                    } else {
+                        canonical_bindings = Some(alternative_bindings);
+                    }
+                    alternatives_matrix.push(vec![alternative.clone()]);
+                }
+                bindings.extend(canonical_bindings.unwrap_or_default());
+                Ok(irrefutable)
+            }
+            MatchPattern::Hash(entries) => {
+                if !matches!(expected, Type::Hash | Type::Unknown) {
+                    return Err(self.error(
+                        DiagnosticCode::TypeMismatch,
+                        format!(
+                            "hash pattern cannot match value of type {}",
+                            expected.name()
+                        ),
+                    ));
+                }
+                let irrefutable = entries.is_empty();
+                for (_, pattern) in entries {
+                    self.validate_match_pattern(pattern, &Type::Unknown, bindings)?;
+                }
+                Ok(irrefutable)
+            }
+            MatchPattern::Literal(literal) => {
+                let literal_type = match literal {
+                    Literal::String(_) => Type::String,
+                    Literal::Int(_) => Type::Int,
+                    Literal::Float(_) => Type::Float,
+                    Literal::Bool(_) => Type::Bool,
+                };
+                if !literal_type.compatible_with(expected) {
+                    return Err(self.error(
+                        DiagnosticCode::TypeMismatch,
+                        format!(
+                            "literal pattern of type {} cannot match value of type {}",
+                            literal_type.name(),
+                            expected.name()
+                        ),
+                    ));
+                }
+                Ok(false)
+            }
+            MatchPattern::Range { start, end } => {
+                for bound in start.iter().chain(end.iter()) {
+                    if !matches!(bound, Literal::Int(_)) {
+                        return Err(self.error(
+                            DiagnosticCode::TypeMismatch,
+                            "range pattern bounds must be Int",
+                        ));
+                    }
+                }
+                if expected != &Type::Int && expected != &Type::Unknown {
+                    return Err(self.error(
+                        DiagnosticCode::TypeMismatch,
+                        format!(
+                            "range pattern cannot match value of type {}",
+                            expected.name()
+                        ),
+                    ));
+                }
+                if let (Some(Literal::Int(start)), Some(Literal::Int(end))) = (start, end)
+                    && start > end
+                {
+                    return Err(self.error(
+                        DiagnosticCode::TypeMismatch,
+                        "range pattern lower bound must not exceed upper bound",
+                    ));
+                }
+                Ok(false)
+            }
+            MatchPattern::Tuple(patterns) => {
+                let unknown_types;
+                let types = if let Type::Tuple(types) = expected {
+                    types
+                } else if expected == &Type::Unknown {
+                    unknown_types = vec![Type::Unknown; patterns.len()];
+                    &unknown_types
+                } else {
+                    return Err(self.error(
+                        DiagnosticCode::TypeMismatch,
+                        format!(
+                            "tuple pattern cannot match value of type {}",
+                            expected.name()
+                        ),
+                    ));
+                };
+                if patterns.len() != types.len() {
+                    return Err(self.error(
+                        DiagnosticCode::TypeMismatch,
+                        format!(
+                            "tuple pattern expects {} elements, found {}",
+                            patterns.len(),
+                            types.len()
+                        ),
+                    ));
+                }
+                let mut irrefutable = true;
+                for (pattern, typ) in patterns.iter().zip(types) {
+                    irrefutable &= self.validate_match_pattern(pattern, typ, bindings)?;
+                }
+                Ok(irrefutable)
+            }
+            MatchPattern::Sequence { patterns, rest } => {
+                let (element_type, sequence_type) = match expected {
+                    Type::Array(element) | Type::List(element) => {
+                        ((**element).clone(), expected.clone())
+                    }
+                    Type::Unknown => (Type::Unknown, Type::Unknown),
+                    _ => {
+                        return Err(self.error(
+                            DiagnosticCode::TypeMismatch,
+                            format!(
+                                "sequence pattern cannot match value of type {}",
+                                expected.name()
+                            ),
+                        ));
+                    }
+                };
+                for pattern in patterns {
+                    self.validate_match_pattern(pattern, &element_type, bindings)?;
+                }
+                if let Some(name) = rest {
+                    bindings.push((name.clone(), sequence_type));
+                }
+                Ok(patterns.is_empty() && rest.is_some())
+            }
+            MatchPattern::Struct { type_name, fields } => {
+                if let Type::Struct(actual_name) = expected
+                    && actual_name != type_name
+                {
+                    return Err(self.error(
+                        DiagnosticCode::TypeMismatch,
+                        format!(
+                            "struct pattern `{type_name}` cannot match value of type {}",
+                            expected.name()
+                        ),
+                    ));
+                } else if expected != &Type::Unknown && !matches!(expected, Type::Struct(_)) {
+                    return Err(self.error(
+                        DiagnosticCode::TypeMismatch,
+                        format!(
+                            "struct pattern `{type_name}` cannot match value of type {}",
+                            expected.name()
+                        ),
+                    ));
+                }
+                let Some(struct_fields) = self.structs.get(type_name) else {
+                    return Err(self.error(
+                        DiagnosticCode::UndefinedVariable,
+                        format!("unknown struct type `{type_name}`"),
+                    ));
+                };
+                if fields.len() != struct_fields.len() {
+                    return Err(self.error(
+                        DiagnosticCode::InvalidFunctionCall,
+                        format!(
+                            "struct pattern `{type_name}` expects {} fields, found {}",
+                            struct_fields.len(),
+                            fields.len()
+                        ),
+                    ));
+                }
+                let mut irrefutable = true;
+                for (pattern, field) in fields.iter().zip(struct_fields) {
+                    irrefutable &=
+                        self.validate_match_pattern(pattern, &field.field_type, bindings)?;
+                }
+                Ok(irrefutable)
+            }
+            MatchPattern::EnumVariant {
+                enum_name,
+                variant_name,
+                payload,
+            } => {
+                if expected != &Type::Enum(enum_name.clone()) && expected != &Type::Unknown {
+                    return Err(self.error(
+                        DiagnosticCode::TypeMismatch,
+                        format!(
+                            "pattern `{enum_name}::{variant_name}` cannot match value of type {}",
+                            expected.name()
+                        ),
+                    ));
+                }
+                let Some(variants) = self.enums.get(enum_name) else {
+                    return Err(self.error(
+                        DiagnosticCode::UndefinedVariable,
+                        format!("unknown enum type `{enum_name}`"),
+                    ));
+                };
+                let Some(variant) = variants
+                    .iter()
+                    .find(|variant| variant.name == *variant_name)
+                else {
+                    return Err(self.error(
+                        DiagnosticCode::UndefinedVariable,
+                        format!("unknown variant `{enum_name}::{variant_name}`"),
+                    ));
+                };
+                let payload_irrefutable = match (&variant.payload_type, payload) {
+                    (Some(payload_type), Some(payload_pattern)) => {
+                        self.validate_match_pattern(payload_pattern, payload_type, bindings)?
+                    }
+                    (Some(payload_type), None) => {
+                        return Err(self.error(
+                            DiagnosticCode::InvalidFunctionCall,
+                            format!(
+                                "pattern `{enum_name}::{variant_name}` requires a payload binding (pattern) of type {}",
+                                payload_type.name()
+                            ),
+                        ));
+                    }
+                    (None, Some(_)) => {
+                        return Err(self.error(
+                            DiagnosticCode::InvalidFunctionCall,
+                            format!("unit variant `{enum_name}::{variant_name}` has no payload"),
+                        ));
+                    }
+                    (None, None) => true,
+                };
+                Ok(variants.len() == 1 && payload_irrefutable)
             }
         }
     }

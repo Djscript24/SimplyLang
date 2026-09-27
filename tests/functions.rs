@@ -56,23 +56,108 @@ fn preserves_function_globals_and_short_circuits() {
 }
 
 #[test]
-fn sends_messages_to_value_objects() {
+fn dispatches_messages_to_value_objects() {
     let output = run_example("examples/09-quality/message-objects.si");
     assert!(output.contains("Hello Ada"));
 }
 
 #[test]
-fn checks_literal_messages_before_runtime() {
-    let (success, _, error) = check_source(
-        "person is hash:\n    name is \"Ada\"\nend\nSayln send(person, \"missing\")\n",
-    );
+fn dispatches_arguments_and_expression_receivers() {
+    let source = "fn rename(self, name):\n    return self + name\nend\n\
+                  fn make_person():\n    return \"Ada\"\nend\n\
+                  Sayln make_person() :: rename(\" Lovelace\")\n";
+    let (success, output) = run_source_stdout(source);
+    assert!(success, "message dispatch failed: {output}");
+    assert_eq!(output, "Ada Lovelace\n");
+}
+
+#[test]
+fn evaluates_receiver_then_arguments_then_message_behavior() {
+    let source = "fn make_receiver():\n    Sayln \"receiver\"\n    return \"R\"\nend\n\
+                  fn make_argument():\n    Sayln \"argument\"\n    return \"A\"\nend\n\
+                  fn combine(self, value):\n    Sayln \"message\"\n    return self + value\nend\n\
+                  result is make_receiver() :: combine(make_argument())\n\
+                  Sayln result\n";
+    let (success, output) = run_source_stdout(source);
+    assert!(success, "ordered message dispatch failed: {output}");
+    assert_eq!(output, "receiver\nargument\nmessage\nRA\n");
+}
+
+#[test]
+fn supports_empty_argument_lists_and_nested_message_arguments() {
+    let source = "fn echo(self):\n    return self\nend\n\
+                  fn name(self):\n    return self[\"name\"]\nend\n\
+                  fn write(self, value):\n    return value\nend\n\
+                  person is hash:\n    name is \"Ada\"\nend\n\
+                  Sayln \"first\" :: echo\n\
+                  Sayln \"second\" :: echo()\n\
+                  Sayln \"log\" :: write(person :: name)\n";
+    let (success, output) = run_source_stdout(source);
+    assert!(success, "message evaluation failed: {output}");
+    assert_eq!(output, "first\nsecond\nAda\n");
+}
+
+#[test]
+fn dispatches_inside_functions_and_nested_scopes() {
+    let source = "fn name(self):\n    return self[\"name\"]\nend\n\
+                  fn greet(person):\n    return person :: name\nend\n\
+                  person is hash:\n    name is \"Ada\"\nend\n\
+                  if true:\n    Sayln greet(person)\nend\n";
+    let (success, output) = run_source_stdout(source);
+    assert!(success, "nested message dispatch failed: {output}");
+    assert_eq!(output, "Ada\n");
+}
+
+#[test]
+fn supports_explicit_nested_dispatch_and_expression_statements() {
+    let source = "fn address(self):\n    return hash:\n        city is \"Jakarta\"\n    end\nend\n\
+                  fn city(self):\n    return self[\"city\"]\nend\n\
+                  fn birthday(self):\n    Sayln self\nend\n\
+                  person is \"Ada\"\n\
+                  Sayln (person :: address) :: city\n\
+                  person :: birthday\n";
+    let (success, output) = run_source_stdout(source);
+    assert!(success, "nested dispatch failed: {output}");
+    assert_eq!(output, "Jakarta\nAda\n");
+}
+
+#[test]
+fn unknown_messages_fail_at_runtime() {
+    let (success, error) =
+        run_source("person is hash:\n    name is \"Ada\"\nend\nSayln person :: missing\n");
     assert!(!success);
     assert!(error.contains("unknown message `missing`"));
+    assert!(error.contains("Hash receiver"));
+    assert!(error.contains("Runtime error"));
 
     let (success, _, error) = check_source(
-        "fn greet(self as Hash):\n    return self[\"name\"]\nend\nperson is hash:\n    name is \"Ada\"\nend\nSayln send(person, \"greet\")\n",
+        "fn greet(self as Hash):\n    return self[\"name\"]\nend\nperson is hash:\n    name is \"Ada\"\nend\nSayln person :: greet\n",
     );
     assert!(success, "valid message failed semantic checking: {error}");
+}
+
+#[test]
+fn validates_message_argument_counts_using_function_signatures() {
+    for (call, count) in [
+        ("person :: rename()", "expects 2 arguments, got 1"),
+        (
+            "person :: rename(\"A\", \"B\")",
+            "expects 2 arguments, got 3",
+        ),
+    ] {
+        let source =
+            format!("fn rename(self, name):\n    return name\nend\nperson is \"Ada\"\n{call}\n");
+        let (success, _, error) = check_source(&source);
+        assert!(!success, "invalid message arity passed checking: {call}");
+        assert!(error.contains(count), "missing arity diagnostic: {error}");
+    }
+}
+
+#[test]
+fn send_is_not_a_public_language_function() {
+    let (success, _, error) = check_source("send(1, \"missing\")\n");
+    assert!(!success);
+    assert!(error.contains("unknown function `send`"));
 }
 
 #[test]

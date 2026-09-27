@@ -78,6 +78,17 @@ fn say_joins_output_and_sayln_terminates_the_line() {
 }
 
 #[test]
+fn parses_message_dispatch_as_an_expression() {
+    let source = "fn make_value(value):\n    return value\nend\n\
+                 fn name(self):\n    return self\nend\n\
+                 result is (make_value(\"Ada\")) :: name\nSayln result\n";
+    let (success, error) = run_source(source);
+    assert!(success, "message expression failed: {error}");
+    let (_, output) = run_source_stdout(source);
+    assert_eq!(output, "Ada\n");
+}
+
+#[test]
 fn keeps_runtime_types_aligned_with_shadowed_scopes() {
     let source = "mut value is 1\nif true:\n    mut value is \"inner\"\n    value -> \"updated\"\nend\nvalue -> 2\nfn update(mut value):\n    value -> \"local\"\n    return value\nend\nSayln update(\"initial\")\nSayln value\n";
     let (success, error) = run_source(source);

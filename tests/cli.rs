@@ -48,6 +48,7 @@ fn every_runnable_example_is_a_conformance_regression() {
         "examples/08-standard-library/strings.si",
         "examples/09-quality/message-objects.si",
         "examples/09-quality/scope-and-short-circuit.si",
+        "examples/13-objects/person.si",
         "examples/04-control-flow/try-catch-finally.si",
         "examples/10-flow/overview.si",
         "examples/10-flow/aggregates.si",
@@ -274,6 +275,141 @@ fn repl_preserves_state_prints_expressions_and_recovers_from_errors() {
 }
 
 #[test]
+fn repl_preserves_struct_state_across_evaluations() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .arg("repl")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start REPL");
+    child
+        .stdin
+        .as_mut()
+        .expect("REPL stdin was unavailable")
+        .write_all(
+            b"type Counter:\n\
+              value as Int\n\
+              end\n\
+              on Counter receive increment:\n\
+                  value -> value + 1\n\
+              end\n\
+              on Counter receive get:\n\
+                  return value\n\
+              end\n\
+              counter is Counter(0)\n\
+              \n\
+              counter :: increment\n\
+              \n\
+              counter :: increment()\n\
+              \n\
+              counter :: get\n",
+        )
+        .expect("failed to write REPL input");
+    drop(child.stdin.take());
+    let output = child
+        .wait_with_output()
+        .expect("failed to read REPL output");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.lines().any(|line| line == "2"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn repl_preserves_enum_declarations_and_matches() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .arg("repl")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start REPL");
+    child
+        .stdin
+        .as_mut()
+        .expect("REPL stdin was unavailable")
+        .write_all(
+            b"enum State:\n\
+              Ready\n\
+              Running\n\
+              end\n\
+              state is State::Ready\n\
+              match state:\n\
+                  State::Ready:\n\
+                      Sayln \"ready\"\n\
+                  State::Running:\n\
+                      Sayln \"running\"\n\
+                  end\n",
+        )
+        .expect("failed to write REPL input");
+    drop(child.stdin.take());
+    let output = child
+        .wait_with_output()
+        .expect("failed to read REPL output");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.lines().any(|line| line == "ready"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn repl_preserves_struct_identity_inside_enum_payloads() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .arg("repl")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start REPL");
+    child
+        .stdin
+        .as_mut()
+        .expect("REPL stdin was unavailable")
+        .write_all(
+            b"type User:\n\
+              name as String\n\
+              end\n\
+              on User receive rename(new_name as String):\n\
+                  name -> new_name\n\
+              end\n\
+              on User receive describe:\n\
+                  return name\n\
+              end\n\
+              enum Response:\n\
+                  Success as User\n\
+                  Error as String\n\
+              end\n\
+              user is User(\"Budi\")\n\
+              response is Response::Success(user)\n\
+              \n\
+              user :: rename(\"Andi\")\n\
+              \n\
+              match response:\n\
+                  Response::Success(person):\n\
+                      person :: describe\n\
+                  Response::Error(error):\n\
+                      error\n\
+              end\n",
+        )
+        .expect("failed to write REPL input");
+    drop(child.stdin.take());
+    let output = child
+        .wait_with_output()
+        .expect("failed to read REPL output");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.lines().any(|line| line == "Andi"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
 fn repl_evaluates_pasted_multiline_blocks_as_single_statements() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_simply"))
         .arg("repl")
@@ -296,6 +432,8 @@ fn repl_evaluates_pasted_multiline_blocks_as_single_statements() {
                   return local * factor\n\
               end\n\
               \n\
+              Sayln 7 :: scale\n\
+              \n\
               if true:\n\
                   value is \"inner\"\n\
                   Sayln value\n\
@@ -316,12 +454,52 @@ fn repl_evaluates_pasted_multiline_blocks_as_single_statements() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
         stdout.lines().collect::<Vec<_>>(),
-        ["Simply 0.9.0", "inner", "21", "10", "false", "true"]
+        ["Simply 0.9.0", "21", "inner", "21", "10", "false", "true"]
     );
     assert!(!stdout.contains("> "));
     assert!(!stdout.contains("... "));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn repl_supports_struct_declarations_construction_and_message_dispatch() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .arg("repl")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start REPL");
+    child
+        .stdin
+        .as_mut()
+        .expect("REPL stdin was unavailable")
+        .write_all(
+            b"type Person:\n\
+              name as String\n\
+              age as Int\n\
+              end\n\
+              on Person receive greet:\n\
+                  return \"Hello \" + name\n\
+              end\n\
+              person is Person(\"Ada\", 37)\n\
+              Sayln person :: greet\n",
+        )
+        .expect("failed to write REPL input");
+    drop(child.stdin.take());
+    let output = child
+        .wait_with_output()
+        .expect("failed to read REPL output");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        ["Simply 0.9.0", "Hello Ada"]
+    );
+    assert!(output.stderr.is_empty());
 }
 
 #[test]

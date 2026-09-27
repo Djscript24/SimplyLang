@@ -1,0 +1,23 @@
+value is 2
+
+message is match value:
+    0:
+        "zero"
+    1 | 2 | 3:
+        "small"
+    _:
+        "large"
+end
+
+Sayln message
+
+flag is true
+
+flag_message is match flag:
+    true:
+        "enabled"
+    false:
+        "disabled"
+end
+
+Sayln flag_message

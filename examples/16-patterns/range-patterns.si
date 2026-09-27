@@ -1,0 +1,26 @@
+age is 17
+
+category is match age:
+    ..-1:
+        "negative"
+    0..12:
+        "child"
+    13..17:
+        "teen"
+    18..:
+        "adult"
+end
+
+score is -5
+
+kind is match score:
+    ..-1:
+        "negative"
+    0:
+        "zero"
+    1..:
+        "positive"
+end
+
+Sayln category
+Sayln kind

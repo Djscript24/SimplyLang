@@ -1,0 +1,26 @@
+# Struct patterns recursively match nominal values in declaration order.
+type Address:
+    city as String
+end
+
+type Person:
+    name as String
+    address as Address
+end
+
+enum Result:
+    Ok as Person
+    Error as String
+end
+
+person is Person("Andi", Address("Surabaya"))
+result is Result::Ok(person)
+
+message is match result:
+    Result::Ok(Person(name, Address(city))):
+        name
+    Result::Error(error):
+        error
+end
+
+Sayln message

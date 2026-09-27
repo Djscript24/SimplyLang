@@ -24,6 +24,92 @@ pub struct CatchClause {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct StructField {
+    pub name: String,
+    pub field_type: Type,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumVariant {
+    pub name: String,
+    pub payload_type: Option<Type>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchArm {
+    pub pattern: MatchPattern,
+    pub guard: Option<Expr>,
+    pub body: Vec<Stmt>,
+    pub result: Option<Expr>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MatchPattern {
+    Identifier(String),
+    Literal(Literal),
+    Range {
+        start: Option<Literal>,
+        end: Option<Literal>,
+    },
+    Or(Vec<MatchPattern>),
+    Tuple(Vec<MatchPattern>),
+    Sequence {
+        patterns: Vec<MatchPattern>,
+        rest: Option<String>,
+    },
+    Hash(Vec<(String, MatchPattern)>),
+    Alias {
+        name: String,
+        pattern: Box<MatchPattern>,
+    },
+    EnumVariant {
+        enum_name: String,
+        variant_name: String,
+        payload: Option<Box<MatchPattern>>,
+    },
+    Struct {
+        type_name: String,
+        fields: Vec<MatchPattern>,
+    },
+    Wildcard,
+}
+
+impl MatchPattern {
+    pub(crate) fn destructure_binding_names(&self) -> Vec<&str> {
+        fn collect<'a>(pattern: &'a MatchPattern, names: &mut Vec<&'a str>) {
+            match pattern {
+                MatchPattern::Identifier(name) => names.push(name),
+                MatchPattern::Tuple(patterns) => {
+                    for pattern in patterns {
+                        collect(pattern, names);
+                    }
+                }
+                MatchPattern::Sequence { patterns, rest } => {
+                    for pattern in patterns {
+                        collect(pattern, names);
+                    }
+                    if let Some(name) = rest {
+                        names.push(name);
+                    }
+                }
+                MatchPattern::Wildcard
+                | MatchPattern::Literal(_)
+                | MatchPattern::Range { .. }
+                | MatchPattern::Or(_)
+                | MatchPattern::Hash(_)
+                | MatchPattern::Alias { .. }
+                | MatchPattern::EnumVariant { .. }
+                | MatchPattern::Struct { .. } => {}
+            }
+        }
+
+        let mut names = Vec::new();
+        collect(self, &mut names);
+        names
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     Located {
         span: Span,
@@ -51,13 +137,18 @@ pub enum Stmt {
         name: String,
         value: Expr,
     },
+    DestructureReassign {
+        pattern: MatchPattern,
+        value: Expr,
+    },
     SetIndex {
         name: String,
         index: Expr,
         value: Expr,
     },
     Destructure {
-        names: Vec<(String, bool)>,
+        pattern: MatchPattern,
+        mutable: bool,
         value: Expr,
     },
     CollectionOp {
@@ -80,6 +171,20 @@ pub enum Stmt {
         name: String,
         parameters: Vec<(String, Option<Type>, bool)>,
         return_type: Option<Type>,
+        body: Arc<[Stmt]>,
+    },
+    Struct {
+        name: String,
+        fields: Vec<StructField>,
+    },
+    Enum {
+        name: String,
+        variants: Vec<EnumVariant>,
+    },
+    Message {
+        receiver_type: String,
+        name: String,
+        parameters: Vec<(String, Option<Type>, bool)>,
         body: Arc<[Stmt]>,
     },
     Return(Expr),
@@ -113,6 +218,20 @@ pub enum Expr {
     Call {
         name: String,
         arguments: Vec<Expr>,
+    },
+    MessageDispatch {
+        receiver: Box<Expr>,
+        message: String,
+        arguments: Vec<Expr>,
+    },
+    EnumVariant {
+        enum_name: String,
+        variant_name: String,
+        arguments: Vec<Expr>,
+    },
+    Match {
+        value: Box<Expr>,
+        arms: Vec<MatchArm>,
     },
     Array(Vec<Expr>),
     List(Vec<Expr>),

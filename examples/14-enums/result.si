@@ -1,0 +1,30 @@
+# result.si — stateful structs carried through typed enum payloads
+type User:
+    name as String
+    age as Int
+end
+
+on User receive rename(new_name as String):
+    name -> new_name
+end
+
+on User receive describe:
+    return name
+end
+
+enum Response:
+    Success as User
+    Error as String
+end
+
+user is User("Budi", 17)
+response is Response::Success(user)
+user :: rename("Andi")
+
+message is match response:
+    Response::Success(person):
+        person :: describe
+    Response::Error(error):
+        error
+end
+Sayln message

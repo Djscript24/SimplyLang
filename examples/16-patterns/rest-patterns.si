@@ -1,0 +1,20 @@
+values is [10, 20, 30]
+
+match values:
+    []:
+        Sayln "empty"
+    [head, ...tail]:
+        Sayln head
+        Sayln tail
+end
+
+nested is [[1, 2], [3, 4]]
+
+match nested:
+    []:
+        Sayln "empty nested sequence"
+    [[first, second], ...remaining]:
+        Sayln first
+        Sayln second
+        Sayln remaining
+end

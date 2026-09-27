@@ -17,6 +17,10 @@ runtime behavior, useful diagnostics, and a compact command-line workflow.
 - Functions with typed parameters and optional return types.
 - Nested functions and escaping closures with lexical binding resolution.
 - Arrays, lists, tuples, hashes, trees, and matrices.
+- Tuple and sequence destructuring declarations with nested targets, wildcards,
+  and lazy rest suffixes.
+- Structural match patterns for enums, structs, sequences, partial hashes, and
+  whole-value aliases.
 - Pipelines with `where`, `derive`, `partition`, and aggregate terminals.
 - Streaming CSV pipelines for selecting, deriving, and rewriting large files.
 - Flow chunking and file checkpoints for resumable long-running pipelines.
@@ -194,6 +198,169 @@ bindings. Hashes and trees use string keys and iterate deterministically.
 Matrix dimensions and numeric contents are validated at runtime. Matrix
 multiplication returns floating-point cells.
 
+### Structs and messages
+
+Structs declare nominally typed, positional data. Messages can read and update
+their receiver's fields, and their return value is an ordinary expression
+value:
+
+```simply
+type Person:
+    name as String
+    age as Int
+end
+
+on Person receive greet:
+    return "Hello " + name
+end
+
+on Person receive introduce(to as String):
+    return "Hello " + to + ", I'm " + name
+end
+
+on Person receive rename(new_name as String):
+    name -> new_name
+end
+
+on Person receive get_age:
+    return age
+end
+
+person is Person("Budi", 17)
+person :: rename("Ada")
+name is person :: greet
+age is person :: get_age
+Sayln name
+Sayln age
+```
+
+Inside a message, declared fields are available as local bindings. Reassigning
+one updates that field on the persistent instance; its declared type is
+enforced. Struct values share identity when copied to another binding, so
+messages sent through either binding observe the same state. Message dispatch
+works both as a statement and as an expression. State is accessed through
+messages; direct struct field access, automatic getters, and setters are not
+supported.
+
+### Enums and matching
+
+Enums are nominal tagged values with zero or one typed payload per variant.
+`match` is an expression, and enum matches must cover every variant or include
+an irrefutable fallback pattern:
+
+```simply
+enum Result:
+    Ok as Int
+    Error as String
+end
+
+result is Result::Ok(42)
+message is match result:
+    Result::Ok(value):
+        value
+    Result::Error(error):
+        error
+end
+Sayln message
+```
+
+Struct patterns match fields positionally in declaration order and compose
+with enum and tuple patterns:
+
+```simply
+type Person:
+    name as String
+    age as Int
+end
+
+enum Result:
+    Ok as Person
+    Error as String
+end
+
+result is Result::Ok(Person("Andi", 17))
+match result:
+    Result::Ok(Person(name, _)):
+        Sayln name
+    Result::Error(error):
+        Sayln error
+end
+```
+
+Patterns recursively support identifiers, `_`, tuples, and enum variants with
+an optional single payload pattern, plus positional Struct patterns. For
+example, `(left, (right, _))` matches nested tuples,
+`Result::Ok((left, right))` destructures a tuple payload, and
+`Person(name, Address(city))` matches Struct fields in declaration order.
+Struct patterns require the nominal type and exact field count; named-field
+patterns are not supported.
+Identifier bindings exist only within their selected arm; a failed nested
+pattern does not expose any partial bindings.
+Enum payloads preserve nominal Struct and Enum values; a Struct stored in a
+payload retains its shared identity and state. Enum values do not support
+message dispatch.
+
+Match patterns are type-checked against the scrutinee, including tuple arity,
+nominal enum identity, and Struct identity/arity. Exhaustiveness and
+unreachable-arm checks recursively account for enum variants, tuple elements,
+and Struct fields. Wildcards, identifiers, and recursively irrefutable
+constructor patterns cover their expected type. An arm may add
+`if expression` after its pattern; the guard runs only after a successful
+pattern, with that arm's bindings in scope, and must evaluate to `Bool`. A
+false guard continues to the next arm. Guarded patterns do not count toward
+exhaustiveness, and SimplyLang does not reason symbolically about guard
+conditions. OR-patterns use `pattern | pattern`; alternatives are tried
+left-to-right and must bind the same names with compatible types. Unguarded OR
+alternatives contribute their combined coverage, while a guarded OR contributes
+none.
+
+Literal patterns support Int, Float, String, and Bool values, including inside
+tuples, enum payloads, Struct fields, and OR-patterns. They match exactly with
+no numeric coercion; strings use exact equality. Bool is a finite domain, so
+`true` and `false` together are exhaustive. Float and String are open domains
+and still require a wildcard or identifier for exhaustiveness. Int literal and
+inclusive range patterns such as `-10..10`, `10..`, and `..10` are analyzed as
+intervals. Their unguarded union is exhaustive only when it covers the entire
+Int domain without gaps; guarded patterns do not contribute coverage.
+
+Sequence patterns use brackets, such as `[]`, `[1, 2]`, and
+`[[1, 2], [3, 4]]`. Fixed-length patterns match Array or List values only at
+exact length. A trailing identifier rest binding, such as `[head, ...tail]`,
+matches any length at least as large as its prefix and binds the suffix using
+the source collection type. Rest appears at most once and must be last;
+`[...rest]` matches sequences of any length. Array and List suffixes preserve
+their collection kind, integer ranges preserve their lazy range representation,
+and CSV stream suffixes remain lazy. Patterns recursively support nested
+constructors and range/literal checks. Fixed-length patterns alone do not cover
+arbitrary sequence lengths; use a rest pattern or wildcard for the remainder.
+
+### Destructuring declarations
+
+Declarations can extract values using nested tuple and sequence targets:
+
+```simply
+(name, (age, _)) is ("Ada", (37, "ignored"))
+[head, ...tail] is [1, 2, 3]
+```
+
+Destructuring supports identifiers, `_`, tuples, sequences, and a final
+identifier rest target. Bindings are committed only after the whole target
+matches; CSV rest values remain lazy. Literal, Range, OR, Alias, Enum, Struct,
+and Hash patterns are not destructuring targets.
+
+Destructuring assignment updates existing mutable bindings atomically:
+
+```simply
+mut name is "Ada"
+mut age is 36
+(name, age) -> ("Grace", 37)
+```
+
+Every target must already exist, be mutable, and accept the extracted value's
+type. Wildcards are ignored; duplicate targets are rejected. The RHS is
+evaluated once, and no target changes unless the complete target and all
+assignments validate. CSV rest suffixes stay lazy.
+
 ### Pipelines
 
 Pipelines make collection transformations readable:
@@ -216,8 +383,9 @@ The evaluator fuses supported `where`/`derive` chains ending in `sum` or
 
 Strings can be indexed and sliced by Unicode scalar position, traversed in
 linear time after one `characters(text)` conversion, and inspected with
-`is_ascii_alpha`, `is_ascii_digit`, and `is_whitespace`, and read from or written
-to text files with `read_file` and `write_file`. The
+`is_ascii_alpha`, `is_ascii_digit`, and `is_whitespace`, read from or written
+to text files with `read_file` and `write_file`, and request user input with
+`Ask(prompt)` or `Ask(prompt, Int|Float|String|Bool)`. The
 `examples/11-compiler-foundations/mini-lexer.si` example demonstrates reading a
 Simply source file, scanning it one character at a time, and building
 token-like values. These capabilities provide the foundation for future
@@ -252,6 +420,7 @@ The standard library includes:
 | `substring(text, start, length)` | Slice a string by Unicode scalar positions. |
 | `is_ascii_alpha`, `is_ascii_digit`, `is_whitespace` | Inspect one character. |
 | `read_file(path)`, `write_file(path, content)` | Read and write UTF-8 text files. |
+| `Ask(prompt[, type])` | Read a line as String or parse it as Int, Float, String, or Bool. |
 | `sqrt`, `pow`, `exp`, `log`, `log10`, `sin`, `cos`, `tan` | Scalar mathematical functions. |
 | `floor`, `ceil`, `sign`, `abs`, `round`, `clamp` | Numeric rounding, sign, and bounds operations. |
 | `vector_add`, `vector_subtract`, `vector_scale`, `dot`, `norm`, `distance`, `normalize` | Numeric vector operations. |
@@ -261,7 +430,7 @@ The standard library includes:
 | `is_empty(value)` | Test collections and strings. |
 | `reverse(sequence)` | Reverse arrays, lists, or tuples. |
 | `type_of(value)` / `print(value)` | Inspect values or print them. |
-| `send(receiver, message, ...)` | Dispatch a function by message name. |
+| `receiver :: message(arguments)` | Dispatch a message; struct receivers use type-specific behavior. |
 
 Numerical collection functions use existing Simply arrays, lists, and tuples;
 there is no separate tensor type. Vector and matrix dimensions are validated,
@@ -343,6 +512,7 @@ Function bodies and imported programs use shared storage where appropriate.
 │   ├── 10-flow/            # Declarative Flow, quality, CSV, and resume demos
 │   ├── 11-compiler-foundations/ # String, file, and miniature lexer example
 │   ├── 12-mathematics/     # Scalar, vector, matrix, statistics, and gradient examples
+│   ├── 13-objects/         # Nominal structs and type-specific messages
 │   ├── 99-smoke/           # Small smoke program
 │   └── 99-bench/           # Benchmark programs and large input fixtures
 ├── tests/                  # Native Simply fixtures and Rust integration tests

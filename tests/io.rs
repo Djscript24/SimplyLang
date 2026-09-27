@@ -1,6 +1,115 @@
 mod common;
 use common::*;
-use std::{fs, process::Command, sync::atomic::Ordering};
+use std::{
+    fs,
+    io::Write,
+    process::{Command, Stdio},
+    sync::atomic::Ordering,
+};
+
+#[test]
+fn asks_for_dynamic_strings_and_statically_typed_primitive_values() {
+    let id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("simply-ask-{id}"));
+    fs::create_dir_all(&root).expect("failed to create Ask test directory");
+    let source = root.join("main.si");
+    fs::write(
+        &source,
+        "name is Ask(\"Name: \")\n\
+         age as Int is Ask(\"Age: \", Int)\n\
+         ratio as Float is Ask(\"Ratio: \", Float)\n\
+         active as Bool is Ask(\"Active: \", Bool)\n\
+         Sayln name\n\
+         Sayln age + 1\n\
+         Sayln ratio\n\
+         Sayln active\n",
+    )
+    .expect("failed to write Ask source");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args([
+            "run",
+            source.to_str().expect("Ask source path was not UTF-8"),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start Ask source");
+    child
+        .stdin
+        .take()
+        .expect("Ask child should have piped stdin")
+        .write_all(b"  Ada  \n42\n2.5\nTRUE\n")
+        .expect("failed to provide Ask input");
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for Ask source");
+    fs::remove_dir_all(root).expect("failed to clean up Ask test directory");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "Name: Age: Ratio: Active:   Ada  \n43\n2.5\ntrue\n"
+    );
+}
+
+#[test]
+fn ask_rejects_unsupported_types_and_invalid_typed_input() {
+    let (success, _, error) = check_source("value is Ask(\"Value: \", Date)\n");
+    assert!(!success);
+    assert!(error.contains("unsupported `Ask` type `Date`"), "{error}");
+
+    let (success, _, error) = check_source("value is Ask(\"Value: \", \"Int\")\n");
+    assert!(!success);
+    assert!(error.contains("Ask` type must be"), "{error}");
+
+    let id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("simply-ask-invalid-{id}"));
+    fs::create_dir_all(&root).expect("failed to create invalid Ask test directory");
+    let source = root.join("main.si");
+    fs::write(&source, "value is Ask(\"Age: \", Int)\n")
+        .expect("failed to write invalid Ask source");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args([
+            "run",
+            source.to_str().expect("Ask source path was not UTF-8"),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start invalid Ask source");
+    child
+        .stdin
+        .take()
+        .expect("Ask child should have piped stdin")
+        .write_all(b"not an integer\n")
+        .expect("failed to provide invalid Ask input");
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for invalid Ask source");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("expected an Int"), "{stderr}");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args([
+            "run",
+            source.to_str().expect("Ask source path was not UTF-8"),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to execute Ask source without input");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no input received for `Ask`"), "{stderr}");
+    fs::remove_dir_all(root).expect("failed to clean up invalid Ask test directory");
+}
 
 #[test]
 fn streams_csv_rows_through_where_derive_and_writer() {

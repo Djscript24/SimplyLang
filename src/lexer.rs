@@ -9,6 +9,11 @@ pub enum TokenKind {
     Sayln,
     Open,
     Fn,
+    Type,
+    Enum,
+    Match,
+    On,
+    Receive,
     Return,
     If,
     Else,
@@ -62,13 +67,20 @@ pub enum TokenKind {
     EqualEqual,
     NotEqual,
     Not,
+    Pipe,
+    At,
     Colon,
+    DoubleColon,
     LeftParen,
     RightParen,
     Comma,
     LeftBracket,
     RightBracket,
+    LeftBrace,
+    RightBrace,
     Dot,
+    DotDot,
+    DotDotDot,
     True,
     False,
     String(String),
@@ -120,13 +132,26 @@ impl<'a> Lexer<'a> {
                 }
                 '#' => self.skip_comment(),
                 '"' => tokens.push(self.read_string()?),
+                ':' if self.next_is(':') => {
+                    tokens.push(self.read_double_char(TokenKind::DoubleColon));
+                }
                 ':' => tokens.push(self.single_char(TokenKind::Colon)),
                 '(' => tokens.push(self.single_char(TokenKind::LeftParen)),
                 ')' => tokens.push(self.single_char(TokenKind::RightParen)),
                 ',' => tokens.push(self.single_char(TokenKind::Comma)),
                 '[' => tokens.push(self.single_char(TokenKind::LeftBracket)),
                 ']' => tokens.push(self.single_char(TokenKind::RightBracket)),
+                '{' => tokens.push(self.single_char(TokenKind::LeftBrace)),
+                '}' => tokens.push(self.single_char(TokenKind::RightBrace)),
+                '.' if self.next_two_are_dots() => {
+                    tokens.push(self.read_triple_char(TokenKind::DotDotDot));
+                }
+                '.' if self.next_is('.') => {
+                    tokens.push(self.read_double_char(TokenKind::DotDot));
+                }
                 '.' => tokens.push(self.single_char(TokenKind::Dot)),
+                '|' => tokens.push(self.single_char(TokenKind::Pipe)),
+                '@' => tokens.push(self.single_char(TokenKind::At)),
                 '+' => tokens.push(self.single_char(TokenKind::Plus)),
                 '*' => tokens.push(self.single_char(TokenKind::Star)),
                 '/' => tokens.push(self.single_char(TokenKind::Slash)),
@@ -179,6 +204,13 @@ impl<'a> Lexer<'a> {
             == Some(expected)
     }
 
+    fn next_two_are_dots(&self) -> bool {
+        let mut characters = self.source.get(self.index..).unwrap_or_default().chars();
+        characters.next() == Some('.')
+            && characters.next() == Some('.')
+            && characters.next() == Some('.')
+    }
+
     fn advance(&mut self) -> Option<char> {
         let ch = self.peek()?;
         self.index += ch.len_utf8();
@@ -211,6 +243,11 @@ impl<'a> Lexer<'a> {
             "Sayln" => TokenKind::Sayln,
             "open" => TokenKind::Open,
             "fn" => TokenKind::Fn,
+            "type" => TokenKind::Type,
+            "enum" => TokenKind::Enum,
+            "match" => TokenKind::Match,
+            "on" => TokenKind::On,
+            "receive" => TokenKind::Receive,
             "return" => TokenKind::Return,
             "if" => TokenKind::If,
             "else" => TokenKind::Else,
@@ -283,6 +320,14 @@ impl<'a> Lexer<'a> {
         Token { kind, span }
     }
 
+    fn read_triple_char(&mut self, kind: TokenKind) -> Token {
+        let span = Span::new(self.line, self.column);
+        self.advance();
+        self.advance();
+        self.advance();
+        Token { kind, span }
+    }
+
     fn read_comparison(
         &mut self,
         _character: char,
@@ -305,7 +350,7 @@ impl<'a> Lexer<'a> {
         }
 
         let mut is_float = false;
-        if self.peek() == Some('.') {
+        if self.peek() == Some('.') && !self.next_is('.') {
             is_float = true;
             self.advance();
             while matches!(self.peek(), Some('0'..='9')) {
@@ -487,6 +532,71 @@ mod tests {
     }
 
     #[test]
+    fn lexes_range_operators_without_splitting_integer_literals_as_floats() {
+        let tokens = Lexer::new("0..10 1.5..2.5 ..-1\n")
+            .tokenize()
+            .unwrap()
+            .into_iter()
+            .map(|token| token.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::Int(0),
+                TokenKind::DotDot,
+                TokenKind::Int(10),
+                TokenKind::Float(1.5),
+                TokenKind::DotDot,
+                TokenKind::Float(2.5),
+                TokenKind::DotDot,
+                TokenKind::Minus,
+                TokenKind::Int(1),
+                TokenKind::Newline,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn lexes_rest_patterns_before_range_and_field_access_tokens() {
+        let kinds = Lexer::new("...tail ..10 . value.field 1...rest .... .....\n")
+            .tokenize()
+            .unwrap()
+            .into_iter()
+            .map(|token| token.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::DotDotDot,
+                TokenKind::Identifier("tail".into()),
+                TokenKind::DotDot,
+                TokenKind::Int(10),
+                TokenKind::Dot,
+                TokenKind::Identifier("value".into()),
+                TokenKind::Dot,
+                TokenKind::Identifier("field".into()),
+                TokenKind::Int(1),
+                TokenKind::DotDotDot,
+                TokenKind::Identifier("rest".into()),
+                TokenKind::DotDotDot,
+                TokenKind::Dot,
+                TokenKind::DotDotDot,
+                TokenKind::DotDot,
+                TokenKind::Newline,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn distinguishes_double_colon_from_block_colons() {
+        let tokens = Lexer::new("person::greet:\n").tokenize().unwrap();
+        assert_eq!(tokens[1].kind, TokenKind::DoubleColon);
+        assert_eq!(tokens[3].kind, TokenKind::Colon);
+    }
+
+    #[test]
     fn tracks_unicode_and_windows_newlines_without_losing_tokens() {
         let tokens = Lexer::new("Say \"é\"\r\nSay 2\r\n").tokenize().unwrap();
         assert_eq!(tokens[1].kind, TokenKind::String("é".into()));
@@ -532,7 +642,7 @@ mod tests {
 
     #[test]
     fn tracks_scalar_columns_after_unicode_source() {
-        let error = Lexer::new("Say \"é你好😀\"\nSay @\n")
+        let error = Lexer::new("Say \"é你好😀\"\nSay ?\n")
             .tokenize()
             .unwrap_err();
 

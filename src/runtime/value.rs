@@ -5,6 +5,7 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap},
     fmt::Write,
+    time::SystemTime,
 };
 use std::{rc::Rc, sync::Arc};
 
@@ -19,14 +20,41 @@ pub(crate) struct FunctionValue {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct StructInstance {
+    pub type_name: String,
+    pub fields: Rc<RefCell<BTreeMap<String, Value>>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumValue {
+    pub enum_name: String,
+    pub variant_name: String,
+    pub payload: Option<Box<Value>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CsvStreamVersion {
+    pub length: u64,
+    pub modified: SystemTime,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Unit,
     String(String),
     Int(i64),
     Float(f64),
     Bool(bool),
-    Range { start: i64, end: i64 },
-    CsvStream(String),
+    Range {
+        start: i64,
+        end: i64,
+    },
+    CsvStream {
+        path: String,
+        start_record: usize,
+        start_offset: u64,
+        source_version: Option<CsvStreamVersion>,
+    },
     Array(Rc<Vec<Value>>),
     List(Rc<Vec<Value>>),
     Tuple(Rc<Vec<Value>>),
@@ -34,6 +62,8 @@ pub enum Value {
     Tree(Rc<BTreeMap<String, Value>>),
     Matrix(Rc<Vec<Value>>),
     Function(Rc<FunctionValue>),
+    Struct(Rc<StructInstance>),
+    Enum(Rc<EnumValue>),
 }
 
 pub(crate) fn shared_values(values: Vec<Value>) -> Rc<Vec<Value>> {
@@ -79,7 +109,7 @@ impl Value {
                 }
                 output.push(']');
             }
-            Self::CsvStream(path) => {
+            Self::CsvStream { path, .. } => {
                 write!(output, "<csv stream: {path}>").expect("writing to String cannot fail")
             }
             Self::Array(values)
@@ -110,6 +140,16 @@ impl Value {
                 output.push('}');
             }
             Self::Function(_) => output.push_str("<function>"),
+            Self::Struct(instance) => output.push_str(&instance.type_name),
+            Self::Enum(value) => {
+                write!(output, "{}::{}", value.enum_name, value.variant_name)
+                    .expect("writing to String cannot fail");
+                if let Some(payload) = &value.payload {
+                    output.push('(');
+                    payload.write_display(output);
+                    output.push(')');
+                }
+            }
         }
     }
 

@@ -1,6 +1,6 @@
 # message-objects.si — message dispatch example
 # Demonstrates explicit message dispatch to a hash-backed value without classes.
-# Key components: greet function, person hash, and send.
+# Key components: greet function, person hash, and message dispatch.
 # Explicit message dispatch without classes
 fn greet(self):
     return "Hello " + self["name"]
@@ -10,4 +10,4 @@ person is hash:
     name is "Ada"
 end
 
-Sayln send(person, "greet")
+Sayln person :: greet

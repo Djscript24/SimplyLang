@@ -451,12 +451,22 @@ fn collect_statement_stats(statements: &[Stmt], stats: &mut ExplainStats, inside
                     }
                 }
             }
-            Stmt::Destructure { names, value } => {
-                stats.bindings += names.len();
-                stats.mutable_bindings += names.iter().filter(|(_, mutable)| *mutable).count();
+            Stmt::Destructure {
+                pattern,
+                mutable,
+                value,
+            } => {
+                stats.bindings += pattern.destructure_binding_names().len();
+                stats.mutable_bindings +=
+                    pattern.destructure_binding_names().len() * usize::from(*mutable);
                 collect_expression_stats(value, stats);
             }
             Stmt::Function { body, .. } => {
+                stats.functions += 1;
+                stats.nested_functions += usize::from(inside_function);
+                collect_statement_stats(body, stats, true);
+            }
+            Stmt::Message { body, .. } => {
                 stats.functions += 1;
                 stats.nested_functions += usize::from(inside_function);
                 collect_statement_stats(body, stats, true);
@@ -502,14 +512,18 @@ fn collect_statement_stats(statements: &[Stmt], stats: &mut ExplainStats, inside
             | Stmt::Sayln(expression)
             | Stmt::Expression(expression)
             | Stmt::Return(expression) => collect_expression_stats(expression, stats),
-            Stmt::Reassign { value, .. } | Stmt::CollectionOp { value, .. } => {
-                collect_expression_stats(value, stats)
-            }
+            Stmt::Reassign { value, .. }
+            | Stmt::DestructureReassign { value, .. }
+            | Stmt::CollectionOp { value, .. } => collect_expression_stats(value, stats),
             Stmt::SetIndex { index, value, .. } => {
                 collect_expression_stats(index, stats);
                 collect_expression_stats(value, stats);
             }
-            Stmt::Import { .. } | Stmt::Break | Stmt::Continue => {}
+            Stmt::Import { .. }
+            | Stmt::Struct { .. }
+            | Stmt::Enum { .. }
+            | Stmt::Break
+            | Stmt::Continue => {}
         }
     }
 }
@@ -520,6 +534,35 @@ fn collect_expression_stats(expression: &Expr, stats: &mut ExplainStats) {
             stats.calls += 1;
             for argument in arguments {
                 collect_expression_stats(argument, stats);
+            }
+        }
+        Expr::MessageDispatch {
+            receiver,
+            arguments,
+            ..
+        } => {
+            collect_expression_stats(receiver, stats);
+            for argument in arguments {
+                collect_expression_stats(argument, stats);
+            }
+        }
+        Expr::EnumVariant { arguments, .. } => {
+            for argument in arguments {
+                collect_expression_stats(argument, stats);
+            }
+        }
+        Expr::Match { value, arms } => {
+            collect_expression_stats(value, stats);
+            for arm in arms {
+                if let Some(guard) = &arm.guard {
+                    collect_expression_stats(guard, stats);
+                }
+                for statement in &arm.body {
+                    collect_statement_stats(std::slice::from_ref(statement), stats, false);
+                }
+                if let Some(result) = &arm.result {
+                    collect_expression_stats(result, stats);
+                }
             }
         }
         Expr::Unary { operand, .. } => collect_expression_stats(operand, stats),
@@ -724,14 +767,15 @@ fn repl() -> i32 {
                 if repl_block_depth(&tokens) > 0 {
                     continue;
                 }
-                let program = match Parser::new(tokens).parse() {
-                    Ok(program) => program,
-                    Err(error) => {
-                        render_error("<repl>", error, &input);
-                        input.clear();
-                        continue;
-                    }
-                };
+                let program =
+                    match Parser::new_with_enum_names(tokens, evaluator.enum_names()).parse() {
+                        Ok(program) => program,
+                        Err(error) => {
+                            render_error("<repl>", error, &input);
+                            input.clear();
+                            continue;
+                        }
+                    };
                 pending_programs.push((program, input.clone()));
                 input.clear();
             }
@@ -788,6 +832,10 @@ fn repl_block_depth(tokens: &[Token]) -> usize {
         match &token.kind {
             TokenKind::End => depth = depth.saturating_sub(1),
             TokenKind::Fn
+            | TokenKind::Type
+            | TokenKind::Enum
+            | TokenKind::On
+            | TokenKind::Match
             | TokenKind::If
             | TokenKind::For
             | TokenKind::While

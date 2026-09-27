@@ -1,0 +1,30 @@
+enum Result:
+    Ok as Int
+    Error as String
+end
+
+age is 21
+Sayln match age:
+    adult @ 18..:
+        adult
+    _:
+        0
+end
+
+result is Result::Ok(7)
+Sayln match result:
+    whole @ Result::Ok(payload @ 0..10):
+        payload
+    whole @ Result::Ok(_):
+        0
+    whole @ Result::Error(_):
+        0
+end
+
+values is [1, 2, 3]
+Sayln match values:
+    whole @ [head, ...tail]:
+        head + tail[0]
+    []:
+        0
+end

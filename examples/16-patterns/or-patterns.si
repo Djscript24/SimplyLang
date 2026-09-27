@@ -1,0 +1,26 @@
+enum Result:
+    Ok as Int
+    Error as String
+end
+
+result is Result::Ok(42)
+
+message is match result:
+    Result::Ok(_) | Result::Error(_):
+        "handled"
+end
+
+Sayln message
+
+enum Choice:
+    First as Int
+    Second as Int
+end
+
+choice is Choice::Second(8)
+matched is match choice:
+    Choice::First(value) | Choice::Second(value):
+        value
+end
+
+Sayln matched

@@ -15,6 +15,8 @@ pub enum Type {
     Hash,
     Tree,
     Matrix,
+    Struct(String),
+    Enum(String),
     Function {
         parameters: Vec<Option<Box<Type>>>,
         return_type: Option<Box<Type>>,
@@ -39,6 +41,8 @@ impl Type {
             Self::Hash => "Hash".into(),
             Self::Tree => "Tree".into(),
             Self::Matrix => "Matrix".into(),
+            Self::Struct(name) => name.clone(),
+            Self::Enum(name) => name.clone(),
             Self::Function { .. } => "Function".into(),
         }
     }

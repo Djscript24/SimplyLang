@@ -1,0 +1,27 @@
+enum Result:
+    Ok as Int
+    Error as String
+end
+
+type Person:
+    name as String
+    age as Int
+end
+
+record is hash:
+    result is Result::Ok(7)
+    person is Person("Ada", 36)
+    values is [1, 2]
+    extra is true
+end
+
+message is match record:
+    {"result": Result::Ok(0..10), person: Person(name, 18..), values: [1, 2]}:
+        name
+    {"result": Result::Error(error)}:
+        error
+    {}:
+        "unmatched"
+end
+
+Sayln message
