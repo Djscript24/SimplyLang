@@ -307,7 +307,7 @@ fn csv_stream_sequence_patterns_match_exact_lengths_without_materializing_the_st
         let path = root.join(format!("{name}.csv"));
         fs::write(&path, contents).expect("failed to write CSV sequence fixture");
         let source = format!(
-            "rows as List[List[String]] is csv_rows({:?})\n\
+            "rows as CsvStream is csv_rows({:?})\n\
              result is match rows:\n\
                  {pattern}:\n\
                      \"matched\"\n\
@@ -801,7 +801,7 @@ fn csv_stream_rest_bindings_remain_lazy_and_start_at_the_suffix() {
         let path = root.join(format!("{name}.csv"));
         fs::write(&path, contents).expect("failed to write CSV rest fixture");
         let source = format!(
-            "rows as List[List[String]] is csv_rows({:?})\n\
+            "rows as CsvStream is csv_rows({:?})\n\
              result is match rows:\n\
                  []:\n    list []\n\
                  [first, ...tail]:\n\
@@ -823,7 +823,7 @@ fn csv_stream_rest_bindings_remain_lazy_and_start_at_the_suffix() {
     let pipeline_path = root.join("pipeline.csv");
     fs::write(&pipeline_path, "Ada\nLin\nGrace\n").expect("failed to write CSV pipeline fixture");
     let pipeline_source = format!(
-        "rows as List[List[String]] is csv_rows({:?})\n\
+        "rows as CsvStream is csv_rows({:?})\n\
          tail is match rows:\n\
              []:\n    rows\n\
              [first, ...rest]:\n    rest\n\
@@ -843,7 +843,7 @@ fn csv_stream_rest_bindings_remain_lazy_and_start_at_the_suffix() {
     assert_eq!(output, "2\n");
 
     let repeated_pipeline_source = format!(
-        "rows as List[List[String]] is csv_rows({:?})\n\
+        "rows as CsvStream is csv_rows({:?})\n\
          tail is match rows:\n\
              []:\n    rows\n\
              [first, ...rest]:\n    rest\n\
@@ -863,7 +863,7 @@ fn csv_stream_rest_bindings_remain_lazy_and_start_at_the_suffix() {
     assert_eq!(output, "2\n2\n");
 
     let full_suffix_source = format!(
-        "rows as List[List[String]] is csv_rows({:?})\n\
+        "rows as CsvStream is csv_rows({:?})\n\
          tail is match rows:\n\
              [...rest]:\n    rest\n\
          end\n\
@@ -878,7 +878,7 @@ fn csv_stream_rest_bindings_remain_lazy_and_start_at_the_suffix() {
     assert_eq!(output, "3\n");
 
     let two_record_suffix_source = format!(
-        "rows as List[List[String]] is csv_rows({:?})\n\
+        "rows as CsvStream is csv_rows({:?})\n\
          tail is match rows:\n\
              [first, second, ...rest]:\n    rest\n\
          end\n\
@@ -896,7 +896,7 @@ fn csv_stream_rest_bindings_remain_lazy_and_start_at_the_suffix() {
     fs::write(&malformed_path, "Ada\n\"unterminated\n")
         .expect("failed to write malformed CSV fixture");
     let malformed_source = format!(
-        "rows as List[List[String]] is csv_rows({:?})\n\
+        "rows as CsvStream is csv_rows({:?})\n\
          result is match rows:\n\
              [first, ...tail]:\n    tail\n\
              _:\n    rows\n\
@@ -2118,7 +2118,7 @@ fn hash_pattern_keys_are_literal_unique_and_or_patterns_round_trip() {
         assert!(error.contains(diagnostic), "{error}");
     }
 
-    let source = "record is hash:\n    name is \"Ada\"\nend\n\
+    let source = "record as Hash is hash:\n    name is \"Ada\"\nend\n\
                   result is match record:\n\
                       {\"name\": person, extra: [0 .. 10, _]} | {name: person, extra: [11 .., _]}:\n\
                           person\n\
@@ -2157,7 +2157,7 @@ fn hash_pattern_coverage_matrix_handles_empty_hash_and_overlapping_keys() {
         ),
         (
             "record is hash:\n    name is \"A\"\nend\n\
-             match record:\n    {name: value}:\n        value\n    {}:\n        0\nend\n",
+             match record:\n    {name: value}:\n        value\n    {}:\n        \"zero\"\nend\n",
             true,
             None,
         ),
@@ -2181,25 +2181,25 @@ fn hash_pattern_coverage_matrix_handles_empty_hash_and_overlapping_keys() {
         ),
         (
             "record is hash:\n    name is \"A\"\nend\n\
-             match record:\n    {name: value}:\n        value\n    {name: \"Budi\"}:\n        0\n    {}:\n        1\nend\n",
+             match record:\n    {name: value}:\n        value\n    {name: \"Budi\"}:\n        \"zero\"\n    {}:\n        \"one\"\nend\n",
             false,
             Some("unreachable match pattern"),
         ),
         (
             "record is hash:\n    name is \"A\"\nend\n\
-             match record:\n    {name: \"A\"}:\n        1\n    {name: value}:\n        value\n    {}:\n        2\nend\n",
+             match record:\n    {name: \"A\"}:\n        \"one\"\n    {name: value}:\n        value\n    {}:\n        \"two\"\nend\n",
             true,
             None,
         ),
         (
             "record is hash:\n    name is \"A\"\n    age is 17\nend\n\
-             match record:\n    {name: value}:\n        value\n    {name: value, age: age}:\n        age\n    {}:\n        0\nend\n",
+             match record:\n    {name: value}:\n        value\n    {name: value, age: age}:\n        type_of(age)\n    {}:\n        \"zero\"\nend\n",
             false,
             Some("unreachable match pattern"),
         ),
         (
             "record is hash:\n    name is \"A\"\n    age is 17\nend\n\
-             match record:\n    {name: value, age: age}:\n        age\n    {name: value}:\n        value\n    {}:\n        0\nend\n",
+             match record:\n    {name: value, age: age}:\n        type_of(age)\n    {name: value}:\n        value\n    {}:\n        \"zero\"\nend\n",
             true,
             None,
         ),
@@ -2230,7 +2230,7 @@ fn nested_hash_patterns_compose_with_struct_enum_tuple_sequence_and_or() {
                       name as String\n\
                       age as Int\n\
                   end\n\
-                  record is hash:\n\
+                  record as Hash is hash:\n\
                       user is hash:\n\
                           name is \"Budi\"\n\
                           age is 20\n\
@@ -2664,10 +2664,19 @@ fn unknown_scrutinee_types_remain_permissive_for_dynamic_nested_patterns() {
                               end\nSayln result\n";
     let (valid, _, error) = check_source(dynamic_hash_value);
     assert!(
-        valid,
-        "Hash nested value was rejected without generic type information: {error}"
+        !valid,
+        "known Int values must reject impossible Struct patterns"
     );
-    let (success, output) = run_source_stdout(dynamic_hash_value);
+    assert!(error.contains("cannot match value of type Int"), "{error}");
+
+    let dynamic_hash_value =
+        dynamic_hash_value.replace("record is hash:", "record as Hash is hash:");
+    let (valid, _, error) = check_source(&dynamic_hash_value);
+    assert!(
+        valid,
+        "explicitly untyped Hash should defer nested checks: {error}"
+    );
+    let (success, output) = run_source_stdout(&dynamic_hash_value);
     assert!(success, "dynamic Hash nested value failed: {output}");
     assert_eq!(output, "dynamic mismatch\n");
 }

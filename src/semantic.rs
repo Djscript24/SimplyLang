@@ -13,6 +13,7 @@ use crate::{
         UnaryOperator, is_parallel_safe_expression,
     },
     error::{DiagnosticCode, SimplyError, Span},
+    runtime::limits,
     types::Type,
 };
 
@@ -50,8 +51,8 @@ pub struct SemanticAnalyzer {
     inferred_return: Option<Type>,
     saw_return: bool,
     module_return_allowed: bool,
-    import_stack: Vec<PathBuf>,
-    import_cache: HashMap<PathBuf, Program>,
+    module_return_type: Option<Type>,
+    imported_types: HashMap<String, Type>,
 }
 
 #[derive(Clone)]
@@ -70,16 +71,6 @@ fn resolve_import_path(current_file: Option<&Path>, path: &str) -> Result<PathBu
     } else {
         base.join(path)
     };
-    if resolved.extension().is_none() {
-        let with_extension = resolved.with_extension("si");
-        if with_extension.is_file() {
-            return Ok(fs::canonicalize(with_extension).map_err(|error| SimplyError::Runtime {
-                span: Span::new(0, 0),
-                code: DiagnosticCode::RuntimeImport,
-                message: format!("could not resolve import `{path}`: {error}"),
-            })?);
-        }
-    }
     fs::canonicalize(&resolved).map_err(|error| SimplyError::Runtime {
         span: Span::new(0, 0),
         code: DiagnosticCode::RuntimeImport,
@@ -245,50 +236,60 @@ impl SemanticAnalyzer {
     }
 
     pub fn analyze(&mut self, program: &Program) -> Result<(), SimplyError> {
-        self.import_stack.clear();
-        self.import_cache.clear();
         self.module_return_allowed = false;
+        self.module_return_type = None;
+        self.imported_types.clear();
         self.collect_structs_and_messages(&program.statements)?;
         self.collect_functions(&program.statements)?;
         self.analyze_statements(&program.statements)
     }
 
     pub fn analyze_file(&mut self, path: &Path) -> Result<(), SimplyError> {
-        let resolved = fs::canonicalize(path)
-            .map_err(|error| SimplyError::Runtime {
-                span: Span::new(0, 0),
-                code: DiagnosticCode::RuntimeImport,
-                message: format!("could not open `{}`: {error}", path.display()),
-            })?;
-        let source = fs::read_to_string(&resolved)
-            .map_err(|error| SimplyError::Runtime {
-                span: Span::new(0, 0),
-                code: DiagnosticCode::RuntimeImport,
-                message: format!("could not read `{}`: {error}", path.display()),
-            })?;
+        let resolved = fs::canonicalize(path).map_err(|error| SimplyError::Runtime {
+            span: Span::new(0, 0),
+            code: DiagnosticCode::RuntimeImport,
+            message: format!("could not open `{}`: {error}", path.display()),
+        })?;
+        let source = fs::read_to_string(&resolved).map_err(|error| SimplyError::Runtime {
+            span: Span::new(0, 0),
+            code: DiagnosticCode::RuntimeImport,
+            message: format!("could not read `{}`: {error}", path.display()),
+        })?;
         let tokens = crate::lexer::Lexer::new(&source).tokenize()?;
         let program = crate::parser::Parser::new(tokens).parse()?;
-        self.import_stack.clear();
-        self.import_cache.clear();
         self.module_return_allowed = false;
-        self.analyze_imports(&program, Some(&resolved), &mut Vec::new())
+        self.module_return_type = None;
+        self.imported_types.clear();
+        let mut import_stack = vec![resolved.clone()];
+        let mut import_cache = HashMap::new();
+        self.analyze_imports(
+            &program,
+            &resolved,
+            &mut import_stack,
+            &mut import_cache,
+            true,
+        )?;
+        Ok(())
     }
 
     fn analyze_imports(
         &mut self,
         program: &Program,
-        current_file: Option<&Path>,
+        current_file: &Path,
         import_stack: &mut Vec<PathBuf>,
-    ) -> Result<(), SimplyError> {
-        let saved_module_return = self.module_return_allowed;
-        self.module_return_allowed = !import_stack.is_empty();
+        import_cache: &mut HashMap<PathBuf, Type>,
+        is_root: bool,
+    ) -> Result<Type, SimplyError> {
+        self.module_return_allowed = !is_root;
         for statement in &program.statements {
             let statement = match statement {
                 Stmt::Located { statement, .. } => statement.as_ref(),
                 statement => statement,
             };
             if let Stmt::Import { path, .. } = statement {
-                let resolved = resolve_import_path(current_file, path)?;
+                let resolved = resolve_import_path(Some(current_file), path).map_err(|error| {
+                    error.with_context(format!("imported by `{}`", current_file.display()))
+                })?;
                 if import_stack.iter().any(|item| item == &resolved) {
                     return Err(SimplyError::Runtime {
                         span: Span::new(0, 0),
@@ -296,29 +297,52 @@ impl SemanticAnalyzer {
                         message: format!("cyclic import of `{path}`"),
                     });
                 }
-                let imported = if let Some(program) = self.import_cache.get(&resolved) {
-                    program.clone()
+                let imported_type = if let Some(typ) = import_cache.get(&resolved) {
+                    typ.clone()
                 } else {
-                    let source = fs::read_to_string(&resolved).map_err(|error| SimplyError::Runtime {
-                        span: Span::new(0, 0),
-                        code: DiagnosticCode::RuntimeImport,
-                        message: format!("could not read `{}`: {error}", resolved.display()),
+                    let source =
+                        fs::read_to_string(&resolved).map_err(|error| SimplyError::Runtime {
+                            span: Span::new(0, 0),
+                            code: DiagnosticCode::RuntimeImport,
+                            message: format!("could not read `{}`: {error}", resolved.display()),
+                        })?;
+                    let imported = (|| {
+                        let tokens = crate::lexer::Lexer::new(&source).tokenize()?;
+                        crate::parser::Parser::new(tokens).parse()
+                    })()
+                    .map_err(|error: SimplyError| {
+                        error.with_context(format!("in imported module `{}`", resolved.display()))
                     })?;
-                    let tokens = crate::lexer::Lexer::new(&source).tokenize()?;
-                    let program = crate::parser::Parser::new(tokens).parse()?;
-                    self.import_cache.insert(resolved.clone(), program.clone());
-                    program
+                    import_stack.push(resolved.clone());
+                    let mut analyzer = SemanticAnalyzer::new();
+                    let result = analyzer
+                        .analyze_imports(&imported, &resolved, import_stack, import_cache, false)
+                        .map_err(|error| {
+                            error.with_context(format!(
+                                "in imported module `{}`",
+                                resolved.display()
+                            ))
+                        });
+                    import_stack.pop();
+                    let typ = result?;
+                    import_cache.insert(resolved.clone(), typ.clone());
+                    typ
                 };
-                import_stack.push(resolved.clone());
-                self.analyze_imports(&imported, Some(&resolved), import_stack)?;
-                import_stack.pop();
+                if let Stmt::Import { alias, .. } = statement {
+                    self.imported_types.insert(alias.clone(), imported_type);
+                }
             }
         }
         self.collect_structs_and_messages(&program.statements)?;
         self.collect_functions(&program.statements)?;
-        let result = self.analyze_statements(&program.statements);
-        self.module_return_allowed = saved_module_return;
-        result
+        self.analyze_statements(&program.statements)?;
+        if !is_root && self.module_return_type.is_none() {
+            return Err(self.error(
+                DiagnosticCode::InvalidReturn,
+                "imported module must return a value",
+            ));
+        }
+        Ok(self.module_return_type.clone().unwrap_or(Type::Unit))
     }
 
     fn collect_structs_and_messages(&mut self, statements: &[Stmt]) -> Result<(), SimplyError> {
@@ -614,6 +638,7 @@ impl SemanticAnalyzer {
                         (element.as_ref().clone(), Type::Array(element.clone()))
                     }
                     Type::List(element) => (element.as_ref().clone(), Type::List(element.clone())),
+                    Type::Range => (Type::Int, Type::Range),
                     Type::Unknown => (Type::Unknown, Type::Unknown),
                     _ => {
                         return Err(self.error(
@@ -728,7 +753,14 @@ impl SemanticAnalyzer {
                     self.analyze_expression(expression)?;
                 }
                 Stmt::Import { alias, .. } => {
-                    self.define_variable(alias.clone(), Type::Unknown, false)?;
+                    self.define_variable(
+                        alias.clone(),
+                        self.imported_types
+                            .get(alias)
+                            .cloned()
+                            .unwrap_or(Type::Unknown),
+                        false,
+                    )?;
                 }
                 Stmt::Struct { .. } => {}
                 Stmt::Enum { .. } => {}
@@ -782,9 +814,7 @@ impl SemanticAnalyzer {
                 } => {
                     let actual = self.analyze_expression(value)?;
                     let expected = declared_type.clone().unwrap_or_else(|| actual.clone());
-                    if !actual.compatible_with(&expected) {
-                        return Err(self.type_error(&expected, &actual, name));
-                    }
+                    self.require_type(&expected, &actual)?;
                     self.define_variable(name.clone(), expected, *mutable)?;
                 }
                 Stmt::Flow {
@@ -814,9 +844,7 @@ impl SemanticAnalyzer {
                         )
                     })?;
                     let actual = self.analyze_expression(value)?;
-                    if !actual.compatible_with(&expected) {
-                        return Err(self.type_error(&expected, &actual, name));
-                    }
+                    self.require_type(&expected, &actual)?;
                 }
                 Stmt::DestructureReassign { pattern, value } => {
                     let actual = self.analyze_expression(value)?;
@@ -846,6 +874,10 @@ impl SemanticAnalyzer {
                             self.require_type(&element, &value_type)?;
                         }
                         Type::Hash => self.require_type(&Type::String, &index_type)?,
+                        Type::HashValues(element) => {
+                            self.require_type(&Type::String, &index_type)?;
+                            self.require_type(&element, &value_type)?;
+                        }
                         _ => {
                             return Err(self.error(
                                 DiagnosticCode::SemanticCollectionOperation,
@@ -980,6 +1012,11 @@ impl SemanticAnalyzer {
                         ));
                     }
                     if self.function_depth == 0 {
+                        if let Some(previous) = self.module_return_type.clone() {
+                            self.require_type(&previous, &actual)?;
+                        } else {
+                            self.module_return_type = Some(actual);
+                        }
                         self.saw_return = true;
                         return Ok(());
                     }
@@ -1158,13 +1195,19 @@ impl SemanticAnalyzer {
                 Ok(Type::Matrix)
             }
             Expr::Hash(entries) | Expr::Tree(entries) => {
+                let mut value_type = None;
                 for (_, value) in entries {
-                    self.analyze_expression(value)?;
+                    let actual = self.analyze_expression(value)?;
+                    value_type = Some(match value_type {
+                        Some(current) => Self::merge_collection_type(&current, &actual),
+                        None => actual,
+                    });
                 }
+                let value_type = value_type.unwrap_or(Type::Unknown);
                 Ok(if matches!(expression, Expr::Hash(_)) {
-                    Type::Hash
+                    Type::HashValues(Box::new(value_type))
                 } else {
-                    Type::Tree
+                    Type::TreeValues(Box::new(value_type))
                 })
             }
             Expr::Unary { operator, operand } => {
@@ -1236,6 +1279,7 @@ impl SemanticAnalyzer {
                 let target_type = self.analyze_expression(target)?;
                 match target_type {
                     Type::Hash | Type::Tree | Type::Unknown => Ok(Type::Unknown),
+                    Type::HashValues(value) | Type::TreeValues(value) => Ok(*value),
                     _ => Err(self.error(
                         DiagnosticCode::SemanticField,
                         format!("value has no field `{name}`"),
@@ -1247,20 +1291,35 @@ impl SemanticAnalyzer {
     }
 
     fn collection_type(&mut self, values: &[Expr], array: bool) -> Result<Type, SimplyError> {
-        let mut element = Type::Unknown;
+        let mut element = None;
         for value in values {
             let actual = self.analyze_expression(value)?;
-            if element == Type::Unknown {
-                element = actual;
-            } else if !actual.compatible_with(&element) {
-                return Err(self.type_error(&element, &actual, "collection element"));
-            }
+            element = Some(match element {
+                Some(current) if !actual.compatible_with(&current) => {
+                    return Err(self.type_error(&current, &actual, "collection element"));
+                }
+                Some(current) => current,
+                None => actual,
+            });
         }
+        let element = element.unwrap_or(Type::Unknown);
         Ok(if array {
             Type::Array(Box::new(element))
         } else {
             Type::List(Box::new(element))
         })
+    }
+
+    fn merge_collection_type(current: &Type, actual: &Type) -> Type {
+        if current == &Type::Unknown || actual == &Type::Unknown {
+            Type::Unknown
+        } else if actual.compatible_with(current) {
+            current.clone()
+        } else if current.compatible_with(actual) {
+            actual.clone()
+        } else {
+            Type::Unknown
+        }
     }
 
     fn binary_type(
@@ -1387,7 +1446,7 @@ impl SemanticAnalyzer {
             "total" => {
                 self.expect_count(name, &argument_types, 1)?;
                 self.require_numeric_iterable(&argument_types[0])?;
-                Ok(Type::Unknown)
+                Ok(self.numeric_sum_type(&argument_types[0]))
             }
             "trim" => {
                 self.expect_count(name, &argument_types, 1)?;
@@ -1586,7 +1645,7 @@ impl SemanticAnalyzer {
             "csv_rows" => {
                 self.expect_count(name, &argument_types, 1)?;
                 self.require_type(&Type::String, &argument_types[0])?;
-                Ok(Type::List(Box::new(Type::List(Box::new(Type::String)))))
+                Ok(Type::CsvStream)
             }
             "csv_row" => Ok(Type::List(Box::new(Type::Unknown))),
             "replace" => {
@@ -1629,7 +1688,7 @@ impl SemanticAnalyzer {
                 for argument in &argument_types {
                     self.require_type(&Type::Int, argument)?;
                 }
-                Ok(Type::Array(Box::new(Type::Int)))
+                Ok(Type::Range)
             }
             _ => {
                 let Some(function) = self.functions.get(name).cloned() else {
@@ -2025,6 +2084,7 @@ impl SemanticAnalyzer {
 
         let sequence_element_type = match typ {
             Type::Array(element) | Type::List(element) => Some((**element).clone()),
+            Type::CsvStream => Some(Type::List(Box::new(Type::String))),
             Type::Unknown if matches!(head, MatchPattern::Sequence { .. }) => Some(Type::Unknown),
             _ => None,
         };
@@ -2055,7 +2115,7 @@ impl SemanticAnalyzer {
             }
         }
 
-        if matches!(typ, Type::Hash | Type::Unknown) {
+        if matches!(typ, Type::Hash | Type::HashValues(_) | Type::Unknown) {
             if let MatchPattern::Hash(entries) = head {
                 let candidate = self.expand_hash_pattern(entries, tail);
                 let specialized = matrix
@@ -2067,7 +2127,7 @@ impl SemanticAnalyzer {
                 return self.pattern_vector_is_useful(&specialized, &candidate, &candidate_types);
             }
             if matches!(head, MatchPattern::Wildcard | MatchPattern::Identifier(_))
-                && typ == &Type::Hash
+                && matches!(typ, Type::Hash | Type::HashValues(_))
             {
                 let defaults = self.hash_default_matrix(matrix);
                 return self.pattern_vector_is_useful(&defaults, tail, rest_types);
@@ -2690,7 +2750,7 @@ impl SemanticAnalyzer {
                 Ok(irrefutable)
             }
             MatchPattern::Hash(entries) => {
-                if !matches!(expected, Type::Hash | Type::Unknown) {
+                if !matches!(expected, Type::Hash | Type::HashValues(_) | Type::Unknown) {
                     return Err(self.error(
                         DiagnosticCode::TypeMismatch,
                         format!(
@@ -2700,8 +2760,12 @@ impl SemanticAnalyzer {
                     ));
                 }
                 let irrefutable = entries.is_empty();
+                let value_type = match expected {
+                    Type::HashValues(value_type) => (**value_type).clone(),
+                    _ => Type::Unknown,
+                };
                 for (_, pattern) in entries {
-                    self.validate_match_pattern(pattern, &Type::Unknown, bindings)?;
+                    self.validate_match_pattern(pattern, &value_type, bindings)?;
                 }
                 Ok(irrefutable)
             }
@@ -2712,7 +2776,7 @@ impl SemanticAnalyzer {
                     Literal::Float(_) => Type::Float,
                     Literal::Bool(_) => Type::Bool,
                 };
-                if !literal_type.compatible_with(expected) {
+                if expected != &Type::Unknown && !literal_type.compatible_with(expected) {
                     return Err(self.error(
                         DiagnosticCode::TypeMismatch,
                         format!(
@@ -2789,6 +2853,8 @@ impl SemanticAnalyzer {
                     Type::Array(element) | Type::List(element) => {
                         ((**element).clone(), expected.clone())
                     }
+                    Type::Range => (Type::Int, Type::Range),
+                    Type::CsvStream => (Type::List(Box::new(Type::String)), Type::CsvStream),
                     Type::Unknown => (Type::Unknown, Type::Unknown),
                     _ => {
                         return Err(self.error(
@@ -2968,6 +3034,8 @@ impl SemanticAnalyzer {
         let source_type = self.analyze_expression(source)?;
         let mut item_type = match source_type {
             Type::Array(element) | Type::List(element) => *element,
+            Type::Range => Type::Int,
+            Type::CsvStream => Type::List(Box::new(Type::String)),
             Type::Unknown => Type::Unknown,
             _ => {
                 return Err(self.error(
@@ -3058,7 +3126,9 @@ impl SemanticAnalyzer {
                             "partition must define at least two distinct categories",
                         ));
                     }
-                    return Ok(Type::Hash);
+                    return Ok(Type::HashValues(Box::new(Type::List(Box::new(
+                        item_type.clone(),
+                    )))));
                 }
                 PipelineStep::Sum => {
                     self.require_numeric(&item_type)?;
@@ -3135,12 +3205,29 @@ impl SemanticAnalyzer {
                             "chunk size must be a positive integer",
                         ));
                     }
+                    if usize::try_from(*size).map_or(true, |size| size > limits::MAX_CHUNK_SIZE) {
+                        return Err(self.error(
+                            DiagnosticCode::SemanticCollection,
+                            format!("chunk size cannot exceed {}", limits::MAX_CHUNK_SIZE),
+                        ));
+                    }
                 }
                 PipelineStep::Parallel(workers) => {
                     if *workers <= 0 {
                         return Err(self.error(
                             DiagnosticCode::SemanticCollection,
                             "parallel worker count must be a positive integer",
+                        ));
+                    }
+                    if usize::try_from(*workers)
+                        .map_or(true, |workers| workers > limits::MAX_PARALLEL_WORKERS)
+                    {
+                        return Err(self.error(
+                            DiagnosticCode::SemanticCollection,
+                            format!(
+                                "parallel worker count cannot exceed {}",
+                                limits::MAX_PARALLEL_WORKERS
+                            ),
                         ));
                     }
                 }
@@ -3176,17 +3263,22 @@ impl SemanticAnalyzer {
                 self.require_type(&Type::Int, index)?;
                 Ok((**element).clone())
             }
+            Type::Range => {
+                self.require_type(&Type::Int, index)?;
+                Ok(Type::Int)
+            }
             Type::Tuple(types) => {
                 self.require_type(&Type::Int, index)?;
                 match index_expression {
-                    Expr::Literal(Literal::Int(value)) if *value >= 0 => {
-                        types.get(*value as usize).cloned().ok_or_else(|| {
+                    Expr::Literal(Literal::Int(value)) if *value >= 0 => usize::try_from(*value)
+                        .ok()
+                        .and_then(|index| types.get(index).cloned())
+                        .ok_or_else(|| {
                             self.error(
                                 DiagnosticCode::SemanticTupleIndex,
                                 "tuple index out of bounds",
                             )
-                        })
-                    }
+                        }),
                     Expr::Literal(Literal::Int(_)) => Err(self.error(
                         DiagnosticCode::SemanticTupleIndex,
                         "tuple index must be non-negative",
@@ -3194,9 +3286,12 @@ impl SemanticAnalyzer {
                     _ => Ok(Type::Unknown),
                 }
             }
-            Type::Hash | Type::Tree => {
+            Type::Hash | Type::Tree | Type::HashValues(_) | Type::TreeValues(_) => {
                 self.require_type(&Type::String, index)?;
-                Ok(Type::Unknown)
+                Ok(match target {
+                    Type::HashValues(value) | Type::TreeValues(value) => (**value).clone(),
+                    _ => Type::Unknown,
+                })
             }
             Type::String => {
                 self.require_type(&Type::Int, index)?;
@@ -3222,8 +3317,10 @@ impl SemanticAnalyzer {
     fn element_type(typ: &Type) -> Option<Type> {
         match typ {
             Type::Array(element) | Type::List(element) => Some((**element).clone()),
+            Type::Range => Some(Type::Int),
             Type::Tuple(types) => Some(types.first().cloned().unwrap_or(Type::Unknown)),
             Type::Hash | Type::Tree => Some(Type::Unknown),
+            Type::HashValues(value) | Type::TreeValues(value) => Some((**value).clone()),
             Type::Unknown => Some(Type::Unknown),
             _ => None,
         }
@@ -3233,11 +3330,14 @@ impl SemanticAnalyzer {
         if matches!(
             typ,
             Type::String
+                | Type::Range
                 | Type::Array(_)
                 | Type::List(_)
                 | Type::Tuple(_)
                 | Type::Hash
                 | Type::Tree
+                | Type::HashValues(_)
+                | Type::TreeValues(_)
                 | Type::Unknown
         ) {
             Ok(())
@@ -3252,6 +3352,10 @@ impl SemanticAnalyzer {
     fn require_string_iterable(&self, typ: &Type) -> Result<(), SimplyError> {
         match typ {
             Type::Array(element) | Type::List(element) => self.require_type(&Type::String, element),
+            Type::Hash | Type::Tree => Ok(()),
+            Type::HashValues(element) | Type::TreeValues(element) => {
+                self.require_type(&Type::String, element)
+            }
             Type::Tuple(types) => {
                 for element in types {
                     self.require_type(&Type::String, element)?;
@@ -3276,6 +3380,9 @@ impl SemanticAnalyzer {
                 Ok(())
             }
             Type::Hash | Type::Tree | Type::Unknown => Ok(()),
+            Type::HashValues(element) | Type::TreeValues(element) => {
+                self.require_type(&Type::Bool, element)
+            }
             _ => Err(self.error(
                 DiagnosticCode::SemanticCollection,
                 format!("expected a boolean collection, found {}", typ.name()),
@@ -3286,6 +3393,7 @@ impl SemanticAnalyzer {
     fn require_numeric_iterable(&self, typ: &Type) -> Result<(), SimplyError> {
         match typ {
             Type::Array(element) | Type::List(element) => self.require_numeric(element),
+            Type::Range => Ok(()),
             Type::Tuple(types) => {
                 for element in types {
                     self.require_numeric(element)?;
@@ -3331,6 +3439,22 @@ impl SemanticAnalyzer {
         }
     }
 
+    fn numeric_sum_type(&self, typ: &Type) -> Type {
+        let elements: Vec<&Type> = match typ {
+            Type::Array(element) | Type::List(element) => vec![element],
+            Type::Tuple(elements) => elements.iter().collect(),
+            Type::Range => return Type::Int,
+            _ => return Type::Unknown,
+        };
+        if elements.iter().any(|element| **element == Type::Float) {
+            Type::Float
+        } else if elements.iter().any(|element| **element == Type::Unknown) {
+            Type::Unknown
+        } else {
+            Type::Int
+        }
+    }
+
     fn require_matrix(&self, typ: &Type) -> Result<(), SimplyError> {
         let row_type = match typ {
             Type::Matrix => return Ok(()),
@@ -3345,6 +3469,7 @@ impl SemanticAnalyzer {
         };
         match row_type.as_ref() {
             Type::Array(element) | Type::List(element) => self.require_numeric(element),
+            Type::HashValues(element) | Type::TreeValues(element) => self.require_numeric(element),
             Type::Unknown => Ok(()),
             _ => Err(self.error(
                 DiagnosticCode::SemanticCollection,
@@ -3373,6 +3498,9 @@ impl SemanticAnalyzer {
         }
     }
     fn require_type(&self, expected: &Type, actual: &Type) -> Result<(), SimplyError> {
+        if actual == &Type::Unknown {
+            return Ok(());
+        }
         if actual.compatible_with(expected) {
             Ok(())
         } else {

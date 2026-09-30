@@ -76,6 +76,16 @@ fn runs_direct_sum_builtin() {
     let (success, _, error) = check_source("Sayln total(list [1, \"two\"])\n");
     assert!(!success);
     assert!(error.contains("expected a number") || error.contains("String"));
+
+    let (success, _, error) = check_source(
+        "fn needs_text(value as String):\n    return value\nend\n\
+         numbers is [1, 2]\nneeds_text(total(numbers))\n",
+    );
+    assert!(
+        !success,
+        "numeric total must not remain semantically Unknown"
+    );
+    assert!(error.contains("expected String, found Int"), "{error}");
 }
 
 #[test]
@@ -124,14 +134,16 @@ fn builtin_semantics_match_runtime_collection_and_numeric_support() {
     assert!(success, "{output}");
     assert_eq!(output, "Float\n");
 
-    for source in [
-        "Sayln any(list [1, 2])\n",
-        "Sayln join(hash:\n    name is \"Ada\"\nend, \",\")\n",
-        "Sayln round(1e308, 15)\n",
-    ] {
-        let (success, _, error) = check_source(source);
+    let (success, stdout) = run_source_stdout(
+        "profile is hash:\n    name is \"Ada\"\nend\nSayln join(profile, \",\")\n",
+    );
+    assert!(success);
+    assert_eq!(stdout, "Ada\n");
+
+    for source in ["Sayln any(list [1, 2])\n", "Sayln round(1e308, 15)\n"] {
+        let (success, output, error) = check_source(source);
         if source.contains("round") {
-            assert!(success, "{error}");
+            assert!(success, "{output}{error}");
             let (ran, runtime_error) = run_source(source);
             assert!(!ran);
             assert!(
@@ -142,6 +154,21 @@ fn builtin_semantics_match_runtime_collection_and_numeric_support() {
             assert!(!success, "{error}");
         }
     }
+}
+
+#[test]
+fn type_of_reports_range_and_csv_stream_as_distinct_runtime_kinds() {
+    let (success, stdout) =
+        run_source_stdout("Sayln type_of(range(1, 3))\nSayln type_of(csv_rows(\"unused.csv\"))\n");
+    assert!(success);
+    assert_eq!(stdout, "Range\nCsvStream\n");
+
+    let (success, _, error) = check_source("value as Array[Int] is range(1, 3)\n");
+    assert!(!success, "Range must not be an Array type alias");
+    assert!(
+        error.contains("expected Array[Int], found Range"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -189,10 +216,50 @@ fn checks_tuple_and_matrix_index_shapes() {
 }
 
 #[test]
+fn matrix_indices_reject_negative_and_unrepresentable_coordinates_safely() {
+    for source in [
+        "grid is matrix [[1]]\nSayln grid[-1, 0]\n",
+        "grid is matrix [[1]]\nSayln grid[9223372036854775807, 0]\n",
+    ] {
+        let (success, error) = run_source(source);
+        assert!(!success, "invalid matrix coordinate unexpectedly succeeded");
+        assert!(
+            error.contains("matrix index") || error.contains("out of bounds"),
+            "{error}"
+        );
+        assert!(error.contains("error[E"), "{error}");
+    }
+}
+
+#[test]
 fn indexes_tree_values_consistently_with_hash_values() {
     let (success, error) =
         run_source("profile is tree:\n    name is \"Ada\"\nend\nSayln profile[\"name\"]\n");
     assert!(success, "unexpected tree index error: {error}");
+}
+
+#[test]
+fn hash_and_tree_values_retain_indexed_value_types() {
+    for source in [
+        "profile is hash:\n    name is \"Ada\"\nend\nSayln profile[\"name\"] + 1\n",
+        "profile is tree:\n    name is \"Ada\"\nend\nSayln profile[\"name\"] + 1\n",
+    ] {
+        let (success, _, error) = check_source(source);
+        assert!(!success, "invalid collection value type was accepted");
+        assert!(
+            error.contains("expected") || error.contains("TypeMismatch"),
+            "{error}"
+        );
+    }
+
+    let (success, _, error) = check_source(
+        "mut profile is tree:\n    name is \"Ada\"\nend\nprofile[\"name\"] -> \"Lin\"\n",
+    );
+    assert!(
+        !success,
+        "Tree indexed writes must be rejected during checking"
+    );
+    assert!(error.contains("is not mutable"), "{error}");
 }
 
 #[test]

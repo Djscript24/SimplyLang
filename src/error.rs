@@ -317,6 +317,56 @@ pub enum SimplyError {
 }
 
 impl SimplyError {
+    pub(crate) fn with_context(self, context: String) -> Self {
+        match self {
+            Self::Lex {
+                span,
+                code,
+                message,
+            } => Self::Lex {
+                span,
+                code,
+                message: format!("{context}: {message}"),
+            },
+            Self::Parse {
+                span,
+                code,
+                message,
+            } => Self::Parse {
+                span,
+                code,
+                message: format!("{context}: {message}"),
+            },
+            Self::Semantic {
+                span,
+                code,
+                message,
+            } => Self::Semantic {
+                span,
+                code,
+                message: format!("{context}: {message}"),
+            },
+            Self::Runtime {
+                span,
+                code,
+                message,
+            } => Self::Runtime {
+                span,
+                code,
+                message: format!("{context}: {message}"),
+            },
+            Self::Command {
+                span,
+                code,
+                message,
+            } => Self::Command {
+                span,
+                code,
+                message: format!("{context}: {message}"),
+            },
+        }
+    }
+
     pub fn category(&self) -> DiagnosticCategory {
         match self {
             Self::Lex { .. } => DiagnosticCategory::Lex,

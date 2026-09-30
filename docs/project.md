@@ -23,6 +23,19 @@ the fixture is intentionally not a standalone program. Declarative Flow demos
 live under `examples/10-flow/`; benchmark programs and large input fixtures
 live under `examples/99-bench/`.
 
+`simply check` uses the shared semantic analyzer and recursively checks
+canonicalized imports relative to each importing module without executing them.
+`simply run` and the REPL intentionally do not run a static preflight: they keep
+runtime type and operation checks, and imports execute in isolated module
+evaluators. `fmt`, `bench`, `explain`, and `explain-flow` parse and semantically
+analyze the current source using that same analyzer; they do not execute
+imports during their analysis. `bench` subsequently executes the source for its
+runtime measurement, so it may perform the program's normal side effects.
+
+Function calls are limited to 16 nested invocations to prevent stack exhaustion.
+Parallel flows accept at most 64 workers, a chunk size of 1,000,000 values, and
+100,000 chunks; results are merged in source order.
+
 Rust integration tests in `tests/*.rs` are handled by Cargo and are not
 SimplyLang test files. They are grouped by user-facing language domain, with
 shared CLI helpers in `tests/common/`. Nested files, non-`.si` files, examples,

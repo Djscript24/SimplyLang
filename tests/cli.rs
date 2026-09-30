@@ -1,6 +1,13 @@
 mod common;
 use common::*;
-use std::{fs, io::Write, path::Path, process::Command, process::Stdio, sync::atomic::Ordering};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    process::Command,
+    process::Stdio,
+    sync::atomic::Ordering,
+};
 
 #[test]
 fn runs_basic_values() {
@@ -26,45 +33,251 @@ fn compiler_foundation_example_scans_its_source_file() {
 
 #[test]
 fn every_runnable_example_is_a_conformance_regression() {
-    let runnable_examples = [
-        "examples/01-basics/values.si",
-        "examples/02-variables/assignment.si",
-        "examples/03-operators/arithmetic.si",
-        "examples/03-operators/logic.si",
-        "examples/04-control-flow/break-continue.si",
-        "examples/04-control-flow/conditionals.si",
-        "examples/04-control-flow/loops.si",
-        "examples/04-control-flow/while.si",
-        "examples/05-functions/functions.si",
-        "examples/05-functions/closures.si",
-        "examples/06-collections/arrays-lists.si",
-        "examples/06-collections/hash-tree.si",
-        "examples/06-collections/matrices.si",
-        "examples/06-collections/tuples.si",
-        "examples/07-pipelines/collections.si",
-        "examples/08-standard-library/builtins.si",
-        "examples/08-standard-library/collections.si",
-        "examples/08-standard-library/inspection.si",
-        "examples/08-standard-library/strings.si",
-        "examples/09-quality/message-objects.si",
-        "examples/09-quality/scope-and-short-circuit.si",
-        "examples/13-objects/person.si",
-        "examples/04-control-flow/try-catch-finally.si",
-        "examples/10-flow/overview.si",
-        "examples/10-flow/aggregates.si",
-        "examples/10-flow/quality-partition.si",
-        "examples/10-flow/partition-categories.si",
-        "examples/10-flow/parallel-scalar.si",
-        "examples/10-flow/checkpoint-write.si",
-        "examples/10-flow/csv-cleanup.si",
-        "examples/11-compiler-foundations/mini-lexer.si",
-        "examples/99-smoke/smoke.si",
-    ];
-
-    for path in runnable_examples {
-        let output = run_example(path);
-        assert!(!output.is_empty(), "example produced no output: {path}");
+    fn copy_tree(source: &Path, destination: &Path) {
+        fs::create_dir_all(destination).expect("failed to create copied examples directory");
+        for entry in fs::read_dir(source).expect("failed to list examples") {
+            let entry = entry.expect("failed to read examples entry");
+            let path = entry.path();
+            let target = destination.join(entry.file_name());
+            if path.is_dir() {
+                copy_tree(&path, &target);
+            } else {
+                fs::copy(&path, &target).expect("failed to copy example fixture");
+            }
+        }
     }
+
+    fn collect_sources(directory: &Path, examples: &Path, paths: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(directory).expect("failed to list examples directory") {
+            let path = entry
+                .expect("failed to read example directory entry")
+                .path();
+            if path.is_dir() {
+                collect_sources(&path, examples, paths);
+            } else if path.extension().is_some_and(|extension| extension == "si") {
+                let relative = path
+                    .strip_prefix(examples)
+                    .expect("example source should be under examples");
+                if relative.starts_with("99-bench")
+                    || relative == Path::new("08-standard-library/imported-values.si")
+                    || relative == Path::new("11-compiler-foundations/sample-source.si")
+                {
+                    continue;
+                }
+                paths.push(relative.to_path_buf());
+            }
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!(
+        "simply-example-conformance-{}-{}",
+        std::process::id(),
+        TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let examples = Path::new("examples");
+    copy_tree(examples, &root.join(examples));
+    let mut paths = Vec::new();
+    collect_sources(examples, examples, &mut paths);
+    paths.sort();
+
+    for path in paths {
+        let source_path = root.join(examples).join(&path);
+        let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+            .args([
+                "run",
+                source_path.to_str().expect("test path was not UTF-8"),
+            ])
+            .current_dir(&root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to start example");
+        let mut child = output;
+        if path == Path::new("16-user-input/ask.si") {
+            child
+                .stdin
+                .as_mut()
+                .expect("interactive example stdin should be piped")
+                .write_all(b"Ada\n25\ntrue\n")
+                .expect("failed to provide deterministic example input");
+        }
+        drop(child.stdin.take());
+        let output = child.wait_with_output().expect("failed to run example");
+        assert!(
+            output.status.success(),
+            "example failed: {}\n{}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !output.stdout.is_empty(),
+            "example produced no output: {}",
+            path.display()
+        );
+    }
+    fs::remove_dir_all(root).expect("failed to clean copied examples");
+}
+
+#[test]
+fn check_recursively_analyzes_imported_modules_and_their_returned_types() {
+    let root = std::env::temp_dir().join(format!(
+        "simply-check-imports-{}-{}",
+        std::process::id(),
+        TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(root.join("nested")).expect("failed to create import test directory");
+    fs::write(root.join("leaf.si"), "return list [4, 8]\n").expect("failed to write imported leaf");
+    fs::write(
+        root.join("nested/middle.si"),
+        "open \"../leaf.si\" as values\nreturn values\n",
+    )
+    .expect("failed to write nested import");
+    let main = root.join("main.si");
+    fs::write(
+        &main,
+        "open \"nested/middle.si\" as values\n\
+             open \"leaf.si\" as duplicate\n\
+             Sayln values[0] + duplicate[1]\n",
+    )
+    .expect("failed to write import entry point");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["check", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to check imported program");
+    let _ = fs::remove_dir_all(root);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn check_propagates_semantic_errors_from_imported_modules() {
+    let root = std::env::temp_dir().join(format!(
+        "simply-check-invalid-import-{}-{}",
+        std::process::id(),
+        TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&root).expect("failed to create import test directory");
+    fs::write(root.join("bad.si"), "return 2 + \"bad\"\n").expect("failed to write invalid module");
+    let main = root.join("main.si");
+    fs::write(&main, "open \"bad.si\" as value\n").expect("failed to write import entry point");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["check", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to check invalid imported program");
+    let error = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(error.contains("error[E0003]"), "{error}");
+    assert!(error.contains("bad.si"), "{error}");
+
+    fs::write(root.join("values.si"), "return list [2, 4]\n")
+        .expect("failed to write typed imported module");
+    fs::write(
+        &main,
+        "open \"values.si\" as values\nSayln values[0] + \"wrong\"\n",
+    )
+    .expect("failed to write invalid imported value use");
+    let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["check", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to check imported value type");
+    let _ = fs::remove_dir_all(root);
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(error.contains("expected"), "{error}");
+}
+
+#[test]
+fn check_parses_imported_sources_without_executing_them() {
+    let root = std::env::temp_dir().join(format!(
+        "simply-check-import-no-exec-{}-{}",
+        std::process::id(),
+        TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&root).expect("failed to create import test directory");
+    let marker = root.join("executed.txt");
+    fs::write(
+        root.join("side-effect.si"),
+        format!(
+            "write_file({:?}, \"executed\")\nreturn 7\n",
+            marker.to_str().expect("marker path must be UTF-8")
+        ),
+    )
+    .expect("failed to write side-effect module");
+    let main = root.join("main.si");
+    fs::write(&main, "open \"side-effect.si\" as value\n")
+        .expect("failed to write import entry point");
+
+    let checked = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["check", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to check side-effect import");
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    assert!(
+        !marker.exists(),
+        "static checking executed the imported module"
+    );
+
+    fs::write(root.join("invalid.si"), "return (1 +\n")
+        .expect("failed to write syntactically invalid module");
+    fs::write(&main, "open \"invalid.si\" as value\n")
+        .expect("failed to write invalid import entry point");
+    let invalid = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["check", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to check syntactically invalid import");
+    let error = String::from_utf8_lossy(&invalid.stderr);
+    assert!(!invalid.status.success());
+    assert!(error.contains("invalid.si"), "{error}");
+    assert!(error.contains("Parse error"), "{error}");
+
+    fs::remove_dir_all(root).expect("failed to remove import test directory");
+}
+
+#[test]
+fn check_reports_import_cycles_and_missing_modules() {
+    let root = std::env::temp_dir().join(format!(
+        "simply-check-import-errors-{}-{}",
+        std::process::id(),
+        TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&root).expect("failed to create import test directory");
+    let main = root.join("main.si");
+    fs::write(
+        root.join("cycle.si"),
+        "open \"main.si\" as main\nreturn main\n",
+    )
+    .expect("failed to write cyclic module");
+    fs::write(&main, "open \"cycle.si\" as cycle\n").expect("failed to write cycle entry point");
+    let cycle = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["check", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to check cyclic imports");
+    let cycle_error = String::from_utf8_lossy(&cycle.stderr);
+    assert!(!cycle.status.success());
+    assert!(cycle_error.contains("cyclic import"), "{cycle_error}");
+
+    fs::write(&main, "open \"missing.si\" as missing\n")
+        .expect("failed to write missing import entry point");
+    let missing = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["check", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to check missing import");
+    let missing_error = String::from_utf8_lossy(&missing.stderr);
+    let _ = fs::remove_dir_all(root);
+    assert!(!missing.status.success());
+    assert!(missing_error.contains("could not open"), "{missing_error}");
 }
 
 #[test]
@@ -76,6 +289,7 @@ fn cli_commands_use_expected_exit_codes_and_streams() {
         vec!["tokens", "examples/01-basics/values.si"],
         vec!["bench", "examples/99-smoke/smoke.si"],
         vec!["explain", "examples/05-functions/closures.si"],
+        vec!["explain-flow", "examples/10-flow/overview.si"],
         vec!["ast", "examples/01-basics/values.si"],
         vec!["fmt", "examples/01-basics/values.si"],
         vec!["test"],
@@ -84,22 +298,29 @@ fn cli_commands_use_expected_exit_codes_and_streams() {
 
     for arguments in commands {
         let output = Command::new(binary)
-            .args(arguments)
+            .args(&arguments)
             .output()
             .expect("failed to run Simply CLI command");
-        assert!(output.status.success());
-        assert!(output.stderr.is_empty());
+        assert!(
+            output.status.success(),
+            "command failed: {arguments:?}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "unexpected stderr for {arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     let no_arguments = Command::new(binary)
         .output()
         .expect("failed to run Simply without arguments");
     assert!(no_arguments.status.success());
-    assert!(String::from_utf8_lossy(&no_arguments.stdout).contains("USAGE:"));
-    assert!(
-        !String::from_utf8_lossy(&no_arguments.stdout)
-            .contains("test               Run tests/*.si files")
-    );
+    let help = String::from_utf8_lossy(&no_arguments.stdout);
+    assert!(help.contains("USAGE:"));
+    assert!(help.contains("test               Run direct tests/*.si files"));
+    assert!(help.contains("explain-flow <file.si>"));
     assert!(no_arguments.stderr.is_empty());
 
     let version = Command::new(binary)

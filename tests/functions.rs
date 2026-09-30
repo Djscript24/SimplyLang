@@ -9,6 +9,24 @@ fn runs_functions_with_typed_parameters() {
 }
 
 #[test]
+fn direct_and_mutual_recursion_stop_at_the_call_depth_limit() {
+    for source in [
+        "fn recurse(value as Int) gives Int:\n    return recurse(value + 1)\nend\nrecurse(0)\n",
+        "fn first(value as Int) gives Int:\n    return second(value + 1)\nend\n\
+         fn second(value as Int) gives Int:\n    return first(value + 1)\nend\n\
+         first(0)\n",
+    ] {
+        let (success, error) = run_source(source);
+        assert!(!success, "unbounded recursion unexpectedly succeeded");
+        assert!(
+            error.contains("function call depth exceeds the limit"),
+            "{error}"
+        );
+        assert!(error.contains("error[E0206]"), "{error}");
+    }
+}
+
+#[test]
 fn nested_functions_resolve_lexical_bindings() {
     let (success, output) = run_source_stdout(
         "fn make_adder(base as Int):\n\

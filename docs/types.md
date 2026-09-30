@@ -1,12 +1,17 @@
 # SimplyLang Types
 
-The interpreter supports `Unit`, `String`, `Int`, `Float`, `Bool`, `Array[T]`, `List[T]`, `Tuple[T1, T2, ...]`, `Hash`, `Tree`, `Matrix`, and function types internally.
+The interpreter supports `Unit`, `String`, `Int`, `Float`, `Bool`, `Range`, `CsvStream`, `Array[T]`, `List[T]`, `Tuple[T1, T2, ...]`, `Hash`, `Tree`, `Matrix`, and function types internally.
 
 An unannotated binding receives the inferred type of its initial expression. Bindings are immutable by default; prefix a declaration with `mut` to permit reassignment and collection mutation. A reassignment must remain compatible with the binding's type. Explicit annotations are checked when the value is defined, reassigned, inserted into a collection, or passed to a typed function parameter.
 
-`Int` and `Float` are both numeric. Arithmetic involving either float produces `Float`; otherwise it produces `Int`. Floating-point arithmetic rejects non-finite results (`NaN`, positive infinity, and negative infinity) as runtime arithmetic errors. Division or remainder by zero is always an error. `Unknown` is used internally for values whose shape cannot be established statically, such as imported values and dynamic fields. Compatibility treats nested `Unknown` values as wildcards for collection, tuple, and function types.
+`Int` and `Float` are both numeric. Arithmetic involving either float produces `Float`; otherwise it produces `Int`. Floating-point arithmetic rejects non-finite results (`NaN`, positive infinity, and negative infinity) as runtime arithmetic errors. Division or remainder by zero is always an error. `Unknown` is reserved for genuinely unavailable type information. It is not type-compatible with an unrelated concrete type at the top level; semantic checks defer only when an expression's actual type is unknown, leaving that check to the runtime. Nested unknown element information is deferred to runtime checks. Empty collections retain unknown element types because there is no value from which to infer one.
 
-Arrays and lists are homogeneous. Tuple elements may have different types and tuple indexing with a known integer index is checked statically. Hash and tree keys are strings. Matrix dimensions and numeric contents are validated by the runtime operations.
+Arrays and lists are homogeneous. Tuple elements may have different types and tuple indexing with a known integer index is checked statically. Hash and tree keys are strings; inferred hash/tree literals retain a common value type for indexed reads and collection checks when their values agree. A heterogeneous map retains an unknown value type. Tree indexed writes are intentionally rejected, while Hash indexed writes require a mutable binding. Matrix dimensions and numeric contents are validated by the runtime operations.
+
+`range(...)` values have runtime type `Range`; `csv_rows(...)` values have
+runtime type `CsvStream`. These are not aliases for arrays or lists. A Flow can
+consume them as streaming sources; the checker's Flow analysis understands
+their yielded item types.
 
 Function parameters and declared return types are optional. A function without an explicit return annotation returns `Unit` when it reaches the end. A typed function must return a compatible value on every possible branch.
 

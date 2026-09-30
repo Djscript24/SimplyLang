@@ -1107,6 +1107,8 @@ impl Parser {
             "Int" => Type::Int,
             "Float" => Type::Float,
             "Bool" => Type::Bool,
+            "Range" => Type::Range,
+            "CsvStream" => Type::CsvStream,
             "Array" => Type::Array(Box::new(Type::Int)),
             "List" => Type::List(Box::new(Type::Int)),
             "Hash" => Type::Hash,

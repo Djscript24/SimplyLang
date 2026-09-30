@@ -95,6 +95,13 @@ After installation, use `simply` instead of `cargo run --`, for example:
 simply run path/to/program.si
 ```
 
+## Security model
+
+Simply is a trusted local scripting language, not a sandbox. A `.si` program
+can read and write files and otherwise access resources available to the
+operating-system process running it. Only run programs from sources you trust;
+Simply does not restrict filesystem access to the project or source directory.
+
 
 ## Language Basics
 
@@ -448,6 +455,8 @@ simply fmt <file.si>       # Format source text
 simply tokens <file.si>    # Print lexer tokens
 simply ast <file.si>       # Print the parsed AST
 simply bench <file.si>     # Measure front-end and runtime phases
+simply explain <file.si>       # Explain program structure and runtime model
+simply explain-flow <file.si>  # Print a Flow execution plan
 simply test                # Run direct tests/*.si files
 simply repl                # Start the interactive evaluator
 simply --help              # Show command usage

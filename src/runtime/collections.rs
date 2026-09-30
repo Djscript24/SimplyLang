@@ -23,7 +23,8 @@ pub(crate) fn index(
                 .get(column)
                 .cloned()
                 .ok_or_else(|| error(span, "matrix index out of bounds")),
-            _ => Err(error(span, "matrix row is not an array")),
+            Some(_) => Err(error(span, "matrix row is not an array")),
+            None => Err(error(span, "matrix index out of bounds")),
         };
     }
     if let Value::Hash(values) | Value::Tree(values) = target {
@@ -114,7 +115,10 @@ pub(crate) fn mutate_list(
 
 fn coordinate(value: &Value, span: Option<&Span>) -> Result<usize, SimplyError> {
     match value {
-        Value::Int(value) if *value >= 0 => Ok(*value as usize),
+        Value::Int(value) if *value >= 0 => {
+            usize::try_from(*value).map_err(|_| error(span, "matrix index is out of bounds"))
+        }
+        Value::Int(_) => Err(error(span, "matrix index must be non-negative")),
         _ => Err(error(span, "matrix index must be integer")),
     }
 }

@@ -196,8 +196,8 @@ fn runtime_accepts_unit_range_and_csv_stream_declared_types() {
                  return print(\"unit\")\n\
              end\n\
              no_op()\n\
-             values as Array[Int] is range(1, 3)\n\
-             rows as List[List[String]] is csv_rows(\"{}\")\n\
+             values as Range is range(1, 3)\n\
+             rows as CsvStream is csv_rows(\"{}\")\n\
              flow total from rows:\n\
                  count\n\
              end\n\

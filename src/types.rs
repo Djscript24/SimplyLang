@@ -15,7 +15,9 @@ pub enum Type {
     List(Box<Type>),
     Tuple(Vec<Type>),
     Hash,
+    HashValues(Box<Type>),
     Tree,
+    TreeValues(Box<Type>),
     Matrix,
     Struct(String),
     Enum(String),
@@ -43,7 +45,9 @@ impl Type {
                 types.iter().map(Self::name).collect::<Vec<_>>().join(", ")
             ),
             Self::Hash => "Hash".into(),
+            Self::HashValues(_) => "Hash".into(),
             Self::Tree => "Tree".into(),
+            Self::TreeValues(_) => "Tree".into(),
             Self::Matrix => "Matrix".into(),
             Self::Struct(name) => name.clone(),
             Self::Enum(name) => name.clone(),
@@ -52,17 +56,27 @@ impl Type {
     }
 
     pub fn compatible_with(&self, expected: &Self) -> bool {
+        self.compatible_at(expected, false)
+    }
+
+    fn compatible_at(&self, expected: &Self, nested: bool) -> bool {
         match (self, expected) {
-            (Self::Unknown, _) | (_, Self::Unknown) => true,
+            (Self::Unknown, Self::Unknown) => true,
+            (Self::Unknown, _) | (_, Self::Unknown) => nested,
             (Self::Range, Self::Range) | (Self::CsvStream, Self::CsvStream) => true,
+            (Self::HashValues(_), Self::Hash) | (Self::TreeValues(_), Self::Tree) => true,
+            (Self::HashValues(actual), Self::HashValues(expected))
+            | (Self::TreeValues(actual), Self::TreeValues(expected)) => {
+                actual.compatible_at(expected, true)
+            }
             (Self::Array(actual), Self::Array(expected))
-            | (Self::List(actual), Self::List(expected)) => actual.compatible_with(expected),
+            | (Self::List(actual), Self::List(expected)) => actual.compatible_at(expected, true),
             (Self::Tuple(actual), Self::Tuple(expected)) => {
                 actual.len() == expected.len()
                     && actual
                         .iter()
                         .zip(expected)
-                        .all(|(actual, expected)| actual.compatible_with(expected))
+                        .all(|(actual, expected)| actual.compatible_at(expected, true))
             }
             (
                 Self::Function {
@@ -77,13 +91,13 @@ impl Type {
                 actual_parameters.len() == expected_parameters.len()
                     && actual_parameters.iter().zip(expected_parameters).all(
                         |(actual, expected)| match (actual, expected) {
-                            (Some(actual), Some(expected)) => actual.compatible_with(expected),
+                            (Some(actual), Some(expected)) => actual.compatible_at(expected, true),
                             (None, None) => true,
                             _ => false,
                         },
                     )
                     && match (actual_return, expected_return) {
-                        (Some(actual), Some(expected)) => actual.compatible_with(expected),
+                        (Some(actual), Some(expected)) => actual.compatible_at(expected, true),
                         (None, None) => true,
                         _ => false,
                     }
@@ -104,10 +118,11 @@ mod tests {
     }
 
     #[test]
-    fn unknown_is_compatible_without_changing_concrete_types() {
-        assert!(Type::Unknown.compatible_with(&Type::Int));
-        assert!(Type::Int.compatible_with(&Type::Unknown));
+    fn unknown_does_not_override_concrete_type_compatibility() {
+        assert!(!Type::Unknown.compatible_with(&Type::Int));
+        assert!(!Type::Int.compatible_with(&Type::Unknown));
         assert!(!Type::Int.compatible_with(&Type::String));
+        assert!(Type::Unknown.compatible_with(&Type::Unknown));
     }
 
     #[test]
@@ -128,5 +143,12 @@ mod tests {
             Type::Tuple(vec![Type::Unknown, Type::String])
                 .compatible_with(&Type::Tuple(vec![Type::Int, Type::String]))
         );
+    }
+
+    #[test]
+    fn unknown_is_not_a_universal_type_compatibility_fallback() {
+        assert!(!Type::Unknown.compatible_with(&Type::Int));
+        assert!(!Type::Int.compatible_with(&Type::Unknown));
+        assert!(Type::Unknown.compatible_with(&Type::Unknown));
     }
 }

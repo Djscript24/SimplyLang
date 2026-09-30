@@ -231,6 +231,7 @@ fn usage() {
     println!("    bench <file.si>    Benchmark the compiler and runtime");
     println!("    explain <file.si>  Explain program structure and runtime model");
     println!("    explain-flow <file.si>  Print a Flow execution plan");
+    println!("    test               Run direct tests/*.si files");
     println!("    repl               Start the interactive evaluator");
     println!();
     println!("{}", stdout_paint("OPTIONS:", YELLOW));
@@ -891,10 +892,6 @@ fn render_cli_error(path: &PathBuf, message: impl Into<String>) {
         },
         "",
     );
-}
-
-fn check_source(source: &str) -> Result<(), SimplyError> {
-    validate_source(source)
 }
 
 fn check_path(path: &Path) -> Result<(), SimplyError> {

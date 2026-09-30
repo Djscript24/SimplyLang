@@ -1,11 +1,16 @@
 //! evaluator.rs — runtime execution engine
 //! Evaluates validated Simply programs, manages scopes and functions, and executes control flow and pipelines.
 //! Key components: Evaluator, TypeScopes, Flow, and Function.
+mod checkpoint;
+mod csv;
+mod parallel;
+mod pattern;
+
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
     fs,
-    io::{self, BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write},
+    io::{self, BufRead, BufReader, IsTerminal, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -20,7 +25,7 @@ use crate::{
     lexer::Lexer,
     parser::Parser,
     runtime::{
-        collections, operations,
+        collections, files, limits, operations,
         scope::ScopeStack,
         value::{
             CsvStreamVersion, EnumValue, FunctionValue, StructInstance, Value, owned_map_values,
@@ -29,366 +34,6 @@ use crate::{
     },
     types::Type,
 };
-
-struct CheckpointState {
-    position: usize,
-    output_len: u64,
-    output_checksum: u64,
-    input_path: String,
-    output_path: String,
-    input_len: u64,
-    input_modified_ns: u128,
-}
-
-fn modified_time_ns(path: &str) -> Result<u128, String> {
-    let modified = fs::metadata(path)
-        .map_err(|error| format!("could not inspect checkpoint input `{path}`: {error}"))?
-        .modified()
-        .map_err(|error| format!("could not read modification time for `{path}`: {error}"))?;
-    modified
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .map_err(|_| format!("checkpoint input `{path}` has an invalid modification time"))
-}
-
-fn output_prefix_checksum(path: &str, length: u64) -> Result<u64, String> {
-    let file = fs::File::open(path)
-        .map_err(|error| format!("could not read checkpoint output `{path}`: {error}"))?;
-    let mut reader = BufReader::new(file.take(length));
-    let mut checksum = 0xcbf29ce484222325u64;
-    let mut buffer = [0u8; 8192];
-    loop {
-        let count = reader
-            .read(&mut buffer)
-            .map_err(|error| format!("could not read checkpoint output `{path}`: {error}"))?;
-        if count == 0 {
-            break;
-        }
-        for byte in &buffer[..count] {
-            checksum = (checksum ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
-        }
-    }
-    Ok(checksum)
-}
-
-fn encode_checkpoint_path(path: &str) -> String {
-    path.as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-fn decode_checkpoint_path(encoded: &str) -> Result<String, String> {
-    if !encoded.len().is_multiple_of(2) {
-        return Err("invalid encoded checkpoint path".into());
-    }
-    let bytes = (0..encoded.len())
-        .step_by(2)
-        .map(|index| u8::from_str_radix(&encoded[index..index + 2], 16))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| "invalid encoded checkpoint path")?;
-    String::from_utf8(bytes).map_err(|_| "checkpoint path is not valid UTF-8".into())
-}
-
-fn read_checkpoint(path: &str) -> Result<Option<CheckpointState>, String> {
-    match fs::read_to_string(path) {
-        Ok(value) => {
-            let invalid = || format!("checkpoint `{path}` contains invalid recovery state");
-            let mut fields = value.lines();
-            let position = fields
-                .next()
-                .ok_or_else(invalid)?
-                .parse::<usize>()
-                .map_err(|_| invalid())?;
-            let output_len = fields
-                .next()
-                .ok_or_else(invalid)?
-                .parse::<u64>()
-                .map_err(|_| invalid())?;
-            let output_checksum = fields
-                .next()
-                .ok_or_else(invalid)?
-                .parse::<u64>()
-                .map_err(|_| invalid())?;
-            let input_len = fields
-                .next()
-                .ok_or_else(invalid)?
-                .parse::<u64>()
-                .map_err(|_| invalid())?;
-            let input_modified_ns = fields
-                .next()
-                .ok_or_else(invalid)?
-                .parse::<u128>()
-                .map_err(|_| invalid())?;
-            let input_path = decode_checkpoint_path(fields.next().ok_or_else(invalid)?)
-                .map_err(|_| invalid())?;
-            let output_path = decode_checkpoint_path(fields.next().ok_or_else(invalid)?)
-                .map_err(|_| invalid())?;
-            if fields.next().is_some() {
-                return Err(invalid());
-            }
-            Ok(Some(CheckpointState {
-                position,
-                output_len,
-                output_checksum,
-                input_path,
-                output_path,
-                input_len,
-                input_modified_ns,
-            }))
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("could not read checkpoint `{path}`: {error}")),
-    }
-}
-
-fn write_checkpoint(path: &str, state: &CheckpointState) -> Result<(), String> {
-    let temporary = format!("{path}.tmp");
-    let contents = format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
-        state.position,
-        state.output_len,
-        state.output_checksum,
-        state.input_len,
-        state.input_modified_ns,
-        encode_checkpoint_path(&state.input_path),
-        encode_checkpoint_path(&state.output_path),
-    );
-    fs::write(&temporary, contents)
-        .map_err(|error| format!("could not write checkpoint `{path}`: {error}"))?;
-    fs::rename(&temporary, path)
-        .map_err(|error| format!("could not replace checkpoint `{path}`: {error}"))
-}
-
-fn checkpoint_progress(
-    path: Option<&str>,
-    processed: usize,
-    interval: usize,
-    output: Option<&mut fs::File>,
-    input_path: &str,
-    output_path: Option<&str>,
-) -> Result<(), String> {
-    if let Some(path) = path
-        && processed.is_multiple_of(interval)
-    {
-        let output_len = if let Some(output) = output {
-            output
-                .flush()
-                .map_err(|error| format!("could not flush checkpoint output: {error}"))?;
-            output
-                .metadata()
-                .map_err(|error| format!("could not inspect checkpoint output: {error}"))?
-                .len()
-        } else {
-            return Err("checkpoint requires a CSV output sink".into());
-        };
-        let output_path =
-            output_path.ok_or_else(|| "checkpoint requires an output path".to_string())?;
-        let output_checksum = output_prefix_checksum(output_path, output_len)?;
-        let input_metadata = fs::metadata(input_path).map_err(|error| {
-            format!("could not inspect checkpoint input `{input_path}`: {error}")
-        })?;
-        write_checkpoint(
-            path,
-            &CheckpointState {
-                position: processed,
-                output_len,
-                output_checksum,
-                input_path: input_path.into(),
-                output_path: output_path.into(),
-                input_len: input_metadata.len(),
-                input_modified_ns: modified_time_ns(input_path)?,
-            },
-        )?;
-    }
-    Ok(())
-}
-
-fn remove_checkpoint(path: &str) -> Result<(), String> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("could not remove checkpoint `{path}`: {error}")),
-    }
-}
-
-fn validate_checkpoint_source(
-    state: &CheckpointState,
-    input_path: &str,
-    output_path: &str,
-) -> Result<(), String> {
-    if state.input_path != input_path || state.output_path != output_path {
-        return Err("checkpoint input or output path does not match this Flow".into());
-    }
-    let input_len = fs::metadata(input_path)
-        .map_err(|error| format!("could not inspect checkpoint input `{input_path}`: {error}"))?
-        .len();
-    if state.input_len != input_len || state.input_modified_ns != modified_time_ns(input_path)? {
-        return Err(format!(
-            "checkpoint input `{input_path}` changed since the checkpoint was written"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_checkpoint_output(state: &CheckpointState, output_path: &str) -> Result<(), String> {
-    let output_len = fs::metadata(output_path)
-        .map_err(|error| format!("could not inspect checkpoint output `{output_path}`: {error}"))?
-        .len();
-    if state.output_len > output_len {
-        return Err(format!(
-            "checkpoint output length exceeds the current output file `{output_path}`"
-        ));
-    }
-    if output_prefix_checksum(output_path, state.output_len)? != state.output_checksum {
-        return Err(format!(
-            "checkpoint output `{output_path}` changed since the checkpoint was written"
-        ));
-    }
-    Ok(())
-}
-
-fn resolved_path(path: &str) -> Result<PathBuf, String> {
-    let path = Path::new(path);
-    if let Ok(resolved) = fs::canonicalize(path) {
-        return Ok(resolved);
-    }
-    let name = path
-        .file_name()
-        .ok_or_else(|| format!("path `{}` has no file name", path.display()))?;
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let parent = fs::canonicalize(parent).map_err(|error| {
-        format!(
-            "could not resolve directory `{}`: {error}",
-            parent.display()
-        )
-    })?;
-    Ok(parent.join(name))
-}
-
-fn paths_are_same(left: &str, right: &str) -> Result<bool, String> {
-    Ok(resolved_path(left)? == resolved_path(right)?)
-}
-
-fn parse_csv_record(line: &str) -> Result<Vec<Value>, String> {
-    #[derive(Clone, Copy)]
-    enum FieldState {
-        Start,
-        Unquoted,
-        Quoted,
-        AfterQuote,
-    }
-
-    let mut fields = Vec::new();
-    let mut field = String::new();
-    let mut state = FieldState::Start;
-    let mut chars = line.chars().peekable();
-    while let Some(character) = chars.next() {
-        match state {
-            FieldState::Start => match character {
-                '"' => state = FieldState::Quoted,
-                ',' => fields.push(Value::String(String::new())),
-                _ => {
-                    field.push(character);
-                    state = FieldState::Unquoted;
-                }
-            },
-            FieldState::Unquoted => match character {
-                '"' => return Err("quote inside an unquoted field".into()),
-                ',' => {
-                    fields.push(Value::String(std::mem::take(&mut field)));
-                    state = FieldState::Start;
-                }
-                _ => field.push(character),
-            },
-            FieldState::Quoted => match character {
-                '"' if chars.peek() == Some(&'"') => {
-                    field.push('"');
-                    chars.next();
-                }
-                '"' => state = FieldState::AfterQuote,
-                _ => field.push(character),
-            },
-            FieldState::AfterQuote => match character {
-                ',' => {
-                    fields.push(Value::String(std::mem::take(&mut field)));
-                    state = FieldState::Start;
-                }
-                _ => return Err("unexpected character after a quoted field".into()),
-            },
-        }
-    }
-    if matches!(state, FieldState::Quoted) {
-        return Err("unterminated quoted field".into());
-    }
-    fields.push(Value::String(field));
-    Ok(fields)
-}
-
-fn read_csv_record<R: BufRead>(reader: &mut R) -> Result<Option<String>, std::io::Error> {
-    let mut record = String::new();
-    let mut line = String::new();
-    let mut quoted = false;
-    let mut at_field_start = true;
-
-    loop {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            return Ok((!record.is_empty()).then_some(record));
-        }
-        record.push_str(&line);
-        let mut characters = line.chars().peekable();
-        while let Some(character) = characters.next() {
-            if quoted {
-                if character == '"' {
-                    if characters.peek() == Some(&'"') {
-                        characters.next();
-                    } else {
-                        quoted = false;
-                    }
-                }
-            } else if character == '"' && at_field_start {
-                quoted = true;
-                at_field_start = false;
-            } else {
-                at_field_start = character == ',';
-            }
-        }
-        if !quoted {
-            return Ok(Some(record));
-        }
-        at_field_start = true;
-    }
-}
-
-fn csv_field(value: &Value) -> Result<String, String> {
-    match value {
-        Value::String(value) => {
-            if value.contains([',', '"', '\n', '\r']) {
-                Ok(format!("\"{}\"", value.replace('"', "\"\"")))
-            } else {
-                Ok(value.clone())
-            }
-        }
-        Value::Int(value) => Ok(value.to_string()),
-        Value::Float(value) if value.is_finite() => Ok(value.to_string()),
-        Value::Bool(value) => Ok(value.to_string()),
-        Value::Unit => Ok(String::new()),
-        _ => Err("write_csv supports strings, numbers, booleans, and Unit fields".into()),
-    }
-}
-
-fn write_csv_row(output: &mut impl Write, values: &[Value]) -> Result<(), String> {
-    let mut fields = Vec::with_capacity(values.len());
-    for value in values {
-        fields.push(csv_field(value)?);
-    }
-    writeln!(output, "{}", fields.join(","))
-        .map_err(|error| format!("could not write CSV: {error}"))
-}
 
 fn clamp_numeric(
     value: Value,
@@ -1087,6 +732,7 @@ pub struct Evaluator {
     import_stack: Vec<PathBuf>,
     import_cache: Rc<RefCell<HashMap<PathBuf, Arc<Program>>>>,
     output_enabled: bool,
+    call_depth: usize,
 }
 
 struct TypeScopes {
@@ -1318,172 +964,6 @@ enum Flow {
     Return(Value),
     Break,
     Continue,
-}
-
-/// Values that can cross a parallel worker boundary.  Functions and mutable
-/// collections deliberately do not implement this subset: they would either
-/// require sharing the evaluator's Rc state or make evaluation order visible.
-#[derive(Clone)]
-enum ParallelValue {
-    String(String),
-    Int(i64),
-    Float(f64),
-    Bool(bool),
-}
-
-#[cfg(test)]
-static PARALLEL_THREAD_IDS: std::sync::LazyLock<std::sync::Mutex<HashSet<std::thread::ThreadId>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
-
-impl ParallelValue {
-    fn from_value(value: &Value) -> Option<Self> {
-        match value {
-            Value::String(value) => Some(Self::String(value.clone())),
-            Value::Int(value) => Some(Self::Int(*value)),
-            Value::Float(value) => Some(Self::Float(*value)),
-            Value::Bool(value) => Some(Self::Bool(*value)),
-            _ => None,
-        }
-    }
-
-    fn into_value(self) -> Value {
-        match self {
-            Self::String(value) => Value::String(value),
-            Self::Int(value) => Value::Int(value),
-            Self::Float(value) => Value::Float(value),
-            Self::Bool(value) => Value::Bool(value),
-        }
-    }
-
-    fn as_value(&self) -> Value {
-        self.clone().into_value()
-    }
-}
-
-fn evaluate_parallel_expression(
-    expression: &Expr,
-    item: &ParallelValue,
-) -> Result<ParallelValue, String> {
-    let value = match expression {
-        Expr::Literal(Literal::String(value)) => Value::String(value.clone()),
-        Expr::Literal(Literal::Int(value)) => Value::Int(*value),
-        Expr::Literal(Literal::Float(value)) => Value::Float(*value),
-        Expr::Literal(Literal::Bool(value)) => Value::Bool(*value),
-        Expr::Identifier(name) if name == "item" => item.as_value(),
-        Expr::Unary { operator, operand } => {
-            let operand = evaluate_parallel_expression(operand, item)?.into_value();
-            operations::unary(operand, operator, None).map_err(|error| error.to_string())?
-        }
-        Expr::Binary {
-            left,
-            operator,
-            right,
-        } => {
-            let left = evaluate_parallel_expression(left, item)?.into_value();
-            let right = evaluate_parallel_expression(right, item)?.into_value();
-            operations::binary(left, operator, right, None).map_err(|error| error.to_string())?
-        }
-        _ => return Err("expression is outside the parallel-safe subset".into()),
-    };
-    ParallelValue::from_value(&value)
-        .ok_or_else(|| "parallel expressions must produce scalar values".into())
-}
-
-fn evaluate_parallel_chunk(
-    input: &[ParallelValue],
-    transforms: &[PipelineStep],
-) -> Result<Vec<ParallelValue>, String> {
-    let mut output = Vec::with_capacity(input.len());
-    for input in input {
-        let mut current = Some(input.clone());
-        for step in transforms {
-            if current.is_none() {
-                break;
-            }
-            match step {
-                PipelineStep::Where(expression) => {
-                    let item = current
-                        .as_ref()
-                        .ok_or_else(|| "pipeline item was lost".to_string())?;
-                    let result = evaluate_parallel_expression(expression, item)?;
-                    match result {
-                        ParallelValue::Bool(true) => {}
-                        ParallelValue::Bool(false) => current = None,
-                        _ => return Err("pipeline `where` condition must return a boolean".into()),
-                    }
-                }
-                PipelineStep::Derive(expression) => {
-                    let item = current
-                        .as_ref()
-                        .ok_or_else(|| "pipeline item was lost".to_string())?;
-                    current = Some(evaluate_parallel_expression(expression, item)?);
-                }
-                _ => {}
-            }
-        }
-        if let Some(current) = current {
-            output.push(current);
-        }
-    }
-    Ok(output)
-}
-
-fn evaluate_parallel(
-    values: Vec<Value>,
-    transforms: &[PipelineStep],
-    requested_workers: usize,
-    requested_chunk_size: Option<usize>,
-) -> Result<Vec<Value>, String> {
-    let input: Vec<ParallelValue> = values
-        .iter()
-        .map(|value| {
-            ParallelValue::from_value(value).ok_or_else(|| {
-                "values or expressions are outside the parallel-safe subset".to_string()
-            })
-        })
-        .collect::<Result<_, _>>()?;
-    let requested_workers = requested_workers.max(1);
-    let chunk_size = requested_chunk_size
-        .unwrap_or_else(|| input.len().div_ceil(requested_workers))
-        .max(1);
-    let chunks: Vec<Vec<ParallelValue>> = input
-        .chunks(chunk_size)
-        .map(<[ParallelValue]>::to_vec)
-        .collect();
-    let workers = requested_workers.min(chunks.len().max(1));
-    let chunks = Arc::new(chunks);
-    let mut results = (0..chunks.len()).map(|_| None).collect::<Vec<_>>();
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(workers);
-        for worker_index in 0..workers {
-            let chunks = Arc::clone(&chunks);
-            handles.push(scope.spawn(move || {
-                #[cfg(test)]
-                PARALLEL_THREAD_IDS
-                    .lock()
-                    .expect("parallel test lock")
-                    .insert(std::thread::current().id());
-                let mut completed = Vec::new();
-                for index in (worker_index..chunks.len()).step_by(workers) {
-                    let result = evaluate_parallel_chunk(&chunks[index], transforms)?;
-                    completed.push((index, result));
-                }
-                Ok::<_, String>(completed)
-            }));
-        }
-        for handle in handles {
-            for (index, result) in handle.join().map_err(|_| "parallel worker panicked")?? {
-                results[index] = Some(result);
-            }
-        }
-        Ok::<_, String>(())
-    })?;
-    Ok(results
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(ParallelValue::into_value)
-        .collect())
 }
 
 #[derive(Clone)]
@@ -1875,6 +1355,9 @@ impl Evaluator {
                     let value = self.evaluate(value)?;
                     if let Some(expected) = self.variable_types.lookup(name)
                         && let Type::Array(element) | Type::List(element) = expected
+                    {
+                        self.ensure_type(&value, element, name)?;
+                    } else if let Some(Type::HashValues(element)) = self.variable_types.lookup(name)
                     {
                         self.ensure_type(&value, element, name)?;
                     }
@@ -2452,7 +1935,7 @@ impl Evaluator {
                             );
                         }
                     };
-                    fs::write(&path, content).map_err(|error| {
+                    files::atomic_write(Path::new(&path), content.as_bytes()).map_err(|error| {
                         self.runtime_error(format!("could not write file `{path}`: {error}"))
                     })?;
                     return Ok(Value::Unit);
@@ -3177,294 +2660,6 @@ impl Evaluator {
         )))
     }
 
-    fn match_value_pattern(
-        &self,
-        pattern: &crate::ast::MatchPattern,
-        value: &Value,
-    ) -> Result<Option<Vec<(String, Value)>>, SimplyError> {
-        let matched = match pattern {
-            crate::ast::MatchPattern::Wildcard => Some(Vec::new()),
-            crate::ast::MatchPattern::Literal(literal) => {
-                let literal = match literal {
-                    crate::ast::Literal::String(value) => Value::String(value.clone()),
-                    crate::ast::Literal::Int(value) => Value::Int(*value),
-                    crate::ast::Literal::Float(value) => Value::Float(*value),
-                    crate::ast::Literal::Bool(value) => Value::Bool(*value),
-                };
-                literal.eq(value).then(Vec::new)
-            }
-            crate::ast::MatchPattern::Range { start, end } => {
-                let Value::Int(value) = value else {
-                    return Ok(None);
-                };
-                let starts_before_or_at = match start {
-                    Some(crate::ast::Literal::Int(start)) => *value >= *start,
-                    Some(_) => return Ok(None),
-                    None => true,
-                };
-                let ends_after_or_at = match end {
-                    Some(crate::ast::Literal::Int(end)) => *value <= *end,
-                    Some(_) => return Ok(None),
-                    None => true,
-                };
-                (starts_before_or_at && ends_after_or_at).then(Vec::new)
-            }
-            crate::ast::MatchPattern::Or(alternatives) => {
-                let mut bindings = None;
-                for alternative in alternatives {
-                    if let Some(matched) = self.match_value_pattern(alternative, value)? {
-                        bindings = Some(matched);
-                        break;
-                    }
-                }
-                bindings
-            }
-            crate::ast::MatchPattern::Identifier(name) => Some(vec![(name.clone(), value.clone())]),
-            crate::ast::MatchPattern::Alias { name, pattern } => {
-                let Some(mut bindings) = self.match_value_pattern(pattern, value)? else {
-                    return Ok(None);
-                };
-                bindings.push((name.clone(), value.clone()));
-                Some(bindings)
-            }
-            crate::ast::MatchPattern::Tuple(patterns) => {
-                let Value::Tuple(values) = value else {
-                    return Ok(None);
-                };
-                if patterns.len() != values.len() {
-                    return Ok(None);
-                }
-                let mut bindings = Vec::new();
-                for (pattern, value) in patterns.iter().zip(values.iter()) {
-                    let Some(nested) = self.match_value_pattern(pattern, value)? else {
-                        return Ok(None);
-                    };
-                    bindings.extend(nested);
-                }
-                Some(bindings)
-            }
-            crate::ast::MatchPattern::Sequence { patterns, rest } => {
-                let (values, rest_value) = match value {
-                    Value::Array(values) => {
-                        if values.len() < patterns.len()
-                            || (rest.is_none() && values.len() != patterns.len())
-                        {
-                            return Ok(None);
-                        }
-                        let tail = rest.as_ref().map(|_| {
-                            Value::Array(shared_values(values[patterns.len()..].to_vec()))
-                        });
-                        (values[..patterns.len()].to_vec(), tail)
-                    }
-                    Value::List(values) => {
-                        if values.len() < patterns.len()
-                            || (rest.is_none() && values.len() != patterns.len())
-                        {
-                            return Ok(None);
-                        }
-                        let tail = rest
-                            .as_ref()
-                            .map(|_| Value::List(shared_values(values[patterns.len()..].to_vec())));
-                        (values[..patterns.len()].to_vec(), tail)
-                    }
-                    Value::Range { start, end } => {
-                        let length = (i128::from(*end) - i128::from(*start)).max(0);
-                        if length < patterns.len() as i128
-                            || (rest.is_none() && length != patterns.len() as i128)
-                        {
-                            return Ok(None);
-                        }
-                        let mut values = Vec::with_capacity(patterns.len());
-                        for index in 0..patterns.len() {
-                            let index = i128::try_from(index).ok();
-                            let Some(value) = index
-                                .and_then(|index| i64::try_from(i128::from(*start) + index).ok())
-                            else {
-                                return Ok(None);
-                            };
-                            values.push(Value::Int(value));
-                        }
-                        let tail = if rest.is_some() {
-                            let rest_start = if length == 0 {
-                                *start
-                            } else {
-                                let offset = i128::try_from(patterns.len()).map_err(|_| {
-                                    self.runtime_error(
-                                        "sequence pattern length exceeds the supported range"
-                                            .into(),
-                                    )
-                                })?;
-                                i64::try_from(i128::from(*start) + offset).map_err(|_| {
-                                    self.runtime_error(
-                                        "range rest position exceeds the supported range".into(),
-                                    )
-                                })?
-                            };
-                            Some(Value::Range {
-                                start: rest_start,
-                                end: if length == 0 { rest_start } else { *end },
-                            })
-                        } else {
-                            None
-                        };
-                        (values, tail)
-                    }
-                    Value::CsvStream {
-                        path,
-                        start_record,
-                        start_offset,
-                        source_version,
-                    } => {
-                        let Some((values, tail)) = self.read_csv_sequence_prefix(
-                            path,
-                            *start_record,
-                            *start_offset,
-                            source_version.as_ref(),
-                            patterns.len(),
-                            rest.is_some(),
-                        )?
-                        else {
-                            return Ok(None);
-                        };
-                        (values, tail)
-                    }
-                    _ => return Ok(None),
-                };
-                let mut bindings = Vec::new();
-                for (pattern, value) in patterns.iter().zip(values.iter()) {
-                    let Some(nested) = self.match_value_pattern(pattern, value)? else {
-                        return Ok(None);
-                    };
-                    bindings.extend(nested);
-                }
-                if let (Some(name), Some(value)) = (rest, rest_value) {
-                    bindings.push((name.clone(), value));
-                }
-                Some(bindings)
-            }
-            crate::ast::MatchPattern::Hash(patterns) => {
-                let Value::Hash(values) = value else {
-                    return Ok(None);
-                };
-                let mut bindings = Vec::new();
-                for (key, pattern) in patterns {
-                    let Some(value) = values.get(key) else {
-                        return Ok(None);
-                    };
-                    let Some(nested) = self.match_value_pattern(pattern, value)? else {
-                        return Ok(None);
-                    };
-                    bindings.extend(nested);
-                }
-                Some(bindings)
-            }
-            crate::ast::MatchPattern::Struct { type_name, fields } => {
-                let Value::Struct(instance) = value else {
-                    return Ok(None);
-                };
-                if instance.type_name != *type_name {
-                    return Ok(None);
-                }
-                let Some(definition) = self.lookup_struct(type_name) else {
-                    return Ok(None);
-                };
-                if fields.len() != definition.fields.len() {
-                    return Ok(None);
-                }
-                let instance_fields = instance.fields.borrow();
-                let mut bindings = Vec::new();
-                for (pattern, field) in fields.iter().zip(&definition.fields) {
-                    let Some(value) = instance_fields.get(&field.name) else {
-                        return Ok(None);
-                    };
-                    let Some(nested) = self.match_value_pattern(pattern, value)? else {
-                        return Ok(None);
-                    };
-                    bindings.extend(nested);
-                }
-                Some(bindings)
-            }
-            crate::ast::MatchPattern::EnumVariant {
-                enum_name,
-                variant_name,
-                payload,
-            } => {
-                let Value::Enum(enum_value) = value else {
-                    return Ok(None);
-                };
-                if enum_value.enum_name != *enum_name || enum_value.variant_name != *variant_name {
-                    return Ok(None);
-                }
-                match (&enum_value.payload, payload) {
-                    (None, None) => Some(Vec::new()),
-                    (Some(value), Some(pattern)) => self.match_value_pattern(pattern, value)?,
-                    _ => None,
-                }
-            }
-        };
-        Ok(matched)
-    }
-
-    fn read_csv_sequence_prefix(
-        &self,
-        path: &str,
-        start_record: usize,
-        start_offset: u64,
-        source_version: Option<&CsvStreamVersion>,
-        expected_length: usize,
-        has_rest: bool,
-    ) -> Result<Option<(Vec<Value>, Option<Value>)>, SimplyError> {
-        let file = fs::File::open(path).map_err(|error| self.file_error(Path::new(path), error))?;
-        let current_version = Self::csv_stream_version(&file, path, self)?;
-        let mut reader = BufReader::new(file);
-        Self::seek_csv_stream(
-            &mut reader,
-            path,
-            start_record,
-            start_offset,
-            source_version,
-            &current_version,
-            self,
-        )?;
-        let mut rows = Vec::with_capacity(expected_length);
-        for _ in 0..expected_length {
-            let Some(record) = read_csv_record(&mut reader)
-                .map_err(|error| self.file_error(Path::new(path), error))?
-            else {
-                return Ok(None);
-            };
-            let line = record.strip_suffix('\n').unwrap_or(&record);
-            let line = line.strip_suffix('\r').unwrap_or(line);
-            let row = parse_csv_record(line).map_err(|message| {
-                self.runtime_error(format!("invalid CSV row in `{path}`: {message}"))
-            })?;
-            rows.push(Value::List(shared_values(row)));
-        }
-        let tail = if has_rest {
-            let suffix_record = start_record.checked_add(expected_length).ok_or_else(|| {
-                self.runtime_error("CSV stream position exceeds the supported range".into())
-            })?;
-            let suffix_offset = reader
-                .stream_position()
-                .map_err(|error| self.file_error(Path::new(path), error))?;
-            Some(Value::CsvStream {
-                path: path.to_owned(),
-                start_record: suffix_record,
-                start_offset: suffix_offset,
-                source_version: Some(current_version),
-            })
-        } else {
-            if read_csv_record(&mut reader)
-                .map_err(|error| self.file_error(Path::new(path), error))?
-                .is_some()
-            {
-                return Ok(None);
-            }
-            None
-        };
-        Ok(Some((rows, tail)))
-    }
-
     fn csv_stream_version(
         file: &fs::File,
         path: &str,
@@ -3502,7 +2697,7 @@ impl Evaluator {
             .seek(SeekFrom::Start(0))
             .map_err(|error| evaluator.file_error(Path::new(path), error))?;
         for _ in 0..start_record {
-            if read_csv_record(reader)
+            if csv::read_record(reader)
                 .map_err(|error| evaluator.file_error(Path::new(path), error))?
                 .is_none()
             {
@@ -3612,55 +2807,72 @@ impl Evaluator {
                 self.ensure_type(value, expected, parameter)?;
             }
         }
-        self.push_scope();
-        for (capture, value) in function.captures.borrow().iter() {
-            self.variable_types
-                .define(capture.clone(), Self::type_of_value(value), false);
-            self.scopes
-                .define(capture.clone(), value.clone(), false)
-                .map_err(|error| {
-                    self.runtime_error_with_code(DiagnosticCode::DuplicateDeclaration, error)
-                })?;
+        if self.call_depth >= limits::MAX_CALL_DEPTH {
+            return Err(self.runtime_error_with_code(
+                DiagnosticCode::RuntimeGeneral,
+                format!(
+                    "function call depth exceeds the limit of {}",
+                    limits::MAX_CALL_DEPTH
+                ),
+            ));
         }
-        for ((parameter, _, mutable), value) in function.parameters.iter().zip(values) {
-            self.variable_types
-                .define(parameter.clone(), Self::type_of_value(&value), *mutable);
-            self.scopes
-                .define(parameter.clone(), value, *mutable)
-                .map_err(|error| {
-                    self.runtime_error_with_code(DiagnosticCode::DuplicateDeclaration, error)
-                })?;
-        }
-        let is_message_invocation = message_instance.is_some();
-        if let Some(instance) = message_instance.as_ref() {
-            self.active_message_states.push(ActiveMessageState {
-                instance: instance.clone(),
-                scope_index: self.scopes.current_scope_index(),
-            });
-        }
-        let result = self.execute_statements(&function.body);
-        if is_message_invocation {
-            self.active_message_states.pop();
-        }
-        let result = match result {
-            Ok(flow) => match flow {
-                Flow::None => Value::Unit,
-                Flow::Return(value) => value,
-                Flow::Break | Flow::Continue => {
-                    self.pop_scope();
-                    return Err(self.runtime_error("break/continue used outside a loop".into()));
-                }
-            },
-            Err(error) => {
-                self.pop_scope();
-                return Err(error);
+        self.call_depth += 1;
+        let result = (|| {
+            self.push_scope();
+            for (capture, value) in function.captures.borrow().iter() {
+                self.variable_types
+                    .define(capture.clone(), Self::type_of_value(value), false);
+                self.scopes
+                    .define(capture.clone(), value.clone(), false)
+                    .map_err(|error| {
+                        self.runtime_error_with_code(DiagnosticCode::DuplicateDeclaration, error)
+                    })?;
             }
-        };
-        self.pop_scope();
-        if let Some(expected) = &function.return_type {
-            self.ensure_type(&result, expected, name)?;
-        }
-        Ok(result)
+            for ((parameter, _, mutable), value) in function.parameters.iter().zip(values) {
+                self.variable_types.define(
+                    parameter.clone(),
+                    Self::type_of_value(&value),
+                    *mutable,
+                );
+                self.scopes
+                    .define(parameter.clone(), value, *mutable)
+                    .map_err(|error| {
+                        self.runtime_error_with_code(DiagnosticCode::DuplicateDeclaration, error)
+                    })?;
+            }
+            let is_message_invocation = message_instance.is_some();
+            if let Some(instance) = message_instance.as_ref() {
+                self.active_message_states.push(ActiveMessageState {
+                    instance: instance.clone(),
+                    scope_index: self.scopes.current_scope_index(),
+                });
+            }
+            let result = self.execute_statements(&function.body);
+            if is_message_invocation {
+                self.active_message_states.pop();
+            }
+            let result = match result {
+                Ok(flow) => match flow {
+                    Flow::None => Value::Unit,
+                    Flow::Return(value) => value,
+                    Flow::Break | Flow::Continue => {
+                        self.pop_scope();
+                        return Err(self.runtime_error("break/continue used outside a loop".into()));
+                    }
+                },
+                Err(error) => {
+                    self.pop_scope();
+                    return Err(error);
+                }
+            };
+            self.pop_scope();
+            if let Some(expected) = &function.return_type {
+                self.ensure_type(&result, expected, name)?;
+            }
+            Ok(result)
+        })();
+        self.call_depth -= 1;
+        result
     }
 
     fn evaluate_values(&mut self, expressions: &[Expr]) -> Result<Vec<Value>, SimplyError> {
@@ -3785,9 +2997,23 @@ impl Evaluator {
         let input = fs::File::open(input_path)
             .map_err(|error| self.file_error(Path::new(input_path), error))?;
         let chunk_size = steps.iter().find_map(|step| match step {
-            PipelineStep::Chunk(size) => Some(*size as usize),
+            PipelineStep::Chunk(size) => Some(*size),
             _ => None,
         });
+        let chunk_size = chunk_size
+            .map(|size| {
+                usize::try_from(size)
+                    .map_err(|_| self.runtime_error("chunk size is out of bounds".into()))
+            })
+            .transpose()?;
+        if let Some(size) = chunk_size
+            && (size == 0 || size > limits::MAX_CHUNK_SIZE)
+        {
+            return Err(self.runtime_error(format!(
+                "chunk size must be between 1 and {}",
+                limits::MAX_CHUNK_SIZE
+            )));
+        }
         let checkpoint_path = steps.iter().find_map(|step| match step {
             PipelineStep::Checkpoint(path) => Some(path),
             _ => None,
@@ -3802,7 +3028,7 @@ impl Evaluator {
                 None => None,
             };
             if let Some(output_path) = output_path.as_deref()
-                && paths_are_same(input_path, output_path)
+                && checkpoint::paths_are_same(input_path, output_path)
                     .map_err(|message| self.runtime_error(message))?
             {
                 return Err(self.runtime_error(
@@ -3815,9 +3041,9 @@ impl Evaluator {
                     .into_iter()
                     .flatten()
                 {
-                    if paths_are_same(checkpoint_path, protected_path)
+                    if checkpoint::paths_are_same(checkpoint_path, protected_path)
                         .map_err(|message| self.runtime_error(message))?
-                        || paths_are_same(&temporary_checkpoint, protected_path)
+                        || checkpoint::paths_are_same(&temporary_checkpoint, protected_path)
                             .map_err(|message| self.runtime_error(message))?
                     {
                         return Err(self.runtime_error(
@@ -3829,7 +3055,7 @@ impl Evaluator {
             }
             let checkpoint_state = checkpoint_path
                 .as_deref()
-                .map(read_checkpoint)
+                .map(checkpoint::read_checkpoint)
                 .transpose()
                 .map_err(|message| self.runtime_error(message))?
                 .flatten();
@@ -3845,9 +3071,9 @@ impl Evaluator {
                 let output_path = output_path.as_deref().ok_or_else(|| {
                     self.runtime_error("checkpoint output path is missing".into())
                 })?;
-                validate_checkpoint_source(state, input_path, output_path)
+                checkpoint::validate_checkpoint_source(state, input_path, output_path)
                     .map_err(|message| self.runtime_error(message))?;
-                validate_checkpoint_output(state, output_path)
+                checkpoint::validate_checkpoint_output(state, output_path)
                     .map_err(|message| self.runtime_error(message))?;
             }
             if resume_at > 0 && !matches!(terminal, PipelineStep::WriteCsv(_)) {
@@ -3909,7 +3135,7 @@ impl Evaluator {
                 self,
             )?;
             let mut index = start_record;
-            while let Some(record) = read_csv_record(&mut reader)
+            while let Some(record) = csv::read_record(&mut reader)
                 .map_err(|error| self.file_error(Path::new(input_path), error))?
             {
                 if index < resume_at {
@@ -3918,7 +3144,7 @@ impl Evaluator {
                 }
                 let line = record.strip_suffix('\n').unwrap_or(&record);
                 let line = line.strip_suffix('\r').unwrap_or(line);
-                let row = parse_csv_record(line).map_err(|message| {
+                let row = csv::parse_record(line).map_err(|message| {
                     self.runtime_error(format!("invalid CSV row in `{input_path}`: {message}"))
                 })?;
                 let mut current = Some(Value::List(shared_values(row)));
@@ -3955,7 +3181,7 @@ impl Evaluator {
                 }
                 let Some(value) = current else {
                     index += 1;
-                    checkpoint_progress(
+                    checkpoint::checkpoint_progress(
                         checkpoint_path.as_deref(),
                         index,
                         interval,
@@ -3981,7 +3207,7 @@ impl Evaluator {
                         values.push(value);
                     }
                     index += 1;
-                    checkpoint_progress(
+                    checkpoint::checkpoint_progress(
                         checkpoint_path.as_deref(),
                         index,
                         interval,
@@ -4028,7 +3254,7 @@ impl Evaluator {
                                 ));
                             }
                         };
-                        write_csv_row(
+                        csv::write_row(
                             output
                                 .as_mut()
                                 .expect("write_csv output should be initialized"),
@@ -4039,7 +3265,7 @@ impl Evaluator {
                     _ => unreachable!(),
                 }
                 index += 1;
-                checkpoint_progress(
+                checkpoint::checkpoint_progress(
                     checkpoint_path.as_deref(),
                     index,
                     interval,
@@ -4083,7 +3309,8 @@ impl Evaluator {
             if terminal_result.is_ok()
                 && let Some(path) = checkpoint_path.as_deref()
             {
-                remove_checkpoint(path).map_err(|message| self.runtime_error(message))?;
+                checkpoint::remove_checkpoint(path)
+                    .map_err(|message| self.runtime_error(message))?;
             }
             terminal_result
         })();
@@ -4262,18 +3489,49 @@ impl Evaluator {
         } else {
             steps
         };
-        let parallel_workers = steps.iter().find_map(|step| match step {
-            PipelineStep::Parallel(workers) => Some(*workers as usize),
-            _ => None,
-        });
-        let chunk_size = steps.iter().find_map(|step| match step {
-            PipelineStep::Chunk(size) => Some(*size as usize),
-            _ => None,
-        });
+        let parallel_workers = steps
+            .iter()
+            .find_map(|step| match step {
+                PipelineStep::Parallel(workers) => Some(*workers),
+                _ => None,
+            })
+            .map(|workers| {
+                usize::try_from(workers).map_err(|_| {
+                    self.runtime_error("parallel worker count is out of bounds".into())
+                })
+            })
+            .transpose()?;
+        let chunk_size = steps
+            .iter()
+            .find_map(|step| match step {
+                PipelineStep::Chunk(size) => Some(*size),
+                _ => None,
+            })
+            .map(|size| {
+                usize::try_from(size)
+                    .map_err(|_| self.runtime_error("chunk size is out of bounds".into()))
+            })
+            .transpose()?;
         if let Some(workers) = parallel_workers {
             if workers == 0 {
                 return Err(self.runtime_error("parallel worker count must be positive".into()));
             }
+            if workers > limits::MAX_PARALLEL_WORKERS {
+                return Err(self.runtime_error(format!(
+                    "parallel worker count cannot exceed {}",
+                    limits::MAX_PARALLEL_WORKERS
+                )));
+            }
+        }
+        if let Some(size) = chunk_size
+            && (size == 0 || size > limits::MAX_CHUNK_SIZE)
+        {
+            return Err(self.runtime_error(format!(
+                "chunk size must be between 1 and {}",
+                limits::MAX_CHUNK_SIZE
+            )));
+        }
+        if let Some(workers) = parallel_workers {
             if !matches!(
                 terminal,
                 Some(
@@ -4307,7 +3565,7 @@ impl Evaluator {
             }) {
                 return Err(self.runtime_error("`parallel` requires scalar source items".into()));
             }
-            match evaluate_parallel(input, transforms, workers, chunk_size) {
+            match parallel::evaluate_parallel(input, transforms, workers, chunk_size) {
                 Ok(output) => {
                     let sequential_steps: Vec<_> = steps
                         .last()
@@ -4436,7 +3694,7 @@ impl Evaluator {
                             ));
                         }
                     };
-                    write_csv_row(
+                    csv::write_row(
                         output_file
                             .as_mut()
                             .expect("write_csv output should be initialized"),
@@ -4734,6 +3992,9 @@ impl Evaluator {
         expected: &Type,
         name: &str,
     ) -> Result<(), SimplyError> {
+        if *expected == Type::Unknown {
+            return Ok(());
+        }
         if self.value_matches_type(value, expected) {
             return Ok(());
         }
@@ -4783,20 +4044,24 @@ impl Evaluator {
             | (Value::Hash(_), Type::Hash)
             | (Value::Tree(_), Type::Tree)
             | (Value::Matrix(_), Type::Matrix)
-            | (Value::Function(_), Type::Function { .. })
-            | (_, Type::Unknown) => true,
+            | (Value::Function(_), Type::Function { .. }) => true,
             (Value::Struct(instance), Type::Struct(expected)) => &instance.type_name == expected,
             (Value::Enum(value), Type::Enum(expected)) => &value.enum_name == expected,
             (Value::Range { .. }, Type::Range) => true,
             (Value::CsvStream { .. }, Type::CsvStream) => true,
-            (Value::Range { .. }, Type::Array(element)) => Type::Int.compatible_with(element),
-            (Value::CsvStream { .. }, Type::List(row)) if matches!(row.as_ref(), Type::List(field) if matches!(field.as_ref(), Type::String)) => {
+            (Value::Array(_), Type::Array(element)) | (Value::List(_), Type::List(element))
+                if **element == Type::Unknown =>
+            {
                 true
             }
             (Value::Array(values), Type::Array(element))
             | (Value::List(values), Type::List(element)) => values
                 .iter()
                 .all(|value| self.value_matches_type(value, element)),
+            (Value::Hash(values), Type::HashValues(element))
+            | (Value::Tree(values), Type::TreeValues(element)) => values
+                .values()
+                .all(|value| **element == Type::Unknown || self.value_matches_type(value, element)),
             (Value::Tuple(values), Type::Tuple(types)) => {
                 values.len() == types.len()
                     && values
@@ -4829,8 +4094,24 @@ impl Evaluator {
                     .unwrap_or(Type::Unknown),
             )),
             Value::Tuple(values) => Type::Tuple(values.iter().map(Self::type_of_value).collect()),
-            Value::Hash(_) => Type::Hash,
-            Value::Tree(_) => Type::Tree,
+            Value::Hash(values) => {
+                let mut types = values.values().map(Self::type_of_value);
+                let first = types.next().unwrap_or(Type::Unknown);
+                if types.all(|typ| typ.compatible_with(&first)) {
+                    Type::HashValues(Box::new(first))
+                } else {
+                    Type::HashValues(Box::new(Type::Unknown))
+                }
+            }
+            Value::Tree(values) => {
+                let mut types = values.values().map(Self::type_of_value);
+                let first = types.next().unwrap_or(Type::Unknown);
+                if types.all(|typ| typ.compatible_with(&first)) {
+                    Type::TreeValues(Box::new(first))
+                } else {
+                    Type::TreeValues(Box::new(Type::Unknown))
+                }
+            }
             Value::Matrix(_) => Type::Matrix,
             Value::Struct(instance) => Type::Struct(instance.type_name.clone()),
             Value::Enum(value) => Type::Enum(value.enum_name.clone()),
@@ -5004,7 +4285,7 @@ mod tests {
 
     #[test]
     fn parallel_workers_execute_scalar_chunks_and_preserve_order() {
-        PARALLEL_THREAD_IDS
+        parallel::PARALLEL_THREAD_IDS
             .lock()
             .expect("parallel test lock")
             .clear();
@@ -5014,8 +4295,8 @@ mod tests {
             operator: BinaryOperator::Multiply,
             right: Box::new(Expr::Literal(Literal::Int(2))),
         })];
-        let output =
-            evaluate_parallel(values, &transforms, 4, Some(8)).expect("parallel evaluation");
+        let output = parallel::evaluate_parallel(values, &transforms, 4, Some(8))
+            .expect("parallel evaluation");
         assert_eq!(
             output,
             (0..16)
@@ -5023,12 +4304,81 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(
-            PARALLEL_THREAD_IDS
+            parallel::PARALLEL_THREAD_IDS
                 .lock()
                 .expect("parallel test lock")
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn parallel_execution_rejects_excessive_workers_and_chunk_counts() {
+        assert_eq!(
+            parallel::evaluate_parallel(Vec::new(), &[], 1, None).expect("empty input"),
+            Vec::<Value>::new()
+        );
+        assert!(
+            parallel::evaluate_parallel(
+                vec![Value::Int(1)],
+                &[],
+                limits::MAX_PARALLEL_WORKERS + 1,
+                None
+            )
+            .expect_err("worker limit should be enforced")
+            .contains("worker count")
+        );
+        assert!(
+            parallel::evaluate_parallel(
+                vec![Value::Int(1)],
+                &[],
+                1,
+                Some(limits::MAX_CHUNK_SIZE + 1)
+            )
+            .expect_err("chunk size limit should be enforced")
+            .contains("chunk size")
+        );
+        let input = (0..=limits::MAX_PARALLEL_CHUNKS)
+            .map(|value| Value::Int(value as i64))
+            .collect();
+        assert!(
+            parallel::evaluate_parallel(input, &[], 1, Some(1))
+                .expect_err("chunk count limit should be enforced")
+                .contains("chunk count")
+        );
+    }
+
+    #[test]
+    fn function_call_depth_is_restored_after_recursion_failure() {
+        let source =
+            "fn recurse(value as Int) gives Int:\n    return recurse(value + 1)\nend\nrecurse(0)\n";
+        let program = Parser::new(Lexer::new(source).tokenize().expect("source should lex"))
+            .parse()
+            .expect("source should parse");
+        let mut evaluator = Evaluator::new();
+        let error = evaluator
+            .run(&program)
+            .expect_err("excessive recursion should fail with a diagnostic");
+        assert!(
+            error
+                .to_string()
+                .contains("function call depth exceeds the limit")
+        );
+        assert_eq!(evaluator.call_depth, 0);
+
+        let recovery = Parser::new(
+            Lexer::new(
+                "fn identity(value as Int) gives Int:\n    return value\nend\nidentity(7)\n",
+            )
+            .tokenize()
+            .expect("recovery source should lex"),
+        )
+        .parse()
+        .expect("recovery source should parse");
+        evaluator
+            .run(&recovery)
+            .expect("successful calls should work after recursion failure");
+        assert_eq!(evaluator.call_depth, 0);
     }
 
     #[test]
@@ -5038,7 +4388,7 @@ mod tests {
             arguments: vec![Expr::Identifier("item".into())],
         }));
         assert!(
-            evaluate_parallel(
+            parallel::evaluate_parallel(
                 vec![Value::List(shared_values(vec![Value::Int(1)]))],
                 &[],
                 2,
