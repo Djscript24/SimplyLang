@@ -2394,8 +2394,8 @@ impl Evaluator {
                         Value::Int(_) => "Int",
                         Value::Float(_) => "Float",
                         Value::Bool(_) => "Bool",
-                        Value::Range { .. } => "Array",
-                        Value::CsvStream { .. } => "List",
+                        Value::Range { .. } => "Range",
+                        Value::CsvStream { .. } => "CsvStream",
                         Value::Array(_) => "Array",
                         Value::List(_) => "List",
                         Value::Tuple(_) => "Tuple",
@@ -4759,8 +4759,8 @@ impl Evaluator {
             Value::Int(_) => "Int".into(),
             Value::Float(_) => "Float".into(),
             Value::Bool(_) => "Bool".into(),
-            Value::Range { .. } => "Array".into(),
-            Value::CsvStream { .. } => "List".into(),
+            Value::Range { .. } => "Range".into(),
+            Value::CsvStream { .. } => "CsvStream".into(),
             Value::Array(_) => "Array".into(),
             Value::List(_) => "List".into(),
             Value::Tuple(_) => "Tuple".into(),
@@ -4787,6 +4787,8 @@ impl Evaluator {
             | (_, Type::Unknown) => true,
             (Value::Struct(instance), Type::Struct(expected)) => &instance.type_name == expected,
             (Value::Enum(value), Type::Enum(expected)) => &value.enum_name == expected,
+            (Value::Range { .. }, Type::Range) => true,
+            (Value::CsvStream { .. }, Type::CsvStream) => true,
             (Value::Range { .. }, Type::Array(element)) => Type::Int.compatible_with(element),
             (Value::CsvStream { .. }, Type::List(row)) if matches!(row.as_ref(), Type::List(field) if matches!(field.as_ref(), Type::String)) => {
                 true
@@ -4812,8 +4814,8 @@ impl Evaluator {
             Value::Int(_) => Type::Int,
             Value::Float(_) => Type::Float,
             Value::Bool(_) => Type::Bool,
-            Value::Range { .. } => Type::Array(Box::new(Type::Int)),
-            Value::CsvStream { .. } => Type::List(Box::new(Type::List(Box::new(Type::String)))),
+            Value::Range { .. } => Type::Range,
+            Value::CsvStream { .. } => Type::CsvStream,
             Value::Array(values) => Type::Array(Box::new(
                 values
                     .first()

@@ -9,6 +9,8 @@ pub enum Type {
     Int,
     Float,
     Bool,
+    Range,
+    CsvStream,
     Array(Box<Type>),
     List(Box<Type>),
     Tuple(Vec<Type>),
@@ -32,6 +34,8 @@ impl Type {
             Self::Int => "Int".into(),
             Self::Float => "Float".into(),
             Self::Bool => "Bool".into(),
+            Self::Range => "Range".into(),
+            Self::CsvStream => "CsvStream".into(),
             Self::Array(element) => format!("Array[{}]", element.name()),
             Self::List(element) => format!("List[{}]", element.name()),
             Self::Tuple(types) => format!(
@@ -50,6 +54,7 @@ impl Type {
     pub fn compatible_with(&self, expected: &Self) -> bool {
         match (self, expected) {
             (Self::Unknown, _) | (_, Self::Unknown) => true,
+            (Self::Range, Self::Range) | (Self::CsvStream, Self::CsvStream) => true,
             (Self::Array(actual), Self::Array(expected))
             | (Self::List(actual), Self::List(expected)) => actual.compatible_with(expected),
             (Self::Tuple(actual), Self::Tuple(expected)) => {
@@ -103,6 +108,15 @@ mod tests {
         assert!(Type::Unknown.compatible_with(&Type::Int));
         assert!(Type::Int.compatible_with(&Type::Unknown));
         assert!(!Type::Int.compatible_with(&Type::String));
+    }
+
+    #[test]
+    fn range_and_csv_stream_types_are_distinct_runtime_types() {
+        assert_eq!(Type::Range.name(), "Range");
+        assert_eq!(Type::CsvStream.name(), "CsvStream");
+        assert!(Type::Range.compatible_with(&Type::Range));
+        assert!(Type::CsvStream.compatible_with(&Type::CsvStream));
+        assert!(!Type::Range.compatible_with(&Type::CsvStream));
     }
 
     #[test]

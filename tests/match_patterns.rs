@@ -407,7 +407,7 @@ fn rest_sequence_patterns_bind_typed_suffixes_and_match_minimum_lengths() {
                         end\n";
     let (success, output) = run_source_stdout(range_source);
     assert!(success, "range rest binding failed: {output}");
-    assert_eq!(output, "Array\n[2, 3, 4]\n");
+    assert_eq!(output, "Range\n[2, 3, 4]\n");
 
     let typed_array_suffix = "fn expect_array(values as Array[Int]) gives Int:\n\
                                   return count(values)\n\
@@ -438,7 +438,7 @@ fn rest_sequence_patterns_bind_typed_suffixes_and_match_minimum_lengths() {
                               end\n";
     let (success, output) = run_source_stdout(typed_range_suffix);
     assert!(success, "empty Range suffix failed: {output}");
-    assert_eq!(output, "Array\n[]\n");
+    assert_eq!(output, "Range\n[]\n");
 }
 
 #[test]

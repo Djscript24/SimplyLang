@@ -109,7 +109,7 @@ fn cli_commands_use_expected_exit_codes_and_streams() {
     assert!(version.status.success());
     assert_eq!(
         String::from_utf8_lossy(&version.stdout).trim(),
-        "Simply 0.9.0"
+        "Simply 0.10.0"
     );
     assert!(version.stderr.is_empty());
 
@@ -262,7 +262,7 @@ fn repl_preserves_state_prints_expressions_and_recovers_from_errors() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Simply 0.9.0"));
+    assert!(stdout.contains("Simply 0.10.0"));
     assert!(stdout.contains("from say"));
     assert!(stdout.contains("15"));
     assert!(stdout.contains("from say\n15\n"));
@@ -454,7 +454,7 @@ fn repl_evaluates_pasted_multiline_blocks_as_single_statements() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
         stdout.lines().collect::<Vec<_>>(),
-        ["Simply 0.9.0", "21", "inner", "21", "10", "false", "true"]
+        ["Simply 0.10.0", "21", "inner", "21", "10", "false", "true"]
     );
     assert!(!stdout.contains("> "));
     assert!(!stdout.contains("... "));
@@ -497,7 +497,7 @@ fn repl_supports_struct_declarations_construction_and_message_dispatch() {
         String::from_utf8_lossy(&output.stdout)
             .lines()
             .collect::<Vec<_>>(),
-        ["Simply 0.9.0", "Hello Ada"]
+        ["Simply 0.10.0", "Hello Ada"]
     );
     assert!(output.stderr.is_empty());
 }

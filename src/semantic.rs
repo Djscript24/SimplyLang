@@ -1,7 +1,11 @@
 //! semantic.rs — static program analysis
 //! Checks declarations, scopes, types, functions, and control-flow requirements before evaluation.
 //! Key components: SemanticAnalyzer, FunctionSignature, and ScopeStack.
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::{Path, PathBuf},
+};
 
 use crate::{
     ast::{
@@ -45,6 +49,9 @@ pub struct SemanticAnalyzer {
     function_return: Option<Type>,
     inferred_return: Option<Type>,
     saw_return: bool,
+    module_return_allowed: bool,
+    import_stack: Vec<PathBuf>,
+    import_cache: HashMap<PathBuf, Program>,
 }
 
 #[derive(Clone)]
@@ -52,6 +59,32 @@ struct ScopeStack {
     scopes: Vec<HashMap<String, Type>>,
     bindings: HashMap<String, Vec<usize>>,
     mutability: HashMap<String, Vec<bool>>,
+}
+
+fn resolve_import_path(current_file: Option<&Path>, path: &str) -> Result<PathBuf, SimplyError> {
+    let base = current_file
+        .and_then(Path::parent)
+        .unwrap_or_else(|| Path::new("."));
+    let resolved = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        base.join(path)
+    };
+    if resolved.extension().is_none() {
+        let with_extension = resolved.with_extension("si");
+        if with_extension.is_file() {
+            return Ok(fs::canonicalize(with_extension).map_err(|error| SimplyError::Runtime {
+                span: Span::new(0, 0),
+                code: DiagnosticCode::RuntimeImport,
+                message: format!("could not resolve import `{path}`: {error}"),
+            })?);
+        }
+    }
+    fs::canonicalize(&resolved).map_err(|error| SimplyError::Runtime {
+        span: Span::new(0, 0),
+        code: DiagnosticCode::RuntimeImport,
+        message: format!("could not open `{path}`: {error}"),
+    })
 }
 
 impl ScopeStack {
@@ -212,9 +245,80 @@ impl SemanticAnalyzer {
     }
 
     pub fn analyze(&mut self, program: &Program) -> Result<(), SimplyError> {
+        self.import_stack.clear();
+        self.import_cache.clear();
+        self.module_return_allowed = false;
         self.collect_structs_and_messages(&program.statements)?;
         self.collect_functions(&program.statements)?;
         self.analyze_statements(&program.statements)
+    }
+
+    pub fn analyze_file(&mut self, path: &Path) -> Result<(), SimplyError> {
+        let resolved = fs::canonicalize(path)
+            .map_err(|error| SimplyError::Runtime {
+                span: Span::new(0, 0),
+                code: DiagnosticCode::RuntimeImport,
+                message: format!("could not open `{}`: {error}", path.display()),
+            })?;
+        let source = fs::read_to_string(&resolved)
+            .map_err(|error| SimplyError::Runtime {
+                span: Span::new(0, 0),
+                code: DiagnosticCode::RuntimeImport,
+                message: format!("could not read `{}`: {error}", path.display()),
+            })?;
+        let tokens = crate::lexer::Lexer::new(&source).tokenize()?;
+        let program = crate::parser::Parser::new(tokens).parse()?;
+        self.import_stack.clear();
+        self.import_cache.clear();
+        self.module_return_allowed = false;
+        self.analyze_imports(&program, Some(&resolved), &mut Vec::new())
+    }
+
+    fn analyze_imports(
+        &mut self,
+        program: &Program,
+        current_file: Option<&Path>,
+        import_stack: &mut Vec<PathBuf>,
+    ) -> Result<(), SimplyError> {
+        let saved_module_return = self.module_return_allowed;
+        self.module_return_allowed = !import_stack.is_empty();
+        for statement in &program.statements {
+            let statement = match statement {
+                Stmt::Located { statement, .. } => statement.as_ref(),
+                statement => statement,
+            };
+            if let Stmt::Import { path, .. } = statement {
+                let resolved = resolve_import_path(current_file, path)?;
+                if import_stack.iter().any(|item| item == &resolved) {
+                    return Err(SimplyError::Runtime {
+                        span: Span::new(0, 0),
+                        code: DiagnosticCode::RuntimeImport,
+                        message: format!("cyclic import of `{path}`"),
+                    });
+                }
+                let imported = if let Some(program) = self.import_cache.get(&resolved) {
+                    program.clone()
+                } else {
+                    let source = fs::read_to_string(&resolved).map_err(|error| SimplyError::Runtime {
+                        span: Span::new(0, 0),
+                        code: DiagnosticCode::RuntimeImport,
+                        message: format!("could not read `{}`: {error}", resolved.display()),
+                    })?;
+                    let tokens = crate::lexer::Lexer::new(&source).tokenize()?;
+                    let program = crate::parser::Parser::new(tokens).parse()?;
+                    self.import_cache.insert(resolved.clone(), program.clone());
+                    program
+                };
+                import_stack.push(resolved.clone());
+                self.analyze_imports(&imported, Some(&resolved), import_stack)?;
+                import_stack.pop();
+            }
+        }
+        self.collect_structs_and_messages(&program.statements)?;
+        self.collect_functions(&program.statements)?;
+        let result = self.analyze_statements(&program.statements);
+        self.module_return_allowed = saved_module_return;
+        result
     }
 
     fn collect_structs_and_messages(&mut self, statements: &[Stmt]) -> Result<(), SimplyError> {
@@ -869,11 +973,15 @@ impl SemanticAnalyzer {
                 }
                 Stmt::Return(expression) => {
                     let actual = self.analyze_expression(expression)?;
-                    if self.function_depth == 0 {
+                    if self.function_depth == 0 && !self.module_return_allowed {
                         return Err(self.error(
                             DiagnosticCode::InvalidReturn,
                             "return used outside a function",
                         ));
+                    }
+                    if self.function_depth == 0 {
+                        self.saw_return = true;
+                        return Ok(());
                     }
                     if let Some(expected) = self.function_return.clone() {
                         self.require_type(&expected, &actual)?;

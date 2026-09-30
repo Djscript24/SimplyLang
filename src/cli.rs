@@ -110,7 +110,7 @@ pub fn run() -> i32 {
                 "{}",
                 stdout_paint(&format!("Checking {}...", path.display()), CYAN)
             );
-            check_source(&source).map(|_| println!("{}", stdout_paint("No errors found.", GREEN)))
+            check_path(&path).map(|_| println!("{}", stdout_paint("No errors found.", GREEN)))
         }
         Command::Bench => benchmark_source(&source, &path),
         Command::Explain => explain_source(&source, &path),
@@ -895,6 +895,11 @@ fn render_cli_error(path: &PathBuf, message: impl Into<String>) {
 
 fn check_source(source: &str) -> Result<(), SimplyError> {
     validate_source(source)
+}
+
+fn check_path(path: &Path) -> Result<(), SimplyError> {
+    let mut analyzer = SemanticAnalyzer::new();
+    analyzer.analyze_file(path)
 }
 
 fn validate_source(source: &str) -> Result<(), SimplyError> {
