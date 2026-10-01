@@ -1,7 +1,8 @@
 # Vector arithmetic: dot product, Euclidean norm, and distance.
-a is [1, 2, 3]
-b is [4, 5, 6]
+a as Vector[Float, 3] is [1.0, 2.0, 3.0]
+b as Vector[Float, 3] is [4.0, 5.0, 6.0]
 
 Sayln dot(a, b)
+Sayln cross(a, b)
 Sayln norm([3, 4])
 Sayln distance([1, 2], [4, 6])

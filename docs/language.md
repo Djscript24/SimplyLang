@@ -2,6 +2,8 @@
 
 This document describes the language implemented by the current interpreter.
 Statements are newline-oriented and blocks close with `end`.
+The language-level value, object, equality, capture, and lifetime rules are
+specified in [SimplyLang Memory Model v1](memory-model.md).
 
 ## Source Files
 
@@ -27,6 +29,13 @@ Simply source files use the `.si` extension. `#` starts a comment outside a stri
   rely on a later-declared sibling, so sibling mutual recursion is not supported.
 - `type Name: ... end` declares a nominal struct with ordered, typed fields.
   Construct instances positionally with `Name(value, ...)`.
+- Numeric vectors and matrices can be annotated as `Vector[Float]`,
+  `Vector[Float, 3]`, `Matrix[Float]`, or `Matrix[Float, 3, 3]`. A `?` leaves
+  an individual dimension dynamic, as in `Matrix[Float, ?, 3]`. Vectors use
+  existing arrays, lists, or homogeneous tuples; matrices accept the
+  `matrix [[...], ...]` literal or rectangular nested arrays/lists. The
+  checker verifies known dimensions—including compatible matrix products and
+  vector operations—and leaves unknown dimensions to runtime validation.
 - `on Name receive message(parameters): ... end` defines behavior for that
   struct. `instance :: message(arguments)` dispatches it, passing declared
   fields into the message scope. Reassigning a field binding within a message
@@ -105,7 +114,10 @@ Struct, wildcard, binding, or OR-patterns. Binding names exist only within
 their selected arm, and a failed nested pattern exposes no partial bindings. A trailing
 expression gives the arm and match expression its value; an arm without one
 returns `Unit`. Enum equality uses the existing equality operators and compares
-enum identity, variant, and payload.
+nominal declaration, variant, and payload. Struct equality compares instance
+identity rather than fields; collection equality is structural, with nested
+struct values compared by identity. Function equality compares callable
+identity.
 
 Patterns are checked against the scrutinee type, including tuple arity,
 nominal enum identity, and Struct identity/arity. Exhaustiveness and
@@ -417,18 +429,34 @@ The built-ins are:
   and `sign` provide scalar mathematical operations. Scalar transcendental
   functions return finite `Float` values; `sqrt` rejects negative inputs and
   logarithms reject non-positive inputs.
-- `vector_add`, `vector_subtract`, `vector_scale`, `dot`, `norm`, `distance`, and
-  `normalize` operate on numeric arrays, lists, or tuples. Vectors must be
+- `vector_add`, `vector_subtract`, `vector_scale`, `dot`, `cross`, `norm`,
+  `distance`, and `normalize` operate on numeric arrays, lists, or tuples. Vectors must be
   non-empty; paired vector operations require equal lengths. `dot` preserves
   integer results for integer inputs, while norm, distance, and normalization
-  return `Float` values. A zero vector cannot be normalized.
-- `shape`, `transpose`, `matrix_add`, `matrix_subtract`, `matrix_scale`,
-  `multiply`, and `identity` provide explicit matrix operations over rectangular,
+  return `Float` values. `cross` requires two three-dimensional vectors and
+  returns a Float vector. A zero vector cannot be normalized.
+- `shape`, `trace`, `rank`, `matvec`, `transpose`, `matrix_add`, `matrix_subtract`, `matrix_scale`,
+  `multiply`, `identity`, `determinant`, `inverse`, `lu`, `qr`, `cholesky`,
+  `solve`, and `least_squares` provide explicit matrix operations over rectangular,
   non-empty numeric row collections. `shape` returns `(rows, columns)`;
+  `trace` requires a square matrix and returns its diagonal sum. `rank` returns
+  the numerical rank using a scale-relative floating-point tolerance.
+  `matvec(A, x)` multiplies a matrix by a vector whose length matches A's
+  column count and returns one Float per row.
   multiplication requires the left column count to equal the right row count
   and returns `Float` cells. Ragged, empty, nonnumeric, and incompatible
-  matrices produce runtime errors. Use `matrix_scale` for scalar-matrix
-  multiplication.
+  matrices produce runtime errors. `determinant` and `inverse` require square
+  matrices; `inverse` also rejects singular matrices. `solve(A, b)` solves
+  square, non-singular `A` systems with one numeric right-hand-side value per
+  row, returning a Float vector; if `b` is a matrix, its rows represent the
+  right-hand sides and `solve(A, B)` returns one solution column per column of
+  `B`. `lu(A)` returns `(L, U, P)` with `P × A = L × U` using partial pivoting.
+  `qr(A)` returns `(Q, R)` with orthogonal square `Q` and `A = Q × R`.
+  `cholesky(A)` returns lower-triangular `L` such that `A = L × transpose(L)`;
+  it requires a symmetric positive-definite square matrix. Use `matrix_scale`
+  for scalar-matrix multiplication. `least_squares(A, b)` fits an
+  overdetermined system using Householder QR; it requires at least as many
+  rows as columns and full column rank.
 - `mean`, `median`, `variance`, `stddev`, `percentile`, `covariance`, and
   `correlation` operate on numeric arrays, lists, tuples, and ranges.
   Variance and covariance use population conventions (divide by N).
@@ -443,12 +471,15 @@ The built-ins are:
 
 Argument counts and supported value types are checked before execution when statically knowable. Dynamic values remain runtime-validated.
 
-Floating-point results must remain finite; overflow to `NaN` or infinity is reported as a runtime arithmetic error. Matrix multiplication always produces floating-point cells.
+Floating-point results must remain finite; overflow to `NaN` or infinity is reported as a runtime arithmetic error. Matrix multiplication, matrix-vector multiplication, cross products, trace, determinant, inverse, decompositions, `solve`, and `least_squares` produce floating-point results.
 
 Vector dot/add/subtract and matrix element-wise operations are linear in the
 number of elements. Norm, distance, and normalization are O(n); matrix
 transpose and element-wise operations are O(rows × columns); matrix
-multiplication is O(m × n × k). Median and percentile sort their input and are
+multiplication is O(rows × shared_dimension × columns); determinant, inverse,
+`solve`, and the matrix decompositions use O(n³) arithmetic for square
+matrices; `rank` uses O(rows × columns × min(rows, columns)); `matvec` uses
+O(rows × columns); `least_squares` uses O(rows × columns²) arithmetic. Median and percentile sort their input and are
 O(n log n); mean, variance, standard deviation, covariance, and correlation
 use one-pass updates and are O(n). These operations use existing Simply
 collections rather than a separate tensor representation. They provide a

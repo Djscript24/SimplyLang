@@ -190,6 +190,58 @@ fn closures_keep_creation_time_snapshots_across_rebinding() {
 }
 
 #[test]
+fn returned_closure_keeps_collection_snapshot_after_scope_cleanup() {
+    let source = "fn make_reader():\n\
+                      mut values is list [1]\n\
+                      fn read() gives List[Int]:\n\
+                          return values\n\
+                      end\n\
+                      values add 2\n\
+                      return (read, values)\n\
+                  end\n\
+                  mut (read, values) is make_reader()\n\
+                  values add 3\n\
+                  Sayln read()\n\
+                  Sayln values\n";
+    let (success, output) = run_source_stdout(source);
+
+    assert!(
+        success,
+        "returned closure lost its captured value: {output}"
+    );
+    assert_eq!(output, "[1]\n[1, 2, 3]\n");
+}
+
+#[test]
+fn closure_keeps_captured_struct_identity_after_mutation_and_rebinding() {
+    let source = "type Person:\n    name as String\nend\n\
+                  on Person receive rename(next as String):\n\
+                      name -> next\n\
+                  end\n\
+                  on Person receive get_name:\n\
+                      return name\n\
+                  end\n\
+                  fn make_reader(person as Person):\n\
+                      fn read():\n\
+                          return person\n\
+                      end\n\
+                      return read\n\
+                  end\n\
+                  mut person is Person(\"Ada\")\n\
+                  read is make_reader(person)\n\
+                  person :: rename(\"Alicia\")\n\
+                  captured_after_mutation is read()\n\
+                  Sayln captured_after_mutation :: get_name\n\
+                  person -> Person(\"Grace\")\n\
+                  captured_after_rebinding is read()\n\
+                  Sayln captured_after_rebinding :: get_name\n";
+    let (success, output) = run_source_stdout(source);
+
+    assert!(success, "struct closure capture failed: {output}");
+    assert_eq!(output, "Alicia\nAlicia\n");
+}
+
+#[test]
 fn closures_can_capture_pattern_arm_bindings() {
     let source = "fn make_reader(value as Int):\n\
                       return match value:\n\

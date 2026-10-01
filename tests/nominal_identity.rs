@@ -87,18 +87,18 @@ fn equal_payloads_from_distinct_modules_are_not_equal_values() {
 }
 
 #[test]
-fn values_from_different_aliases_of_one_module_remain_equal() {
+fn aliased_struct_types_create_distinct_instances_but_enum_values_compare_structurally() {
     let output = run_fixture("run", "alias-value-equality.si");
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "true\ntrue\n");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "false\ntrue\n");
 }
 
 #[test]
-fn values_declared_in_one_module_remain_compatible() {
+fn values_declared_in_one_module_keep_nominal_types_and_equality_rules() {
     let output = run_fixture("run", "same-module.si");
     assert!(
         output.status.success(),
@@ -107,6 +107,6 @@ fn values_declared_in_one_module_remain_compatible() {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "Item\nState\ntrue\ntrue\n"
+        "Item\nState\nfalse\ntrue\n"
     );
 }

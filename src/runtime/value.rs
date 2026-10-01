@@ -1,16 +1,19 @@
 //! runtime/value.rs — runtime value representation
 //! Defines Simply values and their display/equality behavior at evaluation time.
 //! Key component: Value covers primitives, collections, functions, and unit results.
+use std::sync::Arc;
 use std::{
-    cell::RefCell,
     collections::{BTreeMap, HashMap},
     fmt::Write,
     time::SystemTime,
 };
-use std::{rc::Rc, sync::Arc};
 
 use crate::{
     ast::Stmt,
+    runtime::{
+        arena::{ArenaRef, Handle},
+        storage::{SharedMap, SharedVec},
+    },
     types::{DeclarationIdentity, Type},
 };
 
@@ -22,7 +25,7 @@ pub(crate) struct FunctionValue {
     pub parameters: Vec<(String, Option<Type>, bool)>,
     pub return_type: Option<Type>,
     pub body: Arc<[Stmt]>,
-    pub captures: RefCell<HashMap<String, Value>>,
+    pub captures: HashMap<String, Value>,
     pub source: Option<SourceContext>,
 }
 
@@ -36,22 +39,26 @@ impl PartialEq for FunctionValue {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SourceText {
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SourceContext {
     pub filename: String,
-    pub source: Rc<str>,
+    pub source: ArenaRef<SourceText>,
 }
 
 #[derive(Debug, Clone)]
 pub struct StructInstance {
     pub identity: DeclarationIdentity,
     pub type_name: String,
-    pub fields: Rc<RefCell<BTreeMap<String, Value>>>,
+    pub fields: BTreeMap<String, Value>,
 }
 
 impl PartialEq for StructInstance {
     fn eq(&self, other: &Self) -> bool {
-        self.identity == other.identity
-            && self.fields.borrow().iter().eq(other.fields.borrow().iter())
+        self.identity == other.identity && self.fields == other.fields
     }
 }
 
@@ -77,7 +84,7 @@ pub(crate) struct CsvStreamVersion {
     pub modified: SystemTime,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Value {
     Unit,
     String(String),
@@ -95,34 +102,88 @@ pub enum Value {
         start_offset: u64,
         source_version: Option<CsvStreamVersion>,
     },
-    Array(Rc<Vec<Value>>),
-    List(Rc<Vec<Value>>),
-    Tuple(Rc<Vec<Value>>),
-    Hash(Rc<BTreeMap<String, Value>>),
-    Tree(Rc<BTreeMap<String, Value>>),
-    Matrix(Rc<Vec<Value>>),
-    Function(Rc<FunctionValue>),
-    Struct(Rc<StructInstance>),
-    Enum(Rc<EnumValue>),
+    Array(SharedVec<Value>),
+    List(SharedVec<Value>),
+    Tuple(SharedVec<Value>),
+    Hash(SharedMap<String, Value>),
+    Tree(SharedMap<String, Value>),
+    Matrix(SharedVec<Value>),
+    Function(Handle<FunctionValue>),
+    Struct(ArenaRef<StructInstance>),
+    Enum(ArenaRef<EnumValue>),
 }
 
-pub(crate) fn shared_values(values: Vec<Value>) -> Rc<Vec<Value>> {
-    Rc::new(values)
-}
-
-pub(crate) fn owned_values(values: Rc<Vec<Value>>) -> Vec<Value> {
-    Rc::try_unwrap(values).unwrap_or_else(|values| (*values).clone())
-}
-
-pub(crate) fn owned_map_values(values: Rc<BTreeMap<String, Value>>) -> Vec<Value> {
-    match Rc::try_unwrap(values) {
-        Ok(values) => values.into_values().collect(),
-        Err(values) => values.values().cloned().collect(),
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Unit, Self::Unit) => true,
+            (Self::String(left), Self::String(right)) => left == right,
+            (Self::Int(left), Self::Int(right)) => left == right,
+            (Self::Float(left), Self::Float(right)) => left == right,
+            (Self::Bool(left), Self::Bool(right)) => left == right,
+            (
+                Self::Range {
+                    start: left_start,
+                    end: left_end,
+                    step: left_step,
+                },
+                Self::Range {
+                    start: right_start,
+                    end: right_end,
+                    step: right_step,
+                },
+            ) => left_start == right_start && left_end == right_end && left_step == right_step,
+            (
+                Self::CsvStream {
+                    path: left_path,
+                    start_record: left_record,
+                    start_offset: left_offset,
+                    source_version: left_version,
+                },
+                Self::CsvStream {
+                    path: right_path,
+                    start_record: right_record,
+                    start_offset: right_offset,
+                    source_version: right_version,
+                },
+            ) => {
+                left_path == right_path
+                    && left_record == right_record
+                    && left_offset == right_offset
+                    && left_version == right_version
+            }
+            (Self::Array(left), Self::Array(right))
+            | (Self::List(left), Self::List(right))
+            | (Self::Tuple(left), Self::Tuple(right))
+            | (Self::Matrix(left), Self::Matrix(right)) => left == right,
+            (Self::Hash(left), Self::Hash(right)) | (Self::Tree(left), Self::Tree(right)) => {
+                left == right
+            }
+            (Self::Function(left), Self::Function(right)) => left == right,
+            (Self::Struct(left), Self::Struct(right)) => left.same_instance(right),
+            (Self::Enum(left), Self::Enum(right)) => left
+                .get_cloned()
+                .zip(right.get_cloned())
+                .is_some_and(|(left, right)| left == right),
+            _ => false,
+        }
     }
 }
 
-pub(crate) fn shared_map(values: BTreeMap<String, Value>) -> Rc<BTreeMap<String, Value>> {
-    Rc::new(values)
+pub(crate) fn shared_values(values: Vec<Value>) -> SharedVec<Value> {
+    SharedVec::new(values)
+}
+
+pub(crate) fn owned_values(values: SharedVec<Value>) -> Vec<Value> {
+    values.into_owned()
+}
+
+pub(crate) fn owned_map_values(values: SharedMap<String, Value>) -> Vec<Value> {
+    values.into_owned().into_values().collect()
+}
+
+pub(crate) fn shared_map(values: BTreeMap<String, Value>) -> SharedMap<String, Value> {
+    SharedMap::new(values)
 }
 
 impl Value {
@@ -191,14 +252,17 @@ impl Value {
                 output.push('}');
             }
             Self::Function(_) => output.push_str("<function>"),
-            Self::Struct(instance) => output.push_str(&instance.type_name),
+            Self::Struct(instance) => {
+                if instance
+                    .with(|instance| output.push_str(&instance.type_name))
+                    .is_none()
+                {
+                    output.push_str("<invalid struct>");
+                }
+            }
             Self::Enum(value) => {
-                write!(output, "{}::{}", value.enum_name, value.variant_name)
-                    .expect("writing to String cannot fail");
-                if let Some(payload) = &value.payload {
-                    output.push('(');
-                    payload.write_display(output);
-                    output.push(')');
+                if instance_display(value, output).is_none() {
+                    output.push_str("<invalid enum>");
                 }
             }
         }
@@ -214,6 +278,7 @@ impl Value {
                 current = None;
                 return None;
             }
+
             current = Some(value + step);
             i64::try_from(value).ok().map(Value::Int)
         })
@@ -240,16 +305,18 @@ impl Value {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{Value, shared_values};
-
-    #[test]
-    fn displays_nested_values_without_evaluator() {
-        let value = Value::List(shared_values(vec![
-            Value::Int(1),
-            Value::String("two".into()),
-        ]));
-        assert_eq!(value.display(), "[1, two]");
-    }
+fn instance_display(value: &ArenaRef<EnumValue>, output: &mut String) -> Option<()> {
+    value.with(|value| {
+        write!(output, "{}::{}", value.enum_name, value.variant_name)
+            .expect("writing to String cannot fail");
+        if let Some(payload) = &value.payload {
+            output.push('(');
+            payload.write_display(output);
+            output.push(')');
+        }
+    })
 }
+
+#[cfg(test)]
+#[path = "../../tests/internal/runtime_value.rs"]
+mod tests;

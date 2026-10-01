@@ -7,12 +7,10 @@ mod parallel;
 mod pattern;
 
 use std::{
-    cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::{self, BufRead, BufReader, IsTerminal, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    rc::Rc,
     sync::Arc,
 };
 
@@ -25,17 +23,19 @@ use crate::{
     lexer::Lexer,
     parser::Parser,
     runtime::{
+        arena::{Arena, ArenaRef, Handle},
         collections, files, limits, operations,
         scope::ScopeStack,
+        storage::SharedCell,
         value::{
-            CsvStreamVersion, EnumValue, FunctionValue, SourceContext, StructInstance, Value,
-            owned_map_values, owned_values, shared_map, shared_values,
+            CsvStreamVersion, EnumValue, FunctionValue, SourceContext, SourceText, StructInstance,
+            Value, owned_map_values, owned_values, shared_map, shared_values,
         },
     },
     types::{DeclarationIdentity, DeclarationKind, Type},
 };
 
-type ImportCache = Rc<RefCell<HashMap<PathBuf, (Arc<Program>, Rc<str>)>>>;
+type ImportCache = SharedCell<HashMap<PathBuf, (Arc<Program>, ArenaRef<SourceText>)>>;
 
 fn enumerate_values(values: impl Iterator<Item = Value>) -> Result<Vec<Value>, String> {
     let mut indexed = Vec::new();
@@ -201,6 +201,14 @@ fn evaluate_math_builtin(
             require_count(2)?;
             Some(operations::vector_dot(&arguments[0], &arguments[1], span)?)
         }
+        "cross" => {
+            require_count(2)?;
+            Some(operations::vector_cross(
+                &arguments[0],
+                &arguments[1],
+                span,
+            )?)
+        }
         "norm" => {
             require_count(1)?;
             Some(operations::vector_norm(&arguments[0], span)?)
@@ -220,6 +228,58 @@ fn evaluate_math_builtin(
         "shape" => {
             require_count(1)?;
             Some(operations::matrix_shape_value(&arguments[0], span)?)
+        }
+        "trace" => {
+            require_count(1)?;
+            Some(operations::matrix_trace(&arguments[0], span)?)
+        }
+        "rank" => {
+            require_count(1)?;
+            Some(operations::matrix_rank(&arguments[0], span)?)
+        }
+        "matvec" => {
+            require_count(2)?;
+            Some(operations::matrix_vector_multiply(
+                &arguments[0],
+                &arguments[1],
+                span,
+            )?)
+        }
+        "determinant" => {
+            require_count(1)?;
+            Some(operations::matrix_determinant(&arguments[0], span)?)
+        }
+        "inverse" => {
+            require_count(1)?;
+            Some(operations::matrix_inverse(&arguments[0], span)?)
+        }
+        "lu" => {
+            require_count(1)?;
+            Some(operations::matrix_lu(&arguments[0], span)?)
+        }
+        "qr" => {
+            require_count(1)?;
+            Some(operations::matrix_qr(&arguments[0], span)?)
+        }
+        "cholesky" => {
+            require_count(1)?;
+            Some(operations::matrix_cholesky(&arguments[0], span)?)
+        }
+        "solve" => {
+            require_count(2)?;
+            Some(operations::matrix_solve(
+                &arguments[0],
+                &arguments[1],
+                span,
+            )?)
+        }
+        "least_squares" => {
+            require_count(2)?;
+            Some(operations::matrix_least_squares(
+                &arguments[0],
+                &arguments[1],
+                span,
+            )?)
         }
         "transpose" => {
             require_count(1)?;
@@ -321,10 +381,21 @@ fn is_math_builtin(name: &str) -> bool {
             | "vector_subtract"
             | "vector_scale"
             | "dot"
+            | "cross"
             | "norm"
             | "distance"
             | "normalize"
             | "shape"
+            | "trace"
+            | "rank"
+            | "matvec"
+            | "determinant"
+            | "inverse"
+            | "lu"
+            | "qr"
+            | "cholesky"
+            | "solve"
+            | "least_squares"
             | "transpose"
             | "matrix_add"
             | "matrix_subtract"
@@ -816,12 +887,12 @@ type ImportedModule = (
 
 #[derive(Clone)]
 struct MessageBehavior {
-    function: Rc<FunctionValue>,
+    function: Handle<FunctionValue>,
     field_count: usize,
 }
 
 struct ActiveMessageState {
-    instance: Rc<StructInstance>,
+    instance: ArenaRef<StructInstance>,
     scope_index: usize,
 }
 
@@ -829,7 +900,12 @@ struct ActiveMessageState {
 pub struct Evaluator {
     scopes: ScopeStack,
     variable_types: TypeScopes,
-    function_scopes: Vec<HashMap<String, Rc<Function>>>,
+    function_values: SharedCell<Arena<FunctionValue>>,
+    struct_values: SharedCell<Arena<StructInstance>>,
+    enum_values: SharedCell<Arena<EnumValue>>,
+    source_values: SharedCell<Arena<SourceText>>,
+    function_arena: Arena<Function>,
+    function_scopes: Vec<HashMap<String, Handle<Function>>>,
     struct_scopes: Vec<HashMap<String, StructDefinition>>,
     enum_scopes: Vec<HashMap<String, EnumDefinition>>,
     message_scopes: Vec<HashMap<(DeclarationIdentity, String), MessageBehavior>>,
@@ -838,7 +914,7 @@ pub struct Evaluator {
     current_span: Option<Span>,
     current_file: Option<PathBuf>,
     module_identity: String,
-    current_source: Option<Rc<str>>,
+    current_source: Option<ArenaRef<SourceText>>,
     import_stack: Vec<PathBuf>,
     module_is_imported: bool,
     import_cache: ImportCache,
@@ -959,6 +1035,14 @@ impl Evaluator {
             }
             Type::Array(element) => Type::Array(Box::new(self.resolve_type_identity(element))),
             Type::List(element) => Type::List(Box::new(self.resolve_type_identity(element))),
+            Type::Vector(element, length) => {
+                Type::Vector(Box::new(self.resolve_type_identity(element)), *length)
+            }
+            Type::TypedMatrix(element, rows, columns) => Type::TypedMatrix(
+                Box::new(self.resolve_type_identity(element)),
+                *rows,
+                *columns,
+            ),
             Type::Tuple(elements) => Type::Tuple(
                 elements
                     .iter()
@@ -991,8 +1075,45 @@ impl Evaluator {
         }
     }
 
-    fn track_function(&mut self, function: Rc<FunctionValue>) -> Rc<FunctionValue> {
-        function
+    fn track_function(&mut self, function: FunctionValue) -> Handle<FunctionValue> {
+        self.function_values.borrow_mut().insert(function)
+    }
+
+    fn tracked_function(
+        &self,
+        handle: Handle<FunctionValue>,
+    ) -> Result<FunctionValue, SimplyError> {
+        self.function_values
+            .borrow()
+            .get(handle)
+            .cloned()
+            .ok_or_else(|| {
+                self.runtime_error_with_code(
+                    DiagnosticCode::RuntimeName,
+                    "function handle is no longer valid",
+                )
+            })
+    }
+
+    fn tracked_struct(
+        &self,
+        instance: &ArenaRef<StructInstance>,
+    ) -> Result<StructInstance, SimplyError> {
+        instance.get_cloned().ok_or_else(|| {
+            self.runtime_error_with_code(
+                DiagnosticCode::RuntimeName,
+                "struct handle is no longer valid",
+            )
+        })
+    }
+
+    fn tracked_enum(&self, value: &ArenaRef<EnumValue>) -> Result<EnumValue, SimplyError> {
+        value.get_cloned().ok_or_else(|| {
+            self.runtime_error_with_code(
+                DiagnosticCode::RuntimeName,
+                "enum handle is no longer valid",
+            )
+        })
     }
 
     fn define(&mut self, name: String, value: Value) -> Result<(), String> {
@@ -1022,11 +1143,16 @@ impl Evaluator {
             .rev()
             .find(|state| {
                 Some(state.scope_index) == binding_scope
-                    && state.instance.fields.borrow().contains_key(name)
+                    && state
+                        .instance
+                        .with(|instance| instance.fields.contains_key(name))
+                        .unwrap_or(false)
             })
             .map(|state| state.instance.clone())
         {
-            instance.fields.borrow_mut().insert(name.to_owned(), value);
+            instance.with_mut(|instance| {
+                instance.fields.insert(name.to_owned(), value);
+            });
         }
         true
     }
@@ -1073,14 +1199,19 @@ impl Evaluator {
             .rev()
             .find(|state| {
                 Some(state.scope_index) == binding_scope
-                    && state.instance.fields.borrow().contains_key(name)
+                    && state
+                        .instance
+                        .with(|instance| instance.fields.contains_key(name))
+                        .unwrap_or(false)
             })
             .map(|state| state.instance.clone())
         else {
             return;
         };
         if let Some(value) = self.lookup(name).cloned() {
-            instance.fields.borrow_mut().insert(name.to_owned(), value);
+            instance.with_mut(|instance| {
+                instance.fields.insert(name.to_owned(), value);
+            });
         }
     }
 
@@ -1100,8 +1231,12 @@ impl Evaluator {
     fn pop_scope(&mut self) {
         self.scopes.pop();
         self.variable_types.pop();
-        if self.function_scopes.len() > 1 {
-            self.function_scopes.pop();
+        if self.function_scopes.len() > 1
+            && let Some(functions) = self.function_scopes.pop()
+        {
+            for handle in functions.into_values() {
+                self.function_arena.remove(handle);
+            }
         }
         if self.struct_scopes.len() > 1 {
             self.struct_scopes.pop();
@@ -1150,6 +1285,11 @@ impl Evaluator {
         Self {
             scopes: ScopeStack::new(),
             variable_types: TypeScopes::new(),
+            function_values: SharedCell::new(Arena::new()),
+            struct_values: SharedCell::new(Arena::new()),
+            enum_values: SharedCell::new(Arena::new()),
+            source_values: SharedCell::new(Arena::new()),
+            function_arena: Arena::new(),
             function_scopes: vec![HashMap::new()],
             struct_scopes: vec![HashMap::new()],
             enum_scopes: vec![HashMap::new()],
@@ -1292,12 +1432,12 @@ impl Evaluator {
                         *mutable,
                     )
                 }));
-                let function = Rc::new(FunctionValue {
+                let function = self.track_function(FunctionValue {
                     name: None,
                     parameters: function_parameters,
                     return_type: None,
                     body: Arc::clone(body),
-                    captures: RefCell::new(HashMap::new()),
+                    captures: HashMap::new(),
                     source: self.function_source_context(),
                 });
                 self.message_scopes
@@ -1454,20 +1594,20 @@ impl Evaluator {
             let resolved_return_type = return_type
                 .as_ref()
                 .map(|typ| self.resolve_type_identity(typ));
-            let function_value = self.track_function(Rc::new(FunctionValue {
+            let function_value = self.track_function(FunctionValue {
                 name: Some(name.clone()),
                 parameters: resolved_parameters.clone(),
                 return_type: resolved_return_type.clone(),
                 body: Arc::clone(body),
-                captures: RefCell::new(HashMap::new()),
+                captures: HashMap::new(),
                 source: source.clone(),
-            }));
+            });
             self.function_scopes
                 .last_mut()
                 .expect("function scope stack always has a global scope")
                 .insert(
                     name.clone(),
-                    Rc::new(Function {
+                    self.function_arena.insert(Function {
                         parameters: resolved_parameters.clone(),
                         return_type: resolved_return_type.clone(),
                         body: Arc::clone(body),
@@ -1504,7 +1644,10 @@ impl Evaluator {
         let program = Parser::new(tokens).parse()?;
         self.current_file = Some(resolved.clone());
         self.module_identity = resolved.display().to_string();
-        self.current_source = Some(Rc::from(source));
+        self.current_source = Some(ArenaRef::insert(
+            self.source_values.clone(),
+            SourceText { text: source },
+        ));
         self.import_stack = vec![resolved];
         self.module_is_imported = false;
         self.run(&program)
@@ -1578,7 +1721,7 @@ impl Evaluator {
                         for (name, value) in bindings {
                             self.variable_types.define(
                                 name.clone(),
-                                Self::type_of_value(&value),
+                                self.type_of_value(&value),
                                 false,
                             );
                             self.define(name, value).map_err(|error| {
@@ -1655,9 +1798,14 @@ impl Evaluator {
                         self.ensure_type(&value, &expected, name)?;
                         self.variable_types.define(name.clone(), expected, *mutable);
                     } else {
+                        let typ = self.type_of_value(&value);
                         self.variable_types.define(
                             name.clone(),
-                            Self::type_of_value(&value),
+                            if *mutable {
+                                Self::erase_inferred_dimensions(typ)
+                            } else {
+                                typ
+                            },
                             *mutable,
                         );
                     }
@@ -1680,7 +1828,7 @@ impl Evaluator {
                         steps: steps.clone(),
                     })?;
                     self.variable_types
-                        .define(name.clone(), Self::type_of_value(&value), false);
+                        .define(name.clone(), self.type_of_value(&value), false);
                     self.scopes
                         .define(name.clone(), value, false)
                         .map_err(|error| {
@@ -1743,7 +1891,7 @@ impl Evaluator {
                         if *element == Type::Unknown {
                             self.variable_types.replace_visible(
                                 name,
-                                Type::List(Box::new(Self::type_of_value(&value))),
+                                Type::List(Box::new(self.type_of_value(&value))),
                             );
                         } else {
                             self.ensure_type(&value, &element, name)?;
@@ -1774,7 +1922,8 @@ impl Evaluator {
                     let index_value = self.evaluate(index)?;
                     let value = self.evaluate(value)?;
                     if let Some(expected) = self.variable_types.lookup(name)
-                        && let Type::Array(element) | Type::List(element) = expected
+                        && let Type::Array(element) | Type::List(element) | Type::Vector(element, _) =
+                            expected
                     {
                         self.ensure_type(&value, element, name)?;
                     } else if let Some(Type::HashValues(element)) = self.variable_types.lookup(name)
@@ -1807,7 +1956,7 @@ impl Evaluator {
                     let typed_bindings = bindings
                         .into_iter()
                         .map(|(name, value)| {
-                            let typ = Self::type_of_value(&value);
+                            let typ = self.type_of_value(&value);
                             (name, value, typ, *mutable)
                         })
                         .collect::<Vec<_>>();
@@ -1850,29 +1999,27 @@ impl Evaluator {
                     let resolved_return_type = return_type
                         .as_ref()
                         .map(|typ| self.resolve_type_identity(typ));
-                    let function = self.track_function(Rc::new(FunctionValue {
+                    let function = self.track_function(FunctionValue {
                         name: Some(name.clone()),
                         parameters: resolved_parameters.clone(),
                         return_type: resolved_return_type.clone(),
                         body: Arc::clone(body),
-                        captures: RefCell::new(
-                            if self.function_scopes.len() > 1 || self.import_stack.len() > 1 {
-                                let mut dependencies = closure_dependencies(body, parameters);
-                                dependencies.remove(name);
-                                self.scopes.values_for(&dependencies)
-                            } else {
-                                HashMap::new()
-                            },
-                        ),
+                        captures: if self.function_scopes.len() > 1 || self.import_stack.len() > 1 {
+                            let mut dependencies = closure_dependencies(body, parameters);
+                            dependencies.remove(name);
+                            self.scopes.values_for(&dependencies)
+                        } else {
+                            HashMap::new()
+                        },
                         source: source.clone(),
-                    }));
+                    });
                     let function_value = Value::Function(function);
                     self.function_scopes
                         .last_mut()
                         .expect("function scope stack always has a global scope")
                         .insert(
                             name.clone(),
-                            Rc::new(Function {
+                            self.function_arena.insert(Function {
                                 parameters: resolved_parameters.clone(),
                                 return_type: resolved_return_type.clone(),
                                 body: Arc::clone(body),
@@ -2017,7 +2164,7 @@ impl Evaluator {
                                 let result = if let Some(name) = &catch.binding {
                                     let error_type = error
                                         .thrown_value()
-                                        .map(Self::type_of_value)
+                                        .map(|value| self.type_of_value(value))
                                         .unwrap_or(Type::Tree);
                                     self.variable_types.define(name.clone(), error_type, false);
                                     self.scopes
@@ -2134,7 +2281,7 @@ impl Evaluator {
             ));
         }
         let (program, source) = if let Some(cached) = self.import_cache.borrow().get(&resolved) {
-            (Arc::clone(&cached.0), Rc::clone(&cached.1))
+            (Arc::clone(&cached.0), cached.1.clone())
         } else {
             let source =
                 fs::read_to_string(&resolved).map_err(|error| self.file_error(&resolved, error))?;
@@ -2145,16 +2292,26 @@ impl Evaluator {
                 .parse()
                 .map_err(|error| error.in_source(resolved.display().to_string(), source.clone()))?;
             let program = Arc::new(program);
-            let source: Rc<str> = Rc::from(source);
+            let source = ArenaRef::insert(self.source_values.clone(), SourceText { text: source });
             self.import_cache
                 .borrow_mut()
-                .insert(resolved.clone(), (Arc::clone(&program), Rc::clone(&source)));
+                .insert(resolved.clone(), (Arc::clone(&program), source.clone()));
             (program, source)
         };
+        let source_contents = source.with(|source| source.text.clone()).ok_or_else(|| {
+            self.runtime_error_with_code(
+                DiagnosticCode::RuntimeImport,
+                "source text handle is no longer valid",
+            )
+        })?;
         let mut module = Self {
             current_file: Some(resolved.clone()),
             module_identity: resolved.display().to_string(),
-            current_source: Some(Rc::clone(&source)),
+            current_source: Some(source.clone()),
+            function_values: self.function_values.clone(),
+            struct_values: self.struct_values.clone(),
+            enum_values: self.enum_values.clone(),
+            source_values: self.source_values.clone(),
             import_stack: self
                 .import_stack
                 .iter()
@@ -2162,7 +2319,7 @@ impl Evaluator {
                 .chain(std::iter::once(resolved.clone()))
                 .collect(),
             module_is_imported: true,
-            import_cache: Rc::clone(&self.import_cache),
+            import_cache: self.import_cache.clone(),
             ..Self::new()
         };
         let mut export_names = Vec::new();
@@ -2205,17 +2362,24 @@ impl Evaluator {
             let mut exported_types = HashMap::new();
             for name in export_names {
                 if let Some(value) = module.lookup(&name).cloned() {
-                    if let Value::Function(function) = &value
-                        && function.captures.borrow().is_empty()
-                    {
-                        let mut dependencies =
-                            closure_dependencies(&function.body, &function.parameters);
-                        if let Some(function_name) = &function.name {
-                            dependencies.remove(function_name);
+                    if let Value::Function(function) = &value {
+                        let function_value = module.tracked_function(*function)?;
+                        if function_value.captures.is_empty() {
+                            let mut dependencies = closure_dependencies(
+                                &function_value.body,
+                                &function_value.parameters,
+                            );
+                            if let Some(function_name) = &function_value.name {
+                                dependencies.remove(function_name);
+                            }
+                            let captures = module.scopes.values_for(&dependencies);
+                            module
+                                .function_values
+                                .borrow_mut()
+                                .get_mut(*function)
+                                .expect("tracked function remains in its arena")
+                                .captures = captures;
                         }
-                        function
-                            .captures
-                            .replace(module.scopes.values_for(&dependencies));
                     }
                     exports.insert(name, value);
                     continue;
@@ -2228,20 +2392,22 @@ impl Evaluator {
                         .filter(|((identity, _), _)| identity == &definition.identity)
                         .map(|(key, behavior)| {
                             let behavior = behavior.clone();
-                            let mut dependencies = closure_dependencies(
-                                &behavior.function.body,
-                                &behavior.function.parameters,
-                            );
-                            for (parameter, _, _) in &behavior.function.parameters {
+                            let function = module.tracked_function(behavior.function)?;
+                            let mut dependencies =
+                                closure_dependencies(&function.body, &function.parameters);
+                            for (parameter, _, _) in &function.parameters {
                                 dependencies.remove(parameter);
                             }
-                            behavior
-                                .function
-                                .captures
-                                .replace(module.scopes.values_for(&dependencies));
-                            (key.clone(), behavior)
+                            let captures = module.scopes.values_for(&dependencies);
+                            module
+                                .function_values
+                                .borrow_mut()
+                                .get_mut(behavior.function)
+                                .expect("tracked message function remains in its arena")
+                                .captures = captures;
+                            Ok((key.clone(), behavior))
                         })
-                        .collect();
+                        .collect::<Result<HashMap<_, _>, SimplyError>>()?;
                     exported_types.insert(
                         name,
                         ExportedRuntimeType::Struct {
@@ -2264,7 +2430,7 @@ impl Evaluator {
         })();
         result.map_err(|error: SimplyError| {
             error
-                .in_source(resolved.display().to_string(), source.as_ref().to_owned())
+                .in_source(resolved.display().to_string(), source_contents)
                 .with_context(format!("in imported module `{}`", resolved.display()))
         })
     }
@@ -2282,7 +2448,7 @@ impl Evaluator {
         }
         Some(SourceContext {
             filename: self.current_file.as_ref()?.display().to_string(),
-            source: Rc::clone(self.current_source.as_ref()?),
+            source: self.current_source.as_ref()?.clone(),
         })
     }
 
@@ -2543,10 +2709,10 @@ impl Evaluator {
                         Value::Matrix(_) => "Matrix",
                         Value::Function(_) => "Function",
                         Value::Struct(instance) => {
-                            return Ok(Value::String(instance.type_name.clone()));
+                            return Ok(Value::String(self.tracked_struct(&instance)?.type_name));
                         }
                         Value::Enum(value) => {
-                            return Ok(Value::String(value.enum_name.clone()));
+                            return Ok(Value::String(self.tracked_enum(&value)?.enum_name));
                         }
                     };
                     return Ok(Value::String(type_name.into()));
@@ -3231,12 +3397,15 @@ impl Evaluator {
                             ));
                         }
                     };
-                    Ok(Value::Enum(Rc::new(EnumValue {
-                        enum_name: enum_name.clone(),
-                        identity: definition.identity,
-                        variant_name: variant_name.clone(),
-                        payload,
-                    })))
+                    Ok(Value::Enum(ArenaRef::insert(
+                        self.enum_values.clone(),
+                        EnumValue {
+                            enum_name: enum_name.clone(),
+                            identity: definition.identity,
+                            variant_name: variant_name.clone(),
+                            payload,
+                        },
+                    )))
                 } else {
                     Err(self.runtime_error_with_code(
                         DiagnosticCode::RuntimeMessage,
@@ -3271,6 +3440,7 @@ impl Evaluator {
         arguments: Vec<Value>,
     ) -> Result<Value, SimplyError> {
         if let Value::Enum(value) = &receiver {
+            let value = self.tracked_enum(value)?;
             return Err(self.runtime_error_with_code(
                 DiagnosticCode::RuntimeMessage,
                 format!(
@@ -3280,32 +3450,33 @@ impl Evaluator {
             ));
         }
         if let Value::Struct(instance) = &receiver {
+            let instance_value = self.tracked_struct(instance)?;
             let behavior = self
-                .lookup_message(&instance.identity, message)
+                .lookup_message(&instance_value.identity, message)
                 .cloned()
                 .ok_or_else(|| {
                     self.runtime_error_with_code(
                         DiagnosticCode::RuntimeMessage,
                         format!(
                             "message `{message}` is not understood by `{}`",
-                            instance.type_name
+                            instance_value.type_name
                         ),
                     )
                 })?;
+            let behavior_function = self.tracked_function(behavior.function)?;
             let fields = self
-                .lookup_struct_identity(&instance.identity)
+                .lookup_struct_identity(&instance_value.identity)
                 .ok_or_else(|| {
                     self.runtime_error_with_code(
                         DiagnosticCode::RuntimeMessage,
-                        format!("unknown struct type `{}`", instance.type_name),
+                        format!("unknown struct type `{}`", instance_value.type_name),
                     )
                 })?
                 .fields
                 .iter()
                 .map(|field| {
-                    instance
+                    instance_value
                         .fields
-                        .borrow()
                         .get(&field.name)
                         .cloned()
                         .ok_or_else(|| {
@@ -3313,18 +3484,18 @@ impl Evaluator {
                                 DiagnosticCode::RuntimeMessage,
                                 format!(
                                     "struct `{}` is missing declared field `{}`",
-                                    instance.type_name, field.name
+                                    instance_value.type_name, field.name
                                 ),
                             )
                         })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            if arguments.len() + behavior.field_count != behavior.function.parameters.len() {
+            if arguments.len() + behavior.field_count != behavior_function.parameters.len() {
                 return Err(self.runtime_error_with_code(
                     DiagnosticCode::InvalidFunctionCall,
                     format!(
                         "message `{message}` expects {} arguments, got {}",
-                        behavior.function.parameters.len() - behavior.field_count,
+                        behavior_function.parameters.len() - behavior.field_count,
                         arguments.len()
                     ),
                 ));
@@ -3370,7 +3541,7 @@ impl Evaluator {
                 for (binding, bound_value) in bindings {
                     self.variable_types.define(
                         binding.clone(),
-                        Self::type_of_value(&bound_value),
+                        self.type_of_value(&bound_value),
                         false,
                     );
                     self.scopes
@@ -3488,11 +3659,14 @@ impl Evaluator {
             self.ensure_type(&value, &field.field_type, &field.name)?;
             fields.insert(field.name.clone(), value);
         }
-        Ok(Value::Struct(Rc::new(StructInstance {
-            identity: definition.identity.clone(),
-            type_name: name.into(),
-            fields: Rc::new(RefCell::new(fields)),
-        })))
+        Ok(Value::Struct(ArenaRef::insert(
+            self.struct_values.clone(),
+            StructInstance {
+                identity: definition.identity.clone(),
+                type_name: name.into(),
+                fields,
+            },
+        )))
     }
 
     fn invoke_function(&mut self, name: &str, values: Vec<Value>) -> Result<Value, SimplyError> {
@@ -3510,6 +3684,7 @@ impl Evaluator {
                     .iter()
                     .rev()
                     .find_map(|scope| scope.get(name))
+                    .and_then(|handle| self.function_arena.get(*handle))
                     .cloned()
                     .ok_or_else(|| {
                         let description = if name.chars().next().is_some_and(char::is_uppercase) {
@@ -3519,14 +3694,14 @@ impl Evaluator {
                         };
                         self.runtime_error_with_code(DiagnosticCode::RuntimeName, description)
                     })?;
-                self.track_function(Rc::new(FunctionValue {
+                self.track_function(FunctionValue {
                     name: Some(name.to_owned()),
                     parameters: function.parameters.clone(),
                     return_type: function.return_type.clone(),
                     body: Arc::clone(&function.body),
-                    captures: RefCell::new(HashMap::new()),
+                    captures: HashMap::new(),
                     source: function.source.clone(),
-                }))
+                })
             }
         };
         self.invoke_function_value(name, function, values)
@@ -3535,7 +3710,7 @@ impl Evaluator {
     fn invoke_function_value(
         &mut self,
         name: &str,
-        function: Rc<FunctionValue>,
+        function: Handle<FunctionValue>,
         values: Vec<Value>,
     ) -> Result<Value, SimplyError> {
         self.invoke_function_value_with_message_state(name, function, values, None)
@@ -3544,9 +3719,9 @@ impl Evaluator {
     fn invoke_message_value(
         &mut self,
         name: &str,
-        function: Rc<FunctionValue>,
+        function: Handle<FunctionValue>,
         values: Vec<Value>,
-        instance: Rc<StructInstance>,
+        instance: ArenaRef<StructInstance>,
     ) -> Result<Value, SimplyError> {
         self.invoke_function_value_with_message_state(name, function, values, Some(instance))
     }
@@ -3554,21 +3729,22 @@ impl Evaluator {
     fn invoke_function_value_with_message_state(
         &mut self,
         name: &str,
-        function: Rc<FunctionValue>,
+        function: Handle<FunctionValue>,
         values: Vec<Value>,
-        message_instance: Option<Rc<StructInstance>>,
+        message_instance: Option<ArenaRef<StructInstance>>,
     ) -> Result<Value, SimplyError> {
-        if function.parameters.len() != values.len() {
+        let function_value = self.tracked_function(function)?;
+        if function_value.parameters.len() != values.len() {
             return Err(self.runtime_error_with_code(
                 DiagnosticCode::RuntimeArgument,
                 format!(
                     "function `{name}` expects {} arguments, got {}",
-                    function.parameters.len(),
+                    function_value.parameters.len(),
                     values.len()
                 ),
             ));
         }
-        for ((parameter, expected, _), value) in function.parameters.iter().zip(&values) {
+        for ((parameter, expected, _), value) in function_value.parameters.iter().zip(&values) {
             if let Some(expected) = expected {
                 self.ensure_type(value, expected, parameter)?;
             }
@@ -3582,31 +3758,31 @@ impl Evaluator {
                 ),
             ));
         }
-        let needs_function_scope = !function.captures.borrow().is_empty()
-            || function.name.as_ref().is_some_and(|function_name| {
+        let needs_function_scope = !function_value.captures.is_empty()
+            || function_value.name.as_ref().is_some_and(|function_name| {
                 !matches!(
                     self.lookup(function_name),
-                    Some(Value::Function(current)) if Rc::ptr_eq(current, &function)
+                    Some(Value::Function(current)) if *current == function
                 )
             });
         self.call_depth += 1;
-        let function_source = function.source.clone();
+        let function_source = function_value.source.clone();
         let previous_source = std::mem::replace(
             &mut self.current_source,
             function_source
                 .as_ref()
-                .map(|context| Rc::clone(&context.source)),
+                .map(|context| context.source.clone()),
         );
         let mut scopes_pushed = 0;
         let result = (|| {
             if needs_function_scope {
                 self.push_scope();
                 scopes_pushed += 1;
-                if let Some(function_name) = &function.name {
-                    let value = Value::Function(function.clone());
+                if let Some(function_name) = &function_value.name {
+                    let value = Value::Function(function);
                     self.variable_types.define(
                         function_name.clone(),
-                        Self::type_of_value(&value),
+                        self.type_of_value(&value),
                         false,
                     );
                     self.scopes
@@ -3618,9 +3794,9 @@ impl Evaluator {
                             )
                         })?;
                 }
-                for (capture, value) in function.captures.borrow().iter() {
+                for (capture, value) in &function_value.captures {
                     self.variable_types
-                        .define(capture.clone(), Self::type_of_value(value), false);
+                        .define(capture.clone(), self.type_of_value(value), false);
                     self.scopes
                         .define(capture.clone(), value.clone(), false)
                         .map_err(|error| {
@@ -3633,12 +3809,9 @@ impl Evaluator {
             }
             self.push_scope();
             scopes_pushed += 1;
-            for ((parameter, _, mutable), value) in function.parameters.iter().zip(values) {
-                self.variable_types.define(
-                    parameter.clone(),
-                    Self::type_of_value(&value),
-                    *mutable,
-                );
+            for ((parameter, _, mutable), value) in function_value.parameters.iter().zip(values) {
+                self.variable_types
+                    .define(parameter.clone(), self.type_of_value(&value), *mutable);
                 self.scopes
                     .define(parameter.clone(), value, *mutable)
                     .map_err(|error| {
@@ -3652,7 +3825,7 @@ impl Evaluator {
                     scope_index: self.scopes.current_scope_index(),
                 });
             }
-            let result = self.execute_statements(&function.body);
+            let result = self.execute_statements(&function_value.body);
             if is_message_invocation {
                 self.active_message_states.pop();
             }
@@ -3676,15 +3849,21 @@ impl Evaluator {
         self.current_source = previous_source;
         self.call_depth -= 1;
         let result = result.and_then(|result| {
-            if let Some(expected) = &function.return_type {
+            if let Some(expected) = &function_value.return_type {
                 self.ensure_type(&result, expected, name)?;
             }
             Ok(result)
         });
         match function_source {
-            Some(context) => result.map_err(|error| {
-                error.in_source(context.filename, context.source.as_ref().to_owned())
-            }),
+            Some(context) => {
+                let Some(source) = context.source.with(|source| source.text.clone()) else {
+                    return Err(self.runtime_error_with_code(
+                        DiagnosticCode::RuntimeImport,
+                        "function source text handle is no longer valid",
+                    ));
+                };
+                result.map_err(|error| error.in_source(context.filename, source))
+            }
             None => result,
         }
     }
@@ -4642,18 +4821,6 @@ impl Evaluator {
         Ok(Value::List(shared_values(std::mem::take(values))))
     }
 
-    #[cfg(test)]
-    fn evaluate_streaming_pipeline<I>(
-        &mut self,
-        values: I,
-        steps: &[PipelineStep],
-    ) -> Result<Value, SimplyError>
-    where
-        I: IntoIterator<Item = Value>,
-    {
-        self.evaluate_streaming_pipeline_with_sum_type(values, steps, Type::Unknown)
-    }
-
     fn evaluate_streaming_pipeline_with_sum_type<I>(
         &mut self,
         values: I,
@@ -5565,8 +5732,12 @@ impl Evaluator {
             Value::Tree(_) => "Tree".into(),
             Value::Matrix(_) => "Matrix".into(),
             Value::Function(_) => "Function".into(),
-            Value::Struct(instance) => instance.type_name.clone(),
-            Value::Enum(value) => value.enum_name.clone(),
+            Value::Struct(instance) => instance
+                .with(|instance| instance.type_name.clone())
+                .unwrap_or_else(|| "<invalid struct>".into()),
+            Value::Enum(value) => value
+                .with(|value| value.enum_name.clone())
+                .unwrap_or_else(|| "<invalid enum>".into()),
         }
     }
 
@@ -5579,10 +5750,56 @@ impl Evaluator {
             | (Value::Unit, Type::Unit)
             | (Value::Hash(_), Type::Hash)
             | (Value::Tree(_), Type::Tree)
-            | (Value::Matrix(_), Type::Matrix)
             | (Value::Function(_), Type::Function { .. }) => true,
-            (Value::Struct(instance), Type::Struct(expected)) => &instance.identity == expected,
-            (Value::Enum(value), Type::Enum(expected)) => &value.identity == expected,
+            (Value::Matrix(rows) | Value::Array(rows) | Value::List(rows), Type::Matrix) => {
+                let mut expected_columns = None;
+                !rows.is_empty()
+                    && rows.iter().all(|row| match row {
+                        Value::Array(values) | Value::List(values) if !values.is_empty() => {
+                            if expected_columns.is_some_and(|columns| columns != values.len()) {
+                                return false;
+                            }
+                            expected_columns = Some(values.len());
+                            values
+                                .iter()
+                                .all(|value| matches!(value, Value::Int(_) | Value::Float(_)))
+                        }
+                        _ => false,
+                    })
+            }
+            (
+                Value::Matrix(rows) | Value::Array(rows) | Value::List(rows),
+                Type::TypedMatrix(element, expected_rows, expected_columns),
+            ) => {
+                !rows.is_empty()
+                    && rows.iter().all(|row| {
+                        matches!(row, Value::Array(values) | Value::List(values)
+                            if !values.is_empty()
+                                && values.iter().all(|value| self.value_matches_type(value, element)))
+                    })
+                    && expected_rows.is_none_or(|expected| rows.len() == expected)
+                    && expected_columns.is_none_or(|expected| {
+                        rows.first().is_some_and(|row| match row {
+                            Value::Array(values) | Value::List(values) => values.len() == expected,
+                            _ => false,
+                        })
+                    })
+                    && rows.first().is_some_and(|first_row| {
+                        let width = match first_row {
+                            Value::Array(values) | Value::List(values) => values.len(),
+                            _ => return false,
+                        };
+                        rows.iter().all(|row| {
+                            matches!(row, Value::Array(values) | Value::List(values) if values.len() == width)
+                        })
+                    })
+            }
+            (Value::Struct(instance), Type::Struct(expected)) => instance
+                .with(|instance| &instance.identity == expected)
+                .unwrap_or(false),
+            (Value::Enum(value), Type::Enum(expected)) => value
+                .with(|value| &value.identity == expected)
+                .unwrap_or(false),
             (Value::Range { .. }, Type::Range) => true,
             (Value::CsvStream { .. }, Type::CsvStream) => true,
             (Value::Array(_), Type::Array(element)) | (Value::List(_), Type::List(element))
@@ -5594,6 +5811,14 @@ impl Evaluator {
             | (Value::List(values), Type::List(element)) => values
                 .iter()
                 .all(|value| self.value_matches_type(value, element)),
+            (Value::Array(values), Type::Vector(element, expected_length))
+            | (Value::List(values), Type::Vector(element, expected_length))
+            | (Value::Tuple(values), Type::Vector(element, expected_length)) => {
+                expected_length.is_none_or(|expected| values.len() == expected)
+                    && values
+                        .iter()
+                        .all(|value| self.value_matches_type(value, element))
+            }
             (Value::Hash(values), Type::HashValues(element))
             | (Value::Tree(values), Type::TreeValues(element)) => values
                 .values()
@@ -5609,7 +5834,7 @@ impl Evaluator {
         }
     }
 
-    fn type_of_value(value: &Value) -> Type {
+    fn type_of_value(&self, value: &Value) -> Type {
         match value {
             Value::String(_) => Type::String,
             Value::Int(_) => Type::Int,
@@ -5617,21 +5842,29 @@ impl Evaluator {
             Value::Bool(_) => Type::Bool,
             Value::Range { .. } => Type::Range,
             Value::CsvStream { .. } => Type::CsvStream,
-            Value::Array(values) => Type::Array(Box::new(
-                values
-                    .first()
-                    .map(Self::type_of_value)
-                    .unwrap_or(Type::Unknown),
-            )),
+            Value::Array(values) => Type::Vector(
+                Box::new(
+                    values
+                        .first()
+                        .map(|value| self.type_of_value(value))
+                        .unwrap_or(Type::Unknown),
+                ),
+                Some(values.len()),
+            ),
             Value::List(values) => Type::List(Box::new(
                 values
                     .first()
-                    .map(Self::type_of_value)
+                    .map(|value| self.type_of_value(value))
                     .unwrap_or(Type::Unknown),
             )),
-            Value::Tuple(values) => Type::Tuple(values.iter().map(Self::type_of_value).collect()),
+            Value::Tuple(values) => Type::Tuple(
+                values
+                    .iter()
+                    .map(|value| self.type_of_value(value))
+                    .collect(),
+            ),
             Value::Hash(values) => {
-                let mut types = values.values().map(Self::type_of_value);
+                let mut types = values.values().map(|value| self.type_of_value(value));
                 let first = types.next().unwrap_or(Type::Unknown);
                 if types.all(|typ| typ.compatible_with(&first)) {
                     Type::HashValues(Box::new(first))
@@ -5640,7 +5873,7 @@ impl Evaluator {
                 }
             }
             Value::Tree(values) => {
-                let mut types = values.values().map(Self::type_of_value);
+                let mut types = values.values().map(|value| self.type_of_value(value));
                 let first = types.next().unwrap_or(Type::Unknown);
                 if types.all(|typ| typ.compatible_with(&first)) {
                     Type::TreeValues(Box::new(first))
@@ -5648,18 +5881,76 @@ impl Evaluator {
                     Type::TreeValues(Box::new(Type::Unknown))
                 }
             }
-            Value::Matrix(_) => Type::Matrix,
-            Value::Struct(instance) => Type::Struct(instance.identity.clone()),
-            Value::Enum(value) => Type::Enum(value.identity.clone()),
-            Value::Function(function) => Type::Function {
-                parameters: function
-                    .parameters
-                    .iter()
-                    .map(|(_, typ, _)| typ.clone().map(Box::new))
-                    .collect(),
-                return_type: function.return_type.clone().map(Box::new),
-            },
+            Value::Matrix(rows) => {
+                let mut element_type = Type::Unknown;
+                for row in rows.iter() {
+                    let values = match row {
+                        Value::Array(values) | Value::List(values) => values,
+                        _ => return Type::Matrix,
+                    };
+                    for value in values.iter() {
+                        let value_type = self.type_of_value(value);
+                        element_type = if element_type == Type::Unknown {
+                            value_type
+                        } else if value_type == Type::Float || element_type == Type::Float {
+                            Type::Float
+                        } else if value_type == element_type {
+                            element_type
+                        } else {
+                            Type::Unknown
+                        };
+                    }
+                }
+                Type::TypedMatrix(
+                    Box::new(element_type),
+                    Some(rows.len()),
+                    rows.first().and_then(|row| match row {
+                        Value::Array(values) | Value::List(values) => Some(values.len()),
+                        _ => None,
+                    }),
+                )
+            }
+            Value::Struct(instance) => instance
+                .with(|instance| Type::Struct(instance.identity.clone()))
+                .unwrap_or(Type::Unknown),
+            Value::Enum(value) => value
+                .with(|value| Type::Enum(value.identity.clone()))
+                .unwrap_or(Type::Unknown),
+            Value::Function(function) => self
+                .function_values
+                .borrow()
+                .get(*function)
+                .map(|function| Type::Function {
+                    parameters: function
+                        .parameters
+                        .iter()
+                        .map(|(_, typ, _)| typ.clone().map(Box::new))
+                        .collect(),
+                    return_type: function
+                        .return_type
+                        .as_ref()
+                        .map(|typ| Box::new(typ.clone())),
+                })
+                .unwrap_or(Type::Unknown),
             Value::Unit => Type::Unit,
+        }
+    }
+
+    fn erase_inferred_dimensions(typ: Type) -> Type {
+        match typ {
+            Type::Vector(element, _) => {
+                Type::Vector(Box::new(Self::erase_inferred_dimensions(*element)), None)
+            }
+            Type::TypedMatrix(element, _, _) => Type::TypedMatrix(
+                Box::new(Self::erase_inferred_dimensions(*element)),
+                None,
+                None,
+            ),
+            Type::Array(element) => {
+                Type::Array(Box::new(Self::erase_inferred_dimensions(*element)))
+            }
+            Type::List(element) => Type::List(Box::new(Self::erase_inferred_dimensions(*element))),
+            other => other,
         }
     }
 
@@ -5682,7 +5973,9 @@ impl Evaluator {
 
     fn sequence_item_type(&self, typ: &Type) -> Type {
         match typ {
-            Type::Array(element) | Type::List(element) => (**element).clone(),
+            Type::Array(element) | Type::List(element) | Type::Vector(element, _) => {
+                (**element).clone()
+            }
             Type::Tuple(elements) => {
                 if elements.contains(&Type::Float) {
                     Type::Float
@@ -5723,7 +6016,7 @@ impl Evaluator {
             Expr::Unary { operator, operand } => match operator {
                 UnaryOperator::Negate => self.runtime_expression_type(operand, item_type),
                 UnaryOperator::Not => Type::Bool,
-                UnaryOperator::Transpose => Type::Matrix,
+                UnaryOperator::Transpose => self.runtime_expression_type(operand, item_type),
             },
             Expr::Binary {
                 left,
@@ -5740,7 +6033,7 @@ impl Evaluator {
                     Greater | GreaterEqual | Less | LessEqual | Equal | NotEqual | And | Or => {
                         Type::Bool
                     }
-                    MatrixMultiply => Type::Matrix,
+                    MatrixMultiply => Type::TypedMatrix(Box::new(Type::Float), None, None),
                     Add if left == Type::String && right == Type::String => Type::String,
                     Add | Divide | Multiply | Remainder | Subtract
                         if matches!(left, Type::Int | Type::Float)
@@ -5779,9 +6072,10 @@ impl Evaluator {
                     _ => Type::Unknown,
                 }
             }
-            Expr::Array(values) => {
-                Type::Array(Box::new(self.collection_element_type(values, item_type)))
-            }
+            Expr::Array(values) => Type::Vector(
+                Box::new(self.collection_element_type(values, item_type)),
+                Some(values.len()),
+            ),
             Expr::List(values) => {
                 Type::List(Box::new(self.collection_element_type(values, item_type)))
             }
@@ -5792,7 +6086,7 @@ impl Evaluator {
                     .collect(),
             ),
             Expr::Index { target, .. } => match self.runtime_expression_type(target, item_type) {
-                Type::Array(element) | Type::List(element) => *element,
+                Type::Array(element) | Type::List(element) | Type::Vector(element, _) => *element,
                 Type::Tuple(elements) if !elements.is_empty() => {
                     if elements.iter().all(|typ| typ == &elements[0]) {
                         elements[0].clone()
@@ -5802,14 +6096,44 @@ impl Evaluator {
                 }
                 _ => Type::Unknown,
             },
+            Expr::Matrix(rows) => {
+                let mut element_type = Type::Unknown;
+                for row in rows {
+                    let row_type = self.runtime_expression_type(row, item_type);
+                    let row_element = match row_type {
+                        Type::Array(element) | Type::List(element) | Type::Vector(element, _) => {
+                            *element
+                        }
+                        _ => return Type::Matrix,
+                    };
+                    element_type = if element_type == Type::Unknown {
+                        row_element
+                    } else if element_type == Type::Float || row_element == Type::Float {
+                        Type::Float
+                    } else if element_type == row_element {
+                        element_type
+                    } else {
+                        Type::Unknown
+                    };
+                }
+                Type::TypedMatrix(
+                    Box::new(element_type),
+                    Some(rows.len()),
+                    rows.first().and_then(|row| {
+                        match self.runtime_expression_type(row, item_type) {
+                            Type::Vector(_, length) => length,
+                            _ => None,
+                        }
+                    }),
+                )
+            }
             Expr::Pipeline { .. }
             | Expr::MessageDispatch { .. }
             | Expr::EnumVariant { .. }
             | Expr::Match { .. }
             | Expr::Field { .. }
             | Expr::Hash(_)
-            | Expr::Tree(_)
-            | Expr::Matrix(_) => Type::Unknown,
+            | Expr::Tree(_) => Type::Unknown,
         }
     }
 
@@ -5830,424 +6154,5 @@ impl Evaluator {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::runtime::value::shared_values;
-    use crate::semantic::SemanticAnalyzer;
-    use crate::types::DeclarationKind;
-
-    #[test]
-    fn in_memory_declarations_have_deterministic_module_identity() {
-        let program = Parser::new(
-            Lexer::new(
-                "type Item:\n    value as Int\nend\n\
-                 enum State:\n    Ready\nend\n\
-                 item is Item(1)\nstate is State::Ready\n",
-            )
-            .tokenize()
-            .expect("valid source should tokenize"),
-        )
-        .parse()
-        .expect("valid source should parse");
-        SemanticAnalyzer::new()
-            .analyze(&program)
-            .expect("in-memory declarations should type check");
-
-        for _ in 0..2 {
-            let mut evaluator = Evaluator::new();
-            evaluator
-                .run(&program)
-                .expect("in-memory declarations should execute");
-            let Value::Struct(item) = evaluator.lookup("item").expect("item should be bound")
-            else {
-                panic!("item should be a struct value");
-            };
-            let Value::Enum(state) = evaluator.lookup("state").expect("state should be bound")
-            else {
-                panic!("state should be an enum value");
-            };
-            assert_eq!(
-                item.identity,
-                DeclarationIdentity::new("memory://root", "Item", DeclarationKind::Struct)
-            );
-            assert_eq!(
-                state.identity,
-                DeclarationIdentity::new("memory://root", "State", DeclarationKind::Enum)
-            );
-        }
-    }
-
-    #[test]
-    fn runtime_checks_enum_payload_types_without_semantic_analysis() {
-        let program = Parser::new(
-            Lexer::new("enum Result:\n    Ok as Int\nend\nvalue is Result::Ok(\"bad\")\n")
-                .tokenize()
-                .expect("valid enum source should tokenize"),
-        )
-        .parse()
-        .expect("valid enum syntax should parse");
-        let error = Evaluator::new()
-            .run(&program)
-            .expect_err("runtime must reject a mismatched enum payload");
-        assert!(error.to_string().contains("expected Int"), "{error}");
-        assert!(error.to_string().contains("found String"), "{error}");
-    }
-
-    #[test]
-    fn runtime_rejects_enum_message_dispatch_even_if_a_global_function_exists() {
-        let program = Parser::new(
-            Lexer::new(
-                "enum State:\n    Ready\nend\n\
-                 fn greet(value):\n    return \"hello\"\nend\n\
-                 state is State::Ready\nstate :: greet\n",
-            )
-            .tokenize()
-            .expect("valid enum source should tokenize"),
-        )
-        .parse()
-        .expect("valid enum syntax should parse");
-        let error = Evaluator::new()
-            .run(&program)
-            .expect_err("enum values must not receive struct/global messages");
-        assert!(
-            error
-                .to_string()
-                .contains("does not support message dispatch"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn recursive_tuple_matching_checks_arity_and_keeps_failed_bindings_local() {
-        let source = "pair is (1, 2, 3)\n\
-                     result is match pair:\n\
-                         (first, second):\n    99\n\
-                         _:\n    42\n\
-                     end\n";
-        let program = Parser::new(
-            Lexer::new(source)
-                .tokenize()
-                .expect("valid tuple source should tokenize"),
-        )
-        .parse()
-        .expect("valid tuple source should parse");
-        let mut evaluator = Evaluator::new();
-        evaluator
-            .run(&program)
-            .expect("wildcard should match after arity mismatch");
-        assert_eq!(evaluator.lookup("result"), Some(&Value::Int(42)));
-
-        let source = "pair is (1, 2)\n\
-                     match pair:\n\
-                         (first, (second, third)):\n    first\n\
-                         _:\n    first\n\
-                     end\n";
-        let program = Parser::new(
-            Lexer::new(source)
-                .tokenize()
-                .expect("valid nested tuple source should tokenize"),
-        )
-        .parse()
-        .expect("valid nested tuple source should parse");
-        let error = Evaluator::new()
-            .run(&program)
-            .expect_err("failed tuple pattern must not leak partial bindings");
-        assert!(
-            error.to_string().contains("unknown variable `first`"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn runtime_struct_matching_checks_nominal_identity_and_field_arity() {
-        let source = "type Person:\n    name as String\n    age as Int\nend\n\
-                     person is Person(\"Ada\", 37)\n\
-                     result is match person:\n\
-                         Person(name):\n    \"incorrect arity\"\n\
-                         _:\n    \"fallback\"\n\
-                     end\n";
-        let program = Parser::new(
-            Lexer::new(source)
-                .tokenize()
-                .expect("valid Struct pattern source should tokenize"),
-        )
-        .parse()
-        .expect("valid Struct pattern source should parse");
-        let mut evaluator = Evaluator::new();
-        evaluator
-            .run(&program)
-            .expect("runtime matcher should fall through on incorrect field arity");
-        assert_eq!(
-            evaluator.lookup("result"),
-            Some(&Value::String("fallback".into()))
-        );
-
-        let source = "type Person:\n    name as String\nend\n\
-                     type User:\n    name as String\nend\n\
-                     user is User(\"Ada\")\n\
-                     result is match user:\n\
-                         Person(name):\n    \"incorrect nominal type\"\n\
-                         _:\n    \"fallback\"\n\
-                     end\n";
-        let program = Parser::new(
-            Lexer::new(source)
-                .tokenize()
-                .expect("valid nominal pattern source should tokenize"),
-        )
-        .parse()
-        .expect("valid nominal pattern source should parse");
-        let mut evaluator = Evaluator::new();
-        evaluator
-            .run(&program)
-            .expect("runtime matcher should compare nominal Struct identities");
-        assert_eq!(
-            evaluator.lookup("result"),
-            Some(&Value::String("fallback".into()))
-        );
-    }
-
-    #[test]
-    fn runtime_rejects_non_boolean_match_guards_without_semantic_analysis() {
-        let source = "result is match 1:\n    _ if 1:\n        \"invalid\"\nend\n";
-        let program = Parser::new(
-            Lexer::new(source)
-                .tokenize()
-                .expect("guard source should tokenize"),
-        )
-        .parse()
-        .expect("guard source should parse");
-        let error = Evaluator::new()
-            .run(&program)
-            .expect_err("runtime must reject a non-Bool guard");
-        assert!(
-            error
-                .to_string()
-                .contains("match guard must evaluate to Bool"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn parallel_workers_execute_scalar_chunks_and_preserve_order() {
-        parallel::PARALLEL_THREAD_IDS
-            .lock()
-            .expect("parallel test lock")
-            .clear();
-        let values = (0..16).map(Value::Int).collect();
-        let transforms = [PipelineStep::Derive(Expr::Binary {
-            left: Box::new(Expr::Identifier("item".into())),
-            operator: BinaryOperator::Multiply,
-            right: Box::new(Expr::Literal(Literal::Int(2))),
-        })];
-        let output = parallel::evaluate_parallel(values, &transforms, 4, Some(8))
-            .expect("parallel evaluation");
-        assert_eq!(
-            output,
-            (0..16)
-                .map(|value| Value::Int(value * 2))
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(
-            parallel::PARALLEL_THREAD_IDS
-                .lock()
-                .expect("parallel test lock")
-                .len(),
-            2
-        );
-    }
-
-    #[test]
-    fn parallel_execution_rejects_excessive_workers_and_chunk_counts() {
-        assert_eq!(
-            parallel::evaluate_parallel(Vec::new(), &[], 1, None).expect("empty input"),
-            Vec::<Value>::new()
-        );
-        assert!(
-            parallel::evaluate_parallel(
-                vec![Value::Int(1)],
-                &[],
-                limits::MAX_PARALLEL_WORKERS + 1,
-                None
-            )
-            .expect_err("worker limit should be enforced")
-            .message
-            .contains("worker count")
-        );
-        assert!(
-            parallel::evaluate_parallel(
-                vec![Value::Int(1)],
-                &[],
-                1,
-                Some(limits::MAX_CHUNK_SIZE + 1)
-            )
-            .expect_err("chunk size limit should be enforced")
-            .message
-            .contains("chunk size")
-        );
-        let input = (0..=limits::MAX_PARALLEL_CHUNKS)
-            .map(|value| Value::Int(value as i64))
-            .collect();
-        assert!(
-            parallel::evaluate_parallel(input, &[], 1, Some(1))
-                .expect_err("chunk count limit should be enforced")
-                .message
-                .contains("chunk count")
-        );
-    }
-
-    #[test]
-    fn function_call_depth_is_restored_after_recursion_failure() {
-        let source =
-            "fn recurse(value as Int) gives Int:\n    return recurse(value + 1)\nend\nrecurse(0)\n";
-        let program = Parser::new(Lexer::new(source).tokenize().expect("source should lex"))
-            .parse()
-            .expect("source should parse");
-        let mut evaluator = Evaluator::new();
-        let error = evaluator
-            .run(&program)
-            .expect_err("excessive recursion should fail with a diagnostic");
-        assert!(
-            error
-                .to_string()
-                .contains("function call depth exceeds the limit")
-        );
-        assert_eq!(evaluator.call_depth, 0);
-
-        let recovery = Parser::new(
-            Lexer::new(
-                "fn identity(value as Int) gives Int:\n    return value\nend\nidentity(7)\n",
-            )
-            .tokenize()
-            .expect("recovery source should lex"),
-        )
-        .parse()
-        .expect("recovery source should parse");
-        evaluator
-            .run(&recovery)
-            .expect("successful calls should work after recursion failure");
-        assert_eq!(evaluator.call_depth, 0);
-    }
-
-    #[test]
-    fn parallel_safe_subset_rejects_calls_and_collections() {
-        assert!(!is_parallel_safe_expression(&Expr::Call {
-            name: "abs".into(),
-            arguments: vec![Expr::Identifier("item".into())],
-        }));
-        assert!(
-            parallel::evaluate_parallel(
-                vec![Value::List(shared_values(vec![Value::Int(1)]))],
-                &[],
-                2,
-                None,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn parallel_pipeline_rejects_unsafe_transforms_at_runtime() {
-        let steps = [
-            PipelineStep::Parallel(2),
-            PipelineStep::Derive(Expr::Call {
-                name: "abs".into(),
-                arguments: vec![Expr::Identifier("item".into())],
-            }),
-            PipelineStep::Sum,
-        ];
-        let error = Evaluator::new()
-            .evaluate_streaming_pipeline(vec![Value::Int(1)], &steps)
-            .expect_err("unsafe parallel transforms must not fall back to sequential execution");
-        assert!(error.to_string().contains("parallel-safe"), "{error}");
-    }
-
-    #[test]
-    fn parallel_pipeline_rejects_non_scalar_items_at_runtime() {
-        let steps = [PipelineStep::Parallel(2), PipelineStep::Count];
-        let error = Evaluator::new()
-            .evaluate_streaming_pipeline(
-                vec![Value::List(shared_values(vec![Value::Int(1)]))],
-                &steps,
-            )
-            .expect_err("non-scalar items must not fall back to sequential execution");
-        assert!(error.to_string().contains("scalar source items"), "{error}");
-    }
-
-    #[test]
-    fn csv_rest_suffix_records_the_byte_cursor_after_its_prefix() {
-        static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("simply-csv-cursor-{}-{id}.csv", std::process::id()));
-        let contents = "first\n\"second\nline\"\nthird\n";
-        fs::write(&path, contents).expect("failed to write CSV cursor fixture");
-        let path_string = path.to_str().expect("CSV cursor path must be UTF-8");
-        let suffix_offset = "first\n".len() as u64;
-
-        let (_, suffix) = Evaluator::new()
-            .read_csv_sequence_prefix(path_string, 0, 0, None, 1, true)
-            .expect("prefix read should succeed")
-            .expect("first record should exist");
-        let Some(Value::CsvStream {
-            start_record,
-            start_offset,
-            source_version,
-            ..
-        }) = suffix
-        else {
-            panic!("rest binding should preserve a lazy CSV stream");
-        };
-        assert_eq!(start_record, 1);
-        assert_eq!(start_offset, suffix_offset);
-
-        let (rows, next_suffix) = Evaluator::new()
-            .read_csv_sequence_prefix(
-                path_string,
-                start_record,
-                start_offset,
-                source_version.as_ref(),
-                1,
-                true,
-            )
-            .expect("suffix read should succeed")
-            .expect("second record should exist");
-        assert_eq!(
-            rows,
-            vec![Value::List(shared_values(vec![Value::String(
-                "second\nline".into(),
-            )]))]
-        );
-        let Some(Value::CsvStream {
-            start_record,
-            start_offset,
-            source_version,
-            ..
-        }) = next_suffix
-        else {
-            panic!("nested rest binding should preserve a lazy CSV stream");
-        };
-        assert_eq!(start_record, 2);
-        assert_eq!(start_offset, "first\n\"second\nline\"\n".len() as u64);
-
-        fs::write(&path, "new\nreplacement\nlast\n").expect("failed to replace CSV cursor fixture");
-        let (rows, _) = Evaluator::new()
-            .read_csv_sequence_prefix(
-                path_string,
-                1,
-                suffix_offset,
-                source_version.as_ref(),
-                1,
-                true,
-            )
-            .expect("modified CSV source should use record-position fallback")
-            .expect("replacement record should exist");
-        assert_eq!(
-            rows,
-            vec![Value::List(shared_values(vec![Value::String(
-                "replacement".into(),
-            )]))]
-        );
-
-        fs::remove_file(path).expect("failed to remove CSV cursor fixture");
-    }
-}
+#[path = "../tests/internal/evaluator.rs"]
+mod tests;

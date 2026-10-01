@@ -92,10 +92,10 @@ fn validates_numeric_conversion_literals_and_runtime_values() {
 
 #[test]
 fn reports_stable_codes_for_lex_and_parse_errors() {
-    let (success, lex_error) = run_source("Sayln ?\n");
+    let (success, lex_error) = run_source("Sayln §\n");
     assert!(!success);
     assert!(lex_error.contains("error[E.lex.character.invalid]"));
-    assert!(lex_error.contains("Sayln ?"));
+    assert!(lex_error.contains("Sayln §"));
 
     let (success, parse_error) = run_source("Sayln\n");
     assert!(!success);
@@ -158,7 +158,7 @@ fn rejects_malformed_programs_with_parse_diagnostics() {
 fn reports_structured_diagnostics_for_all_malformed_input_shapes() {
     let cases = [
         (
-            "Sayln ?\n",
+            "Sayln §\n",
             "Lex error",
             "error[E.lex.character.invalid]",
             "1:7",

@@ -519,6 +519,16 @@ fn rest_sequence_patterns_compose_with_nested_patterns_ranges_or_and_guards() {
 }
 
 #[test]
+fn rest_patterns_example_is_exhaustive_and_runs() {
+    let source = include_str!("../examples/15-patterns/rest-patterns.si");
+    let (valid, _, error) = check_source(source);
+    assert!(valid, "rest-patterns example failed checking: {error}");
+
+    let output = run_example("examples/15-patterns/rest-patterns.si");
+    assert_eq!(output, "10\n[20, 30]\n1\n2\n[[3, 4]]\n");
+}
+
+#[test]
 fn rest_sequence_usefulness_and_exhaustiveness_respect_lengths_and_prefixes() {
     let duplicate_prefix = "values is [1, 2]\n\
                             match values:\n\

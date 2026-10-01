@@ -280,6 +280,59 @@ fn enum_equality_compares_nominal_type_variant_and_payload() {
 }
 
 #[test]
+fn enum_equality_uses_struct_identity_for_payloads_and_nested_collections() {
+    let source = "type Person:\n    name as String\nend\n\
+                  enum Result:\n    Ok as Person\nend\n\
+                  first is Person(\"Alice\")\n\
+                  alias is first\n\
+                  second is Person(\"Alice\")\n\
+                  same_a is Result::Ok(first)\n\
+                  same_b is Result::Ok(alias)\n\
+                  different is Result::Ok(second)\n\
+                  list_a is [[first]]\n\
+                  list_b is [[alias]]\n\
+                  list_c is [[second]]\n\
+                  Sayln same_a == same_b\n\
+                  Sayln same_a == different\n\
+                  Sayln list_a == list_b\n\
+                  Sayln list_a == list_c\n";
+    let (success, output) = run_source_stdout(source);
+
+    assert!(success, "nested identity equality failed: {output}");
+    assert_eq!(output, "true\nfalse\ntrue\nfalse\n");
+}
+
+#[test]
+fn enum_equality_recurses_through_nested_enum_and_collection_payloads() {
+    let source = "enum State:\n\
+                      Ready\n\
+                      Running\n\
+                  end\n\
+                  enum Envelope:\n\
+                      StateValue as State\n\
+                      States as List[State]\n\
+                      Nested as Envelope\n\
+                  end\n\
+                  first is Envelope::States(list [State::Ready, State::Running])\n\
+                  second is Envelope::States(list [State::Ready, State::Running])\n\
+                  different is Envelope::States(list [State::Ready])\n\
+                  nested_a is Envelope::Nested(Envelope::StateValue(State::Ready))\n\
+                  nested_b is Envelope::Nested(Envelope::StateValue(State::Ready))\n\
+                  Sayln first == second\n\
+                  Sayln first == different\n\
+                  Sayln [first] == [second]\n\
+                  Sayln nested_a == nested_b\n";
+    let (success, output) = run_source_stdout(source);
+
+    assert!(
+        success,
+        "nested enum equality failed: {output} {}",
+        run_source(source).1
+    );
+    assert_eq!(output, "true\nfalse\ntrue\ntrue\n");
+}
+
+#[test]
 fn declared_lowercase_enum_names_are_resolved_as_variant_constructors() {
     let source = "enum result:\n    Ok as Int\nend\n\
                   value is result::Ok(42)\n\

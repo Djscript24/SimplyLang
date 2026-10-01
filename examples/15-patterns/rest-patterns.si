@@ -17,4 +17,6 @@ match nested:
         Sayln first
         Sayln second
         Sayln remaining
+    _:
+        Sayln "other"
 end

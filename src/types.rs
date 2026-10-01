@@ -48,12 +48,14 @@ pub enum Type {
     CsvStream,
     Array(Box<Type>),
     List(Box<Type>),
+    Vector(Box<Type>, Option<usize>),
     Tuple(Vec<Type>),
     Hash,
     HashValues(Box<Type>),
     Tree,
     TreeValues(Box<Type>),
     Matrix,
+    TypedMatrix(Box<Type>, Option<usize>, Option<usize>),
     Struct(DeclarationIdentity),
     Enum(DeclarationIdentity),
     Function {
@@ -75,6 +77,10 @@ impl Type {
             Self::CsvStream => "CsvStream".into(),
             Self::Array(element) => format!("Array[{}]", element.name()),
             Self::List(element) => format!("List[{}]", element.name()),
+            Self::Vector(element, Some(length)) => {
+                format!("Vector[{}, {length}]", element.name())
+            }
+            Self::Vector(element, None) => format!("Vector[{}]", element.name()),
             Self::Tuple(types) => format!(
                 "Tuple[{}]",
                 types.iter().map(Self::name).collect::<Vec<_>>().join(", ")
@@ -84,6 +90,15 @@ impl Type {
             Self::Tree => "Tree".into(),
             Self::TreeValues(_) => "Tree".into(),
             Self::Matrix => "Matrix".into(),
+            Self::TypedMatrix(element, Some(rows), Some(columns)) => {
+                format!("Matrix[{}, {rows}, {columns}]", element.name())
+            }
+            Self::TypedMatrix(element, rows, columns) if rows.is_some() || columns.is_some() => {
+                let rows = rows.map_or_else(|| "?".into(), |value| value.to_string());
+                let columns = columns.map_or_else(|| "?".into(), |value| value.to_string());
+                format!("Matrix[{}, {rows}, {columns}]", element.name())
+            }
+            Self::TypedMatrix(element, _, _) => format!("Matrix[{}]", element.name()),
             Self::Struct(identity) | Self::Enum(identity) => identity.local_name.clone(),
             Self::Function { .. } => "Function".into(),
         }
@@ -104,7 +119,59 @@ impl Type {
                 actual.compatible_at(expected, true)
             }
             (Self::Array(actual), Self::Array(expected))
-            | (Self::List(actual), Self::List(expected)) => actual.compatible_at(expected, true),
+            | (Self::List(actual), Self::List(expected))
+            | (Self::Vector(actual, _), Self::Array(expected))
+            | (Self::Vector(actual, _), Self::List(expected)) => {
+                actual.compatible_at(expected, true)
+            }
+            (Self::Vector(actual, actual_len), Self::Vector(expected, expected_len)) => {
+                actual.compatible_at(expected, true)
+                    && dimensions_compatible(*actual_len, *expected_len)
+            }
+            (Self::Array(actual), Self::Vector(expected, _))
+            | (Self::List(actual), Self::Vector(expected, _)) => {
+                actual.compatible_at(expected, true)
+            }
+            (Self::Tuple(actual), Self::Vector(expected, expected_len)) => {
+                actual
+                    .iter()
+                    .all(|element| element.compatible_at(expected, true))
+                    && dimensions_compatible(Some(actual.len()), *expected_len)
+            }
+            (
+                Self::TypedMatrix(actual, actual_rows, actual_columns),
+                Self::TypedMatrix(expected, expected_rows, expected_columns),
+            ) => {
+                actual.compatible_at(expected, true)
+                    && dimensions_compatible(*actual_rows, *expected_rows)
+                    && dimensions_compatible(*actual_columns, *expected_columns)
+            }
+            (Self::Vector(row, actual_rows), Self::TypedMatrix(expected, rows, columns)) => {
+                match row.as_ref() {
+                    Self::Vector(actual, actual_columns) => {
+                        actual.compatible_at(expected, true)
+                            && dimensions_compatible(*actual_rows, *rows)
+                            && dimensions_compatible(*actual_columns, *columns)
+                    }
+                    _ => false,
+                }
+            }
+            (Self::Array(row), Self::TypedMatrix(expected, _, _))
+            | (Self::List(row), Self::TypedMatrix(expected, _, _)) => match row.as_ref() {
+                Self::Array(actual) | Self::List(actual) => actual.compatible_at(expected, true),
+                _ => false,
+            },
+            (Self::Vector(row, _), Self::Matrix) => {
+                matches!(
+                    row.as_ref(),
+                    Self::Vector(_, _) | Self::Array(_) | Self::List(_)
+                )
+            }
+            (Self::Array(row), Self::Matrix) | (Self::List(row), Self::Matrix) => {
+                matches!(row.as_ref(), Self::Array(_) | Self::List(_))
+            }
+            (Self::TypedMatrix(_, _, _), Self::Matrix)
+            | (Self::Matrix, Self::TypedMatrix(_, _, _)) => true,
             (Self::Tuple(actual), Self::Tuple(expected)) => {
                 actual.len() == expected.len()
                     && actual
@@ -141,48 +208,13 @@ impl Type {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::Type;
-
-    #[test]
-    fn formats_nested_types_consistently() {
-        let typ = Type::List(Box::new(Type::Tuple(vec![Type::Int, Type::String])));
-        assert_eq!(typ.name(), "List[Tuple[Int, String]]");
-    }
-
-    #[test]
-    fn unknown_does_not_override_concrete_type_compatibility() {
-        assert!(!Type::Unknown.compatible_with(&Type::Int));
-        assert!(!Type::Int.compatible_with(&Type::Unknown));
-        assert!(!Type::Int.compatible_with(&Type::String));
-        assert!(Type::Unknown.compatible_with(&Type::Unknown));
-    }
-
-    #[test]
-    fn range_and_csv_stream_types_are_distinct_runtime_types() {
-        assert_eq!(Type::Range.name(), "Range");
-        assert_eq!(Type::CsvStream.name(), "CsvStream");
-        assert!(Type::Range.compatible_with(&Type::Range));
-        assert!(Type::CsvStream.compatible_with(&Type::CsvStream));
-        assert!(!Type::Range.compatible_with(&Type::CsvStream));
-    }
-
-    #[test]
-    fn nested_unknown_is_compatible_with_concrete_collection_types() {
-        assert!(
-            Type::List(Box::new(Type::Unknown)).compatible_with(&Type::List(Box::new(Type::Int)))
-        );
-        assert!(
-            Type::Tuple(vec![Type::Unknown, Type::String])
-                .compatible_with(&Type::Tuple(vec![Type::Int, Type::String]))
-        );
-    }
-
-    #[test]
-    fn unknown_is_not_a_universal_type_compatibility_fallback() {
-        assert!(!Type::Unknown.compatible_with(&Type::Int));
-        assert!(!Type::Int.compatible_with(&Type::Unknown));
-        assert!(Type::Unknown.compatible_with(&Type::Unknown));
+fn dimensions_compatible(actual: Option<usize>, expected: Option<usize>) -> bool {
+    match (actual, expected) {
+        (Some(actual), Some(expected)) => actual == expected,
+        _ => true,
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/internal/types.rs"]
+mod tests;

@@ -256,6 +256,43 @@ fn message_state_mutations_preserve_declared_field_types() {
 }
 
 #[test]
+fn struct_equality_uses_instance_identity() {
+    let source = "type Person:\n    name as String\nend\n\
+                  on Person receive rename(next as String):\n\
+                      name -> next\n\
+                  end\n\
+                  first is Person(\"Alice\")\n\
+                  second is Person(\"Alice\")\n\
+                  alias is first\n\
+                  first :: rename(\"Alicia\")\n\
+                  second :: rename(\"Alicia\")\n\
+                  Sayln first == second\n\
+                  Sayln first == alias\n";
+    let (success, output) = run_source_stdout(source);
+
+    assert!(success, "struct equality failed: {output}");
+    assert_eq!(output, "false\ntrue\n");
+}
+
+#[test]
+fn struct_identity_equality_terminates_for_cyclic_instances() {
+    let source = "type Node:\n    links as List[Node]\nend\n\
+                  on Node receive link(other as Node):\n\
+                      links add other\n\
+                  end\n\
+                  first is Node(list [])\n\
+                  second is Node(list [])\n\
+                  first :: link(first)\n\
+                  second :: link(second)\n\
+                  Sayln first == second\n\
+                  Sayln first == first\n";
+    let (success, output) = run_source_stdout(source);
+
+    assert!(success, "cyclic struct equality failed: {output}");
+    assert_eq!(output, "false\ntrue\n");
+}
+
+#[test]
 fn recursive_message_dispatch_is_bounded() {
     let source = "type Counter:\n    value as Int\nend\n\
                   counter is Counter(0)\n\

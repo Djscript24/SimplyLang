@@ -285,7 +285,7 @@ fn explain_source(source: &str, path: &Path) -> Result<(), SimplyError> {
     println!();
     println!("runtime model:");
     println!("  bindings: immutable by default");
-    println!("  collections: Rc copy-on-write");
+    println!("  collections: value semantics, copy-on-write");
     println!("  closures: lexical snapshot capture");
     Ok(())
 }

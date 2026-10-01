@@ -1,8 +1,25 @@
-# Matrix shape, multiplication, transpose, and identity.
-A is [[1, 2], [3, 4]]
-B is [[5, 6], [7, 8]]
+# Matrix shape, products, transpose, determinant, inverse, and identity.
+A as Matrix[Float, 2, 2] is [[1.0, 2.0], [3.0, 4.0]]
+B as Matrix[Float, 2, 2] is [[5.0, 6.0], [7.0, 8.0]]
+x as Vector[Float, 2] is [5.0, 6.0]
+rhs as Matrix[Float, 2, 2] is [[5.0, 2.0], [5.0, 1.0]]
 
 Sayln shape(A)
+Sayln trace(A)
+Sayln rank(A)
 Sayln multiply(A, B)
+Sayln matvec(A, x)
 Sayln transpose(A)
 Sayln multiply(A, identity(2))
+Sayln determinant(A)
+Sayln inverse(A)
+Sayln solve(A, [5.0, 11.0])
+Sayln solve(A, rhs)
+(L, U, P) is lu(A)
+Sayln multiply(P, A)
+Sayln multiply(L, U)
+(Q, R) is qr(A)
+Sayln multiply(Q, R)
+positive_definite as Matrix[Float, 2, 2] is [[4.0, 2.0], [2.0, 3.0]]
+Sayln cholesky(positive_definite)
+Sayln least_squares([[1, 0], [0, 1], [1, 1]], [2, 3, 5])

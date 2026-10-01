@@ -12,7 +12,11 @@ pub(crate) fn index(
     index: &Value,
     span: Option<&Span>,
 ) -> Result<Value, SimplyError> {
-    if let (Value::Matrix(rows), Value::Tuple(coordinates)) = (target, index) {
+    if let (
+        Value::Matrix(rows) | Value::Array(rows) | Value::List(rows),
+        Value::Tuple(coordinates),
+    ) = (target, index)
+    {
         if coordinates.len() != 2 {
             return Err(error(span, "matrix index requires row and column"));
         }
@@ -84,13 +88,14 @@ pub(crate) fn set_index(
     span: Option<&Span>,
 ) -> Result<(), SimplyError> {
     if let (Value::Hash(values), Value::String(key)) = (&mut *target, &index) {
-        std::rc::Rc::make_mut(values).insert(key.clone(), value);
+        values.make_mut().insert(key.clone(), value);
         return Ok(());
     }
     let index = collection_index(&index, span)?;
     match target {
         Value::Array(values) | Value::List(values) => {
-            let slot = std::rc::Rc::make_mut(values)
+            let slot = values
+                .make_mut()
                 .get_mut(index)
                 .ok_or_else(|| error(span, "collection index out of bounds"))?;
             *slot = value;
@@ -109,7 +114,7 @@ pub(crate) fn mutate_list(
 ) -> Result<(), SimplyError> {
     match target {
         Value::List(values) => {
-            let values = std::rc::Rc::make_mut(values);
+            let values = values.make_mut();
             match operation {
                 CollectionOperation::Add => values.push(value),
                 CollectionOperation::Remove => {

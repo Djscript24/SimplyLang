@@ -36,11 +36,6 @@ enum ParallelValue {
     Bool(bool),
 }
 
-#[cfg(test)]
-pub(super) static PARALLEL_THREAD_IDS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashSet<std::thread::ThreadId>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-
 impl ParallelValue {
     fn from_value(value: &Value) -> Option<Self> {
         match value {
@@ -215,7 +210,7 @@ pub(super) fn evaluate_parallel(
             let chunks = Arc::clone(&chunks);
             handles.push(scope.spawn(move || {
                 #[cfg(test)]
-                PARALLEL_THREAD_IDS
+                super::tests::PARALLEL_THREAD_IDS
                     .lock()
                     .expect("parallel test lock")
                     .insert(std::thread::current().id());

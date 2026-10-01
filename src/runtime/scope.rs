@@ -4,18 +4,55 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use super::value::Value;
+use super::{
+    arena::{Arena, Handle},
+    value::Value,
+};
+
+struct BindingToken(Handle<Value>);
+
+struct BindingArena(Arena<Value>);
+
+impl BindingArena {
+    fn new() -> Self {
+        Self(Arena::new())
+    }
+
+    fn allocate(&mut self, value: Value) -> BindingToken {
+        BindingToken(self.0.insert(value))
+    }
+
+    fn get(&self, binding: &BindingToken) -> &Value {
+        self.0
+            .get(binding.0)
+            .expect("scope binding token must refer to a live arena slot")
+    }
+
+    fn get_mut(&mut self, binding: &BindingToken) -> &mut Value {
+        self.0
+            .get_mut(binding.0)
+            .expect("scope binding token must refer to a live arena slot")
+    }
+
+    fn release(&mut self, binding: BindingToken) -> Value {
+        self.0
+            .remove(binding.0)
+            .expect("scope binding token must be released exactly once")
+    }
+}
 
 pub(crate) struct ScopeStack {
-    scopes: Vec<HashMap<String, Value>>,
+    values: BindingArena,
+    scopes: Vec<HashMap<String, BindingToken>>,
     bindings: HashMap<String, Vec<usize>>,
     mutability: HashMap<String, Vec<bool>>,
-    reusable_scopes: Vec<HashMap<String, Value>>,
+    reusable_scopes: Vec<HashMap<String, BindingToken>>,
 }
 
 impl ScopeStack {
     pub(crate) fn new() -> Self {
         Self {
+            values: BindingArena::new(),
             scopes: vec![HashMap::new()],
             bindings: HashMap::new(),
             mutability: HashMap::new(),
@@ -38,7 +75,8 @@ impl ScopeStack {
                 "variable `{name}` is already declared in this scope; declare it with `mut` to reassign it"
             ));
         }
-        current.insert(name.clone(), value);
+        let binding = self.values.allocate(value);
+        current.insert(name.clone(), binding);
         self.bindings
             .entry(name.clone())
             .or_default()
@@ -70,7 +108,8 @@ impl ScopeStack {
             .last_mut()
             .expect("runtime scope stack always has a global scope");
         for (name, value, mutable) in bindings {
-            current.insert(name.clone(), value);
+            let binding = self.values.allocate(value);
+            current.insert(name.clone(), binding);
             self.bindings
                 .entry(name.clone())
                 .or_default()
@@ -81,20 +120,24 @@ impl ScopeStack {
     }
 
     pub(crate) fn lookup(&self, name: &str) -> Option<&Value> {
-        if let Some(value) = self.scopes.last().and_then(|scope| scope.get(name)) {
-            return Some(value);
-        }
-        let scope_index = self.bindings.get(name)?.last().copied()?;
-        self.scopes.get(scope_index)?.get(name)
+        let handle = self
+            .scopes
+            .last()
+            .and_then(|scope| scope.get(name))
+            .or_else(|| {
+                let scope_index = self.bindings.get(name)?.last().copied()?;
+                self.scopes.get(scope_index)?.get(name)
+            })?;
+        Some(self.values.get(handle))
     }
 
     pub(crate) fn lookup_mut(&mut self, name: &str) -> Option<&mut Value> {
         let current_index = self.scopes.len() - 1;
-        if self.scopes[current_index].contains_key(name) {
-            return self.scopes[current_index].get_mut(name);
-        }
-        let scope_index = self.bindings.get(name)?.last().copied()?;
-        self.scopes.get_mut(scope_index)?.get_mut(name)
+        let binding = self.scopes[current_index].get(name).or_else(|| {
+            let scope_index = self.bindings.get(name)?.last().copied()?;
+            self.scopes.get(scope_index)?.get(name)
+        })?;
+        Some(self.values.get_mut(binding))
     }
 
     pub(crate) fn is_mutable(&self, name: &str) -> bool {
@@ -153,35 +196,39 @@ impl ScopeStack {
                     "variable `{name}` is no longer a mutable assignment target"
                 ));
             }
-            if !self
+            if self
                 .scopes
                 .get(*scope_index)
-                .is_some_and(|scope| scope.contains_key(name))
+                .and_then(|scope| scope.get(name))
+                .is_none()
             {
                 return Err(format!("unknown assignment target `{name}`"));
             }
         }
 
         for (scope_index, name, value) in bindings {
-            self.scopes[scope_index].insert(name, value);
+            let binding = &self.scopes[scope_index][&name];
+            *self.values.get_mut(binding) = value;
         }
         Ok(())
     }
 
     pub(crate) fn assign_current(&mut self, name: &str, value: Value) -> bool {
-        self.scopes
-            .last_mut()
-            .and_then(|scope| scope.get_mut(name))
-            .map(|binding| *binding = value)
-            .is_some()
+        let Some(binding) = self.scopes.last().and_then(|scope| scope.get(name)) else {
+            return false;
+        };
+        let slot = self.values.get_mut(binding);
+        *slot = value;
+        true
     }
 
     pub(crate) fn remove_current(&mut self, name: &str) -> Option<Value> {
-        let value = self
+        let binding = self
             .scopes
             .last_mut()
             .expect("runtime scope stack always has a global scope")
             .remove(name)?;
+        let value = self.values.release(binding);
         if let Some(scope_indices) = self.bindings.get_mut(name) {
             scope_indices.pop();
             if scope_indices.is_empty() {
@@ -207,9 +254,9 @@ impl ScopeStack {
     pub(crate) fn values_for(&self, names: &HashSet<String>) -> HashMap<String, Value> {
         let mut values = HashMap::new();
         for scope in &self.scopes {
-            for (name, value) in scope {
+            for (name, binding) in scope {
                 if names.contains(name) {
-                    values.insert(name.clone(), value.clone());
+                    values.insert(name.clone(), self.values.get(binding).clone());
                 }
             }
         }
@@ -224,16 +271,17 @@ impl ScopeStack {
     pub(crate) fn pop(&mut self) {
         if self.scopes.len() > 1 {
             let mut scope = self.scopes.pop().expect("scope exists after length check");
-            for name in scope.keys() {
-                if let Some(scope_indices) = self.bindings.get_mut(name) {
+            for (name, binding) in scope.drain() {
+                self.values.release(binding);
+                if let Some(scope_indices) = self.bindings.get_mut(&name) {
                     scope_indices.pop();
                     if scope_indices.is_empty() {
-                        self.bindings.remove(name);
+                        self.bindings.remove(&name);
                     }
-                    if let Some(values) = self.mutability.get_mut(name) {
+                    if let Some(values) = self.mutability.get_mut(&name) {
                         values.pop();
                         if values.is_empty() {
-                            self.mutability.remove(name);
+                            self.mutability.remove(&name);
                         }
                     }
                 }
@@ -251,102 +299,5 @@ impl Default for ScopeStack {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::ScopeStack;
-    use crate::runtime::value::Value;
-
-    #[test]
-    fn resolves_locals_before_globals_and_assigns_nearest_binding() {
-        let mut scopes = ScopeStack::new();
-        scopes.define("value".into(), Value::Int(1), true).unwrap();
-        scopes.push();
-        scopes.define("value".into(), Value::Int(2), true).unwrap();
-
-        assert_eq!(scopes.lookup("value"), Some(&Value::Int(2)));
-        assert!(scopes.assign("value", Value::Int(3)));
-        assert_eq!(scopes.lookup("value"), Some(&Value::Int(3)));
-
-        scopes.pop();
-        assert_eq!(scopes.lookup("value"), Some(&Value::Int(1)));
-    }
-
-    #[test]
-    fn preserves_global_scope_after_excessive_pops() {
-        let mut scopes = ScopeStack::new();
-        scopes
-            .define("global".into(), Value::Int(1), false)
-            .unwrap();
-        scopes.push();
-        scopes.push();
-
-        scopes.pop();
-        scopes.pop();
-        scopes.pop();
-        scopes.pop();
-
-        assert_eq!(scopes.lookup("global"), Some(&Value::Int(1)));
-        scopes
-            .define("still_global".into(), Value::Bool(true), false)
-            .unwrap();
-        assert_eq!(scopes.lookup("still_global"), Some(&Value::Bool(true)));
-    }
-
-    #[test]
-    fn define_many_does_not_partially_bind_when_preflight_fails() {
-        let mut scopes = ScopeStack::new();
-        scopes
-            .define("existing".into(), Value::Int(1), false)
-            .expect("initial binding should succeed");
-
-        let error = scopes
-            .define_many(vec![
-                ("new".into(), Value::Int(2), false),
-                ("existing".into(), Value::Int(3), false),
-            ])
-            .expect_err("duplicate declaration should fail");
-
-        assert!(error.contains("existing"));
-        assert_eq!(scopes.lookup("existing"), Some(&Value::Int(1)));
-        assert_eq!(scopes.lookup("new"), None);
-    }
-
-    #[test]
-    fn define_many_rejects_duplicate_targets_without_binding_anything() {
-        let mut scopes = ScopeStack::new();
-        let error = scopes
-            .define_many(vec![
-                ("same".into(), Value::Int(1), false),
-                ("same".into(), Value::Int(2), false),
-            ])
-            .expect_err("duplicate targets should fail");
-
-        assert!(error.contains("same"));
-        assert_eq!(scopes.lookup("same"), None);
-    }
-
-    #[test]
-    fn assign_many_preflights_every_target_before_mutating() {
-        let mut scopes = ScopeStack::new();
-        scopes
-            .define("first".into(), Value::Int(1), true)
-            .expect("first binding should succeed");
-        scopes
-            .define("second".into(), Value::Int(2), false)
-            .expect("second binding should succeed");
-        let first_scope = scopes.binding_scope("first").expect("first binding exists");
-        let second_scope = scopes
-            .binding_scope("second")
-            .expect("second binding exists");
-
-        let error = scopes
-            .assign_many(vec![
-                (first_scope, "first".into(), Value::Int(10)),
-                (second_scope, "second".into(), Value::Int(20)),
-            ])
-            .expect_err("immutable second target should fail preflight");
-
-        assert!(error.contains("second"));
-        assert_eq!(scopes.lookup("first"), Some(&Value::Int(1)));
-        assert_eq!(scopes.lookup("second"), Some(&Value::Int(2)));
-    }
-}
+#[path = "../../tests/internal/runtime_scope.rs"]
+mod tests;

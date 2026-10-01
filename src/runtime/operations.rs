@@ -42,7 +42,10 @@ pub(crate) fn binary(
 
     match operator {
         Add => match (left, right) {
-            (Value::Matrix(left), Value::Matrix(right)) => matrix_add(&left, &right, span),
+            (
+                left @ (Value::Matrix(_) | Value::Array(_) | Value::List(_)),
+                right @ (Value::Matrix(_) | Value::Array(_) | Value::List(_)),
+            ) => matrix_add_values(&left, &right, false, span),
             (Value::String(left), Value::String(right)) => Ok(Value::String(left + &right)),
             (Value::Int(left), Value::Int(right)) => left
                 .checked_add(right)
@@ -54,7 +57,7 @@ pub(crate) fn binary(
             _ => Err(type_error(span, "`+` requires two compatible values")),
         },
         Subtract | Multiply | Divide | Remainder => numeric_operation(left, operator, right, span),
-        MatrixMultiply => matrix_multiply(left, right, span),
+        MatrixMultiply => matrix_multiply_values(&left, &right, span),
         Greater | GreaterEqual | Less | LessEqual => {
             numeric_comparison(left, operator, right, span)
         }
@@ -156,75 +159,6 @@ fn float_result(value: f64, span: Option<&Span>) -> Result<Value, SimplyError> {
             message: "floating-point result is not finite".into(),
         })
     }
-}
-
-fn matrix_add(left: &[Value], right: &[Value], span: Option<&Span>) -> Result<Value, SimplyError> {
-    let left_width = matrix_shape(left, span)?;
-    let right_width = matrix_shape(right, span)?;
-    if left.len() != right.len() || left_width != right_width {
-        return Err(collection_error(span, "matrix dimensions do not match"));
-    }
-    ensure_matrix_allocation(
-        left.len(),
-        left_width,
-        span,
-        "matrix result is too large to allocate",
-    )?;
-    let mut rows = Vec::new();
-    for (left_row, right_row) in left.iter().zip(right) {
-        let left = matrix_row_values(left_row, span)?;
-        let right = matrix_row_values(right_row, span)?;
-        if left.len() != right.len() {
-            return Err(collection_error(span, "matrix dimensions do not match"));
-        }
-        let mut row = Vec::new();
-        for (left, right) in left.iter().zip(right.iter()) {
-            row.push(binary(
-                left.clone(),
-                &BinaryOperator::Add,
-                right.clone(),
-                span,
-            )?);
-        }
-        rows.push(Value::Array(shared_values(row)));
-    }
-    Ok(Value::Matrix(shared_values(rows)))
-}
-
-fn matrix_multiply(left: Value, right: Value, span: Option<&Span>) -> Result<Value, SimplyError> {
-    let (left, right) = match (left, right) {
-        (Value::Matrix(left), Value::Matrix(right)) => (left, right),
-        _ => return Err(type_error(span, "matrix multiply requires matrices")),
-    };
-    let left_width = matrix_shape(&left, span)?;
-    let right_width = matrix_shape(&right, span)?;
-    if left.is_empty() || right.is_empty() || left_width != right.len() {
-        return Err(collection_error(span, "matrix dimensions do not match"));
-    }
-    ensure_matrix_allocation(
-        left.len(),
-        right_width,
-        span,
-        "matrix result is too large to allocate",
-    )?;
-    let mut result = Vec::with_capacity(left.len());
-    for left_row in left.iter() {
-        let left_row = matrix_row_values(left_row, span)?;
-        let mut output = Vec::with_capacity(right_width);
-        for column in 0..right_width {
-            let mut total = 0.0;
-            for (index, value) in left_row.iter().enumerate() {
-                let right_row = matrix_row_values(&right[index], span)?;
-                total += numeric_value(value, span)? * numeric_value(&right_row[column], span)?;
-            }
-            if !total.is_finite() {
-                return Err(arithmetic_error(span));
-            }
-            output.push(Value::Float(total));
-        }
-        result.push(Value::Array(shared_values(output)));
-    }
-    Ok(Value::Matrix(shared_values(result)))
 }
 
 pub(crate) fn math_unary(
@@ -371,6 +305,39 @@ pub(crate) fn vector_dot(
     Ok(total)
 }
 
+pub(crate) fn vector_cross(
+    left: &Value,
+    right: &Value,
+    span: Option<&Span>,
+) -> Result<Value, SimplyError> {
+    let left = vector_values(left, span)?;
+    let right = vector_values(right, span)?;
+    if left.len() != 3 || right.len() != 3 {
+        return Err(collection_error(
+            span,
+            "cross requires two vectors with exactly three elements",
+        ));
+    }
+    let left = left
+        .iter()
+        .map(|value| numeric_value(value, span))
+        .collect::<Result<Vec<_>, _>>()?;
+    let right = right
+        .iter()
+        .map(|value| numeric_value(value, span))
+        .collect::<Result<Vec<_>, _>>()?;
+    let values = [
+        left[1] * right[2] - left[2] * right[1],
+        left[2] * right[0] - left[0] * right[2],
+        left[0] * right[1] - left[1] * right[0],
+    ];
+    values
+        .into_iter()
+        .map(|value| float_result(value, span))
+        .collect::<Result<Vec<_>, _>>()
+        .map(|values| Value::Array(shared_values(values)))
+}
+
 pub(crate) fn vector_norm(vector: &Value, span: Option<&Span>) -> Result<Value, SimplyError> {
     let mut norm = 0.0_f64;
     for value in vector_values(vector, span)? {
@@ -425,6 +392,758 @@ pub(crate) fn matrix_shape_value(
         Value::Int(rows.len() as i64),
         Value::Int(rows[0].len() as i64),
     ])))
+}
+
+pub(crate) fn matrix_trace(matrix: &Value, span: Option<&Span>) -> Result<Value, SimplyError> {
+    let rows = matrix_rows(matrix, span)?;
+    if rows.len() != rows[0].len() {
+        return Err(collection_error(span, "trace requires a square matrix"));
+    }
+    let mut trace = 0.0;
+    for (index, row) in rows.iter().enumerate() {
+        trace += numeric_value(&row[index], span)?;
+        if !trace.is_finite() {
+            return Err(arithmetic_error(span));
+        }
+    }
+    float_result(trace, span)
+}
+
+pub(crate) fn matrix_rank(matrix: &Value, span: Option<&Span>) -> Result<Value, SimplyError> {
+    let rows = matrix_rows(matrix, span)?;
+    let row_count = rows.len();
+    let column_count = rows[0].len();
+    ensure_matrix_allocation(
+        row_count,
+        column_count,
+        span,
+        "matrix rank workspace is too large",
+    )?;
+    let mut values = rows
+        .iter()
+        .map(|row| row.iter().map(|value| numeric_value(value, span)).collect())
+        .collect::<Result<Vec<Vec<_>>, _>>()?;
+    let scale = values
+        .iter()
+        .flatten()
+        .map(|value| value.abs())
+        .fold(0.0_f64, f64::max);
+    let tolerance = scale * (row_count.max(column_count) as f64 * f64::EPSILON);
+    let mut pivot_row = 0;
+
+    for column in 0..column_count {
+        if pivot_row == row_count {
+            break;
+        }
+        let selected_row = (pivot_row..row_count)
+            .max_by(|left, right| {
+                values[*left][column]
+                    .abs()
+                    .total_cmp(&values[*right][column].abs())
+            })
+            .expect("remaining rows are non-empty");
+        if values[selected_row][column].abs() <= tolerance {
+            continue;
+        }
+        values.swap(pivot_row, selected_row);
+        let pivot = values[pivot_row][column];
+        let (pivot_rows, remaining_rows) = values.split_at_mut(pivot_row + 1);
+        let pivot_values = &pivot_rows[pivot_row];
+        for row in remaining_rows {
+            let factor = row[column] / pivot;
+            row[column] = 0.0;
+            for (cell, pivot_cell) in row.iter_mut().zip(pivot_values).skip(column + 1) {
+                *cell -= factor * pivot_cell;
+                if !cell.is_finite() {
+                    return Err(arithmetic_error(span));
+                }
+            }
+        }
+        pivot_row += 1;
+    }
+    Ok(Value::Int(pivot_row as i64))
+}
+
+pub(crate) fn matrix_vector_multiply(
+    matrix: &Value,
+    vector: &Value,
+    span: Option<&Span>,
+) -> Result<Value, SimplyError> {
+    let rows = matrix_rows(matrix, span)?;
+    let vector = vector_values(vector, span)?;
+    if rows[0].len() != vector.len() {
+        return Err(collection_error(
+            span,
+            "matrix and vector dimensions do not match",
+        ));
+    }
+    ensure_matrix_allocation(rows.len(), 1, span, "matrix-vector result is too large")?;
+    let result = rows
+        .iter()
+        .map(|row| {
+            let mut total = 0.0;
+            for (matrix_value, vector_value) in row.iter().zip(&vector) {
+                total += numeric_value(matrix_value, span)? * numeric_value(vector_value, span)?;
+                if !total.is_finite() {
+                    return Err(arithmetic_error(span));
+                }
+            }
+            float_result(total, span)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Value::Array(shared_values(result)))
+}
+
+pub(crate) fn matrix_determinant(
+    matrix: &Value,
+    span: Option<&Span>,
+) -> Result<Value, SimplyError> {
+    let rows = matrix_rows(matrix, span)?;
+    let size = rows.len();
+    if rows[0].len() != size {
+        return Err(collection_error(
+            span,
+            "determinant requires a square matrix",
+        ));
+    }
+    ensure_matrix_allocation(size, size, span, "determinant workspace is too large")?;
+
+    let mut values = rows
+        .iter()
+        .map(|row| row.iter().map(|value| numeric_value(value, span)).collect())
+        .collect::<Result<Vec<Vec<_>>, _>>()?;
+    let mut determinant = 1.0;
+    let mut sign = 1.0;
+
+    for pivot_column in 0..size {
+        let pivot_row = (pivot_column..size)
+            .max_by(|left, right| {
+                values[*left][pivot_column]
+                    .abs()
+                    .total_cmp(&values[*right][pivot_column].abs())
+            })
+            .expect("square matrix has at least one row");
+        let pivot = values[pivot_row][pivot_column];
+        if pivot == 0.0 {
+            return Ok(Value::Float(0.0));
+        }
+        if pivot_row != pivot_column {
+            values.swap(pivot_row, pivot_column);
+            sign = -sign;
+        }
+        let pivot = values[pivot_column][pivot_column];
+        determinant *= pivot;
+        if !determinant.is_finite() {
+            return Err(arithmetic_error(span));
+        }
+
+        let (pivot_rows, remaining_rows) = values.split_at_mut(pivot_column + 1);
+        let pivot_values = &pivot_rows[pivot_column];
+        for row in remaining_rows {
+            let factor = row[pivot_column] / pivot;
+            row[pivot_column] = 0.0;
+            for (cell, pivot_cell) in row.iter_mut().zip(pivot_values).skip(pivot_column + 1) {
+                *cell -= factor * pivot_cell;
+                if !cell.is_finite() {
+                    return Err(arithmetic_error(span));
+                }
+            }
+        }
+    }
+
+    float_result(sign * determinant, span)
+}
+
+pub(crate) fn matrix_inverse(matrix: &Value, span: Option<&Span>) -> Result<Value, SimplyError> {
+    let rows = matrix_rows(matrix, span)?;
+    let size = rows.len();
+    if rows[0].len() != size {
+        return Err(collection_error(span, "inverse requires a square matrix"));
+    }
+    ensure_matrix_allocation(size, size, span, "matrix inverse is too large to allocate")?;
+
+    let mut left = rows
+        .iter()
+        .map(|row| row.iter().map(|value| numeric_value(value, span)).collect())
+        .collect::<Result<Vec<Vec<_>>, _>>()?;
+    let mut right = (0..size)
+        .map(|row| {
+            (0..size)
+                .map(|column| if row == column { 1.0 } else { 0.0 })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    for pivot_column in 0..size {
+        let pivot_row = (pivot_column..size)
+            .max_by(|left_row, right_row| {
+                left[*left_row][pivot_column]
+                    .abs()
+                    .total_cmp(&left[*right_row][pivot_column].abs())
+            })
+            .expect("square matrix has at least one row");
+        if left[pivot_row][pivot_column] == 0.0 {
+            return Err(arithmetic_error_with_message(
+                span,
+                "matrix is singular and cannot be inverted",
+            ));
+        }
+        if pivot_row != pivot_column {
+            left.swap(pivot_row, pivot_column);
+            right.swap(pivot_row, pivot_column);
+        }
+
+        let pivot = left[pivot_column][pivot_column];
+        for column in 0..size {
+            left[pivot_column][column] /= pivot;
+            right[pivot_column][column] /= pivot;
+        }
+        for row in 0..size {
+            if row == pivot_column {
+                continue;
+            }
+            let factor = left[row][pivot_column];
+            for column in 0..size {
+                left[row][column] -= factor * left[pivot_column][column];
+                right[row][column] -= factor * right[pivot_column][column];
+            }
+        }
+    }
+
+    let result = right
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|value| float_result(value, span))
+                .collect::<Result<Vec<_>, _>>()
+                .map(|row| Value::Array(shared_values(row)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Value::Matrix(shared_values(result)))
+}
+
+pub(crate) fn matrix_solve(
+    matrix: &Value,
+    right_hand_side: &Value,
+    span: Option<&Span>,
+) -> Result<Value, SimplyError> {
+    let rows = matrix_rows(matrix, span)?;
+    let size = rows.len();
+    if rows[0].len() != size {
+        return Err(collection_error(span, "solve requires a square matrix"));
+    }
+    let rhs_is_matrix = matches!(right_hand_side, Value::Matrix(_))
+        || matches!(
+            right_hand_side,
+            Value::Array(values) | Value::List(values)
+                if values.first().is_some_and(|value| matches!(value, Value::Array(_) | Value::List(_)))
+        );
+    let (rhs_columns, mut values) = if rhs_is_matrix {
+        let rhs_rows = matrix_rows(right_hand_side, span)?;
+        if rhs_rows.len() != size {
+            return Err(collection_error(
+                span,
+                "solve requires one right-hand-side row per matrix row",
+            ));
+        }
+        (
+            rhs_rows[0].len(),
+            rhs_rows
+                .iter()
+                .map(|row| row.iter().map(|value| numeric_value(value, span)).collect())
+                .collect::<Result<Vec<Vec<_>>, _>>()?,
+        )
+    } else {
+        let vector = vector_values(right_hand_side, span)?;
+        if vector.len() != size {
+            return Err(collection_error(
+                span,
+                "solve requires one right-hand-side value per matrix row",
+            ));
+        }
+        (
+            1,
+            vector
+                .iter()
+                .map(|value| numeric_value(value, span).map(|value| vec![value]))
+                .collect::<Result<Vec<Vec<_>>, _>>()?,
+        )
+    };
+    ensure_matrix_allocation(
+        size,
+        size.checked_add(rhs_columns)
+            .ok_or_else(|| limit_error(span, "linear system workspace is too large"))?,
+        span,
+        "linear system workspace is too large",
+    )?;
+
+    let mut coefficients = rows
+        .iter()
+        .map(|row| row.iter().map(|value| numeric_value(value, span)).collect())
+        .collect::<Result<Vec<Vec<_>>, _>>()?;
+
+    for pivot_column in 0..size {
+        let pivot_row = (pivot_column..size)
+            .max_by(|left, right| {
+                coefficients[*left][pivot_column]
+                    .abs()
+                    .total_cmp(&coefficients[*right][pivot_column].abs())
+            })
+            .expect("square matrix has at least one row");
+        if coefficients[pivot_row][pivot_column] == 0.0 {
+            return Err(arithmetic_error_with_message(
+                span,
+                "linear system has no unique solution",
+            ));
+        }
+        if pivot_row != pivot_column {
+            coefficients.swap(pivot_row, pivot_column);
+            values.swap(pivot_row, pivot_column);
+        }
+
+        let pivot = coefficients[pivot_column][pivot_column];
+        let (pivot_rows, remaining_rows) = coefficients.split_at_mut(pivot_column + 1);
+        let pivot_values = &pivot_rows[pivot_column];
+        let pivot_rhs = values[pivot_column].clone();
+        let (_, remaining_rhs) = values.split_at_mut(pivot_column + 1);
+        for (row, rhs) in remaining_rows.iter_mut().zip(remaining_rhs) {
+            let factor = row[pivot_column] / pivot;
+            if !factor.is_finite() {
+                return Err(arithmetic_error(span));
+            }
+            row[pivot_column] = 0.0;
+            for (cell, pivot_cell) in row.iter_mut().zip(pivot_values).skip(pivot_column + 1) {
+                *cell -= factor * pivot_cell;
+                if !cell.is_finite() {
+                    return Err(arithmetic_error(span));
+                }
+            }
+            for (rhs_value, pivot_rhs_value) in rhs.iter_mut().zip(&pivot_rhs) {
+                *rhs_value -= factor * pivot_rhs_value;
+                if !rhs_value.is_finite() {
+                    return Err(arithmetic_error(span));
+                }
+            }
+        }
+    }
+
+    let mut solution = vec![vec![0.0; rhs_columns]; size];
+    for row in (0..size).rev() {
+        for column in 0..rhs_columns {
+            let mut value = values[row][column];
+            for (coefficient, solved) in coefficients[row][row + 1..]
+                .iter()
+                .zip(&solution[row + 1..])
+            {
+                value -= coefficient * solved[column];
+            }
+            solution[row][column] = value / coefficients[row][row];
+            if !solution[row][column].is_finite() {
+                return Err(arithmetic_error(span));
+            }
+        }
+    }
+
+    let output = solution
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|value| float_result(value, span))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if rhs_is_matrix {
+        Ok(Value::Matrix(shared_values(
+            output
+                .into_iter()
+                .map(|row| Value::Array(shared_values(row)))
+                .collect(),
+        )))
+    } else {
+        let solution = output
+            .into_iter()
+            .map(|mut row| row.pop().expect("vector solve has one RHS column"))
+            .collect();
+        Ok(Value::Array(shared_values(solution)))
+    }
+}
+
+pub(crate) fn matrix_lu(matrix: &Value, span: Option<&Span>) -> Result<Value, SimplyError> {
+    let rows = matrix_rows(matrix, span)?;
+    let row_count = rows.len();
+    let column_count = rows[0].len();
+    let rank_bound = row_count.min(column_count);
+    ensure_matrix_allocation(row_count, column_count, span, "LU workspace is too large")?;
+    ensure_matrix_allocation(row_count, row_count, span, "LU permutation is too large")?;
+
+    let mut factors = rows
+        .iter()
+        .map(|row| row.iter().map(|value| numeric_value(value, span)).collect())
+        .collect::<Result<Vec<Vec<_>>, _>>()?;
+    let mut permutation = (0..row_count).collect::<Vec<_>>();
+
+    for pivot_column in 0..rank_bound {
+        let pivot_row = (pivot_column..row_count)
+            .max_by(|left, right| {
+                factors[*left][pivot_column]
+                    .abs()
+                    .total_cmp(&factors[*right][pivot_column].abs())
+            })
+            .expect("pivot column has at least one candidate row");
+        if factors[pivot_row][pivot_column] == 0.0 {
+            continue;
+        }
+        if pivot_row != pivot_column {
+            factors.swap(pivot_row, pivot_column);
+            permutation.swap(pivot_row, pivot_column);
+        }
+        let pivot = factors[pivot_column][pivot_column];
+        let (pivot_rows, remaining_rows) = factors.split_at_mut(pivot_column + 1);
+        let pivot_values = &pivot_rows[pivot_column][pivot_column + 1..];
+        for row in remaining_rows {
+            let factor = row[pivot_column] / pivot;
+            if !factor.is_finite() {
+                return Err(arithmetic_error(span));
+            }
+            row[pivot_column] = factor;
+            for (cell, pivot_cell) in row[pivot_column + 1..].iter_mut().zip(pivot_values) {
+                *cell -= factor * pivot_cell;
+                if !cell.is_finite() {
+                    return Err(arithmetic_error(span));
+                }
+            }
+        }
+    }
+
+    let lower = (0..row_count)
+        .map(|row| {
+            (0..rank_bound)
+                .map(|column| {
+                    if row == column {
+                        1.0
+                    } else if row > column {
+                        factors[row][column]
+                    } else {
+                        0.0
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let upper = (0..rank_bound)
+        .map(|row| {
+            (0..column_count)
+                .map(|column| {
+                    if row <= column {
+                        factors[row][column]
+                    } else {
+                        0.0
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let permutation_matrix = (0..row_count)
+        .map(|row| {
+            (0..row_count)
+                .map(|column| f64::from(permutation[row] == column))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Value::Tuple(shared_values(vec![
+        float_matrix_value(lower, span)?,
+        float_matrix_value(upper, span)?,
+        float_matrix_value(permutation_matrix, span)?,
+    ])))
+}
+
+pub(crate) fn matrix_qr(matrix: &Value, span: Option<&Span>) -> Result<Value, SimplyError> {
+    let rows = matrix_rows(matrix, span)?;
+    let row_count = rows.len();
+    let column_count = rows[0].len();
+    ensure_matrix_allocation(row_count, column_count, span, "QR workspace is too large")?;
+    ensure_matrix_allocation(
+        row_count,
+        row_count,
+        span,
+        "QR orthogonal factor is too large",
+    )?;
+
+    let mut upper = rows
+        .iter()
+        .map(|row| row.iter().map(|value| numeric_value(value, span)).collect())
+        .collect::<Result<Vec<Vec<_>>, _>>()?;
+    let mut orthogonal = (0..row_count)
+        .map(|row| {
+            (0..row_count)
+                .map(|column| f64::from(row == column))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    for pivot_column in 0..row_count.min(column_count) {
+        let norm = upper[pivot_column..]
+            .iter()
+            .fold(0.0_f64, |norm, row| norm.hypot(row[pivot_column]));
+        if norm == 0.0 {
+            continue;
+        }
+        let sign = if upper[pivot_column][pivot_column].is_sign_negative() {
+            -1.0
+        } else {
+            1.0
+        };
+        let mut reflector = upper[pivot_column..]
+            .iter()
+            .map(|row| row[pivot_column] / norm)
+            .collect::<Vec<_>>();
+        reflector[0] += sign;
+        let norm_squared = reflector.iter().map(|value| value * value).sum::<f64>();
+        if !norm_squared.is_finite() || norm_squared == 0.0 {
+            return Err(arithmetic_error(span));
+        }
+        let beta = 2.0 / norm_squared;
+
+        for column in pivot_column..column_count {
+            let projection = reflector
+                .iter()
+                .zip(&upper[pivot_column..])
+                .map(|(reflector, row)| reflector * row[column])
+                .sum::<f64>()
+                * beta;
+            for (reflector, row) in reflector.iter().zip(&mut upper[pivot_column..]) {
+                row[column] -= projection * reflector;
+                if !row[column].is_finite() {
+                    return Err(arithmetic_error(span));
+                }
+            }
+        }
+        for row in &mut orthogonal {
+            let projection = reflector
+                .iter()
+                .zip(&row[pivot_column..])
+                .map(|(reflector, value)| reflector * value)
+                .sum::<f64>()
+                * beta;
+            for (reflector, value) in reflector.iter().zip(&mut row[pivot_column..]) {
+                *value -= projection * reflector;
+                if !value.is_finite() {
+                    return Err(arithmetic_error(span));
+                }
+            }
+        }
+        upper[pivot_column][pivot_column] = -sign * norm;
+        for row in &mut upper[pivot_column + 1..] {
+            row[pivot_column] = 0.0;
+        }
+    }
+
+    Ok(Value::Tuple(shared_values(vec![
+        float_matrix_value(orthogonal, span)?,
+        float_matrix_value(upper, span)?,
+    ])))
+}
+
+pub(crate) fn matrix_cholesky(matrix: &Value, span: Option<&Span>) -> Result<Value, SimplyError> {
+    let rows = matrix_rows(matrix, span)?;
+    let size = rows.len();
+    if rows[0].len() != size {
+        return Err(collection_error(span, "cholesky requires a square matrix"));
+    }
+    ensure_matrix_allocation(size, size, span, "Cholesky workspace is too large")?;
+
+    let values = rows
+        .iter()
+        .map(|row| row.iter().map(|value| numeric_value(value, span)).collect())
+        .collect::<Result<Vec<Vec<_>>, _>>()?;
+    let scale = values
+        .iter()
+        .flatten()
+        .fold(0.0_f64, |maximum, value| maximum.max(value.abs()));
+    let symmetry_tolerance = scale * size as f64 * f64::EPSILON;
+    for (row, row_values) in values.iter().enumerate() {
+        for (column, column_values) in values.iter().enumerate().take(row) {
+            if (row_values[column] - column_values[row]).abs() > symmetry_tolerance {
+                return Err(arithmetic_error_with_message(
+                    span,
+                    "cholesky requires a symmetric positive-definite matrix",
+                ));
+            }
+        }
+    }
+
+    let mut lower = vec![vec![0.0; size]; size];
+    for row in 0..size {
+        for column in 0..=row {
+            let mut value = values[row][column];
+            for (row_value, column_value) in
+                lower[row][..column].iter().zip(&lower[column][..column])
+            {
+                value -= row_value * column_value;
+            }
+            if row == column {
+                if !value.is_finite() || value <= 0.0 {
+                    return Err(arithmetic_error_with_message(
+                        span,
+                        "cholesky requires a symmetric positive-definite matrix",
+                    ));
+                }
+                lower[row][column] = value.sqrt();
+            } else {
+                lower[row][column] = value / lower[column][column];
+            }
+            if !lower[row][column].is_finite() {
+                return Err(arithmetic_error(span));
+            }
+        }
+    }
+
+    float_matrix_value(lower, span)
+}
+
+fn float_matrix_value(rows: Vec<Vec<f64>>, span: Option<&Span>) -> Result<Value, SimplyError> {
+    rows.into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|value| float_result(value, span))
+                .collect::<Result<Vec<_>, _>>()
+                .map(|row| Value::Array(shared_values(row)))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|rows| Value::Matrix(shared_values(rows)))
+}
+
+pub(crate) fn matrix_least_squares(
+    matrix: &Value,
+    right_hand_side: &Value,
+    span: Option<&Span>,
+) -> Result<Value, SimplyError> {
+    let rows = matrix_rows(matrix, span)?;
+    let row_count = rows.len();
+    let column_count = rows[0].len();
+    if row_count < column_count {
+        return Err(collection_error(
+            span,
+            "least_squares requires at least as many rows as columns",
+        ));
+    }
+    let right_hand_side = vector_values(right_hand_side, span)?;
+    if right_hand_side.len() != row_count {
+        return Err(collection_error(
+            span,
+            "least_squares requires one right-hand-side value per matrix row",
+        ));
+    }
+    ensure_matrix_allocation(
+        row_count,
+        column_count,
+        span,
+        "least-squares workspace is too large",
+    )?;
+
+    let mut coefficients = rows
+        .iter()
+        .map(|row| row.iter().map(|value| numeric_value(value, span)).collect())
+        .collect::<Result<Vec<Vec<_>>, _>>()?;
+    let mut values = right_hand_side
+        .iter()
+        .map(|value| numeric_value(value, span))
+        .collect::<Result<Vec<_>, _>>()?;
+    let scale = coefficients
+        .iter()
+        .flatten()
+        .fold(0.0_f64, |maximum, value| maximum.max(value.abs()));
+    let tolerance = scale * row_count.max(column_count) as f64 * f64::EPSILON;
+
+    for pivot_column in 0..column_count {
+        let mut column_norm = 0.0_f64;
+        for row in &coefficients[pivot_column..] {
+            column_norm = column_norm.hypot(row[pivot_column]);
+        }
+        if column_norm <= tolerance {
+            return Err(arithmetic_error_with_message(
+                span,
+                "least_squares matrix must have full column rank",
+            ));
+        }
+
+        let diagonal = coefficients[pivot_column][pivot_column];
+        let sign = if diagonal.is_sign_negative() {
+            -1.0
+        } else {
+            1.0
+        };
+        let mut reflector = coefficients[pivot_column..]
+            .iter()
+            .map(|row| row[pivot_column] / column_norm)
+            .collect::<Vec<_>>();
+        reflector[0] += sign;
+        let reflector_norm_squared = reflector.iter().map(|value| value * value).sum::<f64>();
+        if !reflector_norm_squared.is_finite() || reflector_norm_squared == 0.0 {
+            return Err(arithmetic_error(span));
+        }
+        let beta = 2.0 / reflector_norm_squared;
+
+        for column in pivot_column..column_count {
+            let projection = reflector
+                .iter()
+                .zip(&coefficients[pivot_column..])
+                .map(|(reflector_value, row)| reflector_value * row[column])
+                .sum::<f64>()
+                * beta;
+            if !projection.is_finite() {
+                return Err(arithmetic_error(span));
+            }
+            for (reflector_value, row) in reflector.iter().zip(&mut coefficients[pivot_column..]) {
+                row[column] -= projection * reflector_value;
+                if !row[column].is_finite() {
+                    return Err(arithmetic_error(span));
+                }
+            }
+        }
+
+        let projection = reflector
+            .iter()
+            .zip(&values[pivot_column..])
+            .map(|(reflector_value, value)| reflector_value * value)
+            .sum::<f64>()
+            * beta;
+        if !projection.is_finite() {
+            return Err(arithmetic_error(span));
+        }
+        for (reflector_value, value) in reflector.iter().zip(&mut values[pivot_column..]) {
+            *value -= projection * reflector_value;
+            if !value.is_finite() {
+                return Err(arithmetic_error(span));
+            }
+        }
+        coefficients[pivot_column][pivot_column] = -sign * column_norm;
+        for row in &mut coefficients[pivot_column + 1..] {
+            row[pivot_column] = 0.0;
+        }
+    }
+
+    let mut solution = vec![0.0; column_count];
+    for row in (0..column_count).rev() {
+        let mut value = values[row];
+        for (coefficient, solved) in coefficients[row][row + 1..]
+            .iter()
+            .zip(&solution[row + 1..])
+        {
+            value -= coefficient * solved;
+        }
+        solution[row] = value / coefficients[row][row];
+        if !solution[row].is_finite() {
+            return Err(arithmetic_error(span));
+        }
+    }
+
+    solution
+        .into_iter()
+        .map(|value| float_result(value, span))
+        .collect::<Result<Vec<_>, _>>()
+        .map(|solution| Value::Array(shared_values(solution)))
 }
 
 pub(crate) fn matrix_transpose_value(
@@ -906,60 +1625,5 @@ fn division_error(span: Option<&Span>) -> SimplyError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{binary, ensure_matrix_allocation, numeric_comparison};
-    use crate::{ast::BinaryOperator, error::DiagnosticCode, runtime::value::Value};
-
-    #[test]
-    fn matrix_result_allocations_obey_the_cell_limit() {
-        assert!(ensure_matrix_allocation(1_000, 1_000, None, "too large").is_ok());
-
-        let too_many_cells = ensure_matrix_allocation(1_001, 1_000, None, "too large").unwrap_err();
-        assert_eq!(too_many_cells.code(), DiagnosticCode::RuntimeLimit);
-
-        let overflowing_dimensions =
-            ensure_matrix_allocation(usize::MAX, 2, None, "too large").unwrap_err();
-        assert_eq!(overflowing_dimensions.code(), DiagnosticCode::RuntimeLimit);
-    }
-
-    #[test]
-    fn compares_large_integers_without_float_precision_loss() {
-        let result = numeric_comparison(
-            Value::Int(9_007_199_254_740_993),
-            &BinaryOperator::Greater,
-            Value::Int(9_007_199_254_740_992),
-            None,
-        )
-        .expect("integer comparison should succeed");
-
-        assert_eq!(result, Value::Bool(true));
-    }
-
-    #[test]
-    fn rejects_non_finite_float_results() {
-        let result = binary(
-            Value::Float(1.0e308),
-            &BinaryOperator::Multiply,
-            Value::Float(1.0e308),
-            None,
-        );
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn rejects_non_finite_matrix_results() {
-        let matrix = Value::Matrix(crate::runtime::value::shared_values(vec![Value::Array(
-            crate::runtime::value::shared_values(vec![Value::Float(1.0e308)]),
-        )]));
-
-        let result = binary(
-            matrix.clone(),
-            &BinaryOperator::MatrixMultiply,
-            matrix,
-            None,
-        );
-
-        assert!(result.is_err());
-    }
-}
+#[path = "../../tests/internal/runtime_operations.rs"]
+mod tests;

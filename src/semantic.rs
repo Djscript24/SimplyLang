@@ -321,6 +321,14 @@ impl SemanticAnalyzer {
                 .unwrap_or_else(|| typ.clone()),
             Type::Array(element) => Type::Array(Box::new(self.resolve_type_identity(element))),
             Type::List(element) => Type::List(Box::new(self.resolve_type_identity(element))),
+            Type::Vector(element, length) => {
+                Type::Vector(Box::new(self.resolve_type_identity(element)), *length)
+            }
+            Type::TypedMatrix(element, rows, columns) => Type::TypedMatrix(
+                Box::new(self.resolve_type_identity(element)),
+                *rows,
+                *columns,
+            ),
             Type::Tuple(elements) => Type::Tuple(
                 elements
                     .iter()
@@ -400,19 +408,6 @@ impl SemanticAnalyzer {
             }
         }
         Ok(())
-    }
-
-    #[cfg(test)]
-    pub fn analyze(&mut self, program: &Program) -> Result<(), SimplyError> {
-        self.ensure_global_function_scope();
-        self.module_identity = "memory://root".into();
-        self.module_return_allowed = false;
-        self.module_return_type = None;
-        self.imported_types.clear();
-        self.module_export_names.clear();
-        self.collect_structs_and_messages(&program.statements)?;
-        self.collect_functions(&program.statements)?;
-        self.analyze_statements(&program.statements)
     }
 
     pub fn analyze_file(&mut self, path: &Path) -> Result<(), SimplyError> {
@@ -904,7 +899,7 @@ impl SemanticAnalyzer {
             },
             MatchPattern::Sequence { patterns, rest } => {
                 let (element_type, rest_type) = match actual {
-                    Type::Array(element) => {
+                    Type::Array(element) | Type::Vector(element, _) => {
                         (element.as_ref().clone(), Type::Array(element.clone()))
                     }
                     Type::List(element) => (element.as_ref().clone(), Type::List(element.clone())),
@@ -1005,7 +1000,10 @@ impl SemanticAnalyzer {
                     DiagnosticCode::UndefinedVariable,
                     format!("unknown enum type `{}`", identity.local_name),
                 )),
-            Type::Array(element) | Type::List(element) => self.validate_declared_type(element),
+            Type::Array(element)
+            | Type::List(element)
+            | Type::Vector(element, _)
+            | Type::TypedMatrix(element, _, _) => self.validate_declared_type(element),
             Type::Tuple(elements) => {
                 for element in elements {
                     self.validate_declared_type(element)?;
@@ -1065,7 +1063,7 @@ impl SemanticAnalyzer {
             },
             MatchPattern::Sequence { patterns, rest } => {
                 let (element_type, rest_type) = match expected {
-                    Type::Array(element) => {
+                    Type::Array(element) | Type::Vector(element, _) => {
                         (element.as_ref().clone(), Type::Array(element.clone()))
                     }
                     Type::List(element) => (element.as_ref().clone(), Type::List(element.clone())),
@@ -1340,7 +1338,16 @@ impl SemanticAnalyzer {
                 let expected = declared_type
                     .as_ref()
                     .map(|typ| self.resolve_type_identity(typ))
-                    .unwrap_or_else(|| actual.clone());
+                    .unwrap_or_else(|| {
+                        if *mutable {
+                            Self::erase_inferred_dimensions(actual.clone())
+                        } else {
+                            actual.clone()
+                        }
+                    });
+                if matches!(expected, Type::Matrix | Type::TypedMatrix(_, _, _)) {
+                    self.require_rectangular_matrix_literal(value)?;
+                }
                 self.require_type(&expected, &actual)?;
                 self.define_variable(name.clone(), expected, *mutable)?;
             }
@@ -1394,7 +1401,7 @@ impl SemanticAnalyzer {
                 let index_type = self.analyze_expression(index)?;
                 let value_type = self.analyze_expression(value)?;
                 match target {
-                    Type::Array(element) | Type::List(element) => {
+                    Type::Array(element) | Type::List(element) | Type::Vector(element, _) => {
                         self.require_type(&Type::Int, &index_type)?;
                         self.require_type(&element, &value_type)?;
                     }
@@ -1821,10 +1828,40 @@ impl SemanticAnalyzer {
                     .collect::<Result<_, _>>()?,
             )),
             Expr::Matrix(values) => {
+                let mut element_type = Type::Unknown;
+                let mut column_count = None;
                 for value in values {
-                    self.analyze_expression(value)?;
+                    let row_type = self.analyze_expression(value)?;
+                    let row_length = Self::vector_length(&row_type);
+                    let row_element = match row_type {
+                        Type::Array(element) | Type::List(element) | Type::Vector(element, _) => {
+                            *element
+                        }
+                        Type::Unknown => Type::Unknown,
+                        _ => {
+                            return Err(self.error(
+                                DiagnosticCode::SemanticCollection,
+                                "matrix rows must be numeric sequences",
+                            ));
+                        }
+                    };
+                    self.require_numeric(&row_element)?;
+                    element_type = Self::merge_numeric_type(&element_type, &row_element);
+                    if let Some(row_length) = row_length {
+                        if column_count.is_some_and(|columns| columns != row_length) {
+                            return Err(self.error(
+                                DiagnosticCode::SemanticCollection,
+                                "matrix rows must have equal widths",
+                            ));
+                        }
+                        column_count = Some(row_length);
+                    }
                 }
-                Ok(Type::Matrix)
+                Ok(Type::TypedMatrix(
+                    Box::new(element_type),
+                    Some(values.len()),
+                    column_count,
+                ))
             }
             Expr::Hash(entries) | Expr::Tree(entries) => {
                 let mut value_type = None;
@@ -1855,7 +1892,7 @@ impl SemanticAnalyzer {
                     }
                     UnaryOperator::Transpose => {
                         self.require_type(&Type::Matrix, &operand_type)?;
-                        Ok(Type::Matrix)
+                        Ok(operand_type)
                     }
                 }
             }
@@ -1927,31 +1964,173 @@ impl SemanticAnalyzer {
         for value in values {
             let actual = self.analyze_expression(value)?;
             element = Some(match element {
-                Some(current) if !actual.compatible_with(&current) => {
-                    return Err(self.type_error(&current, &actual, "collection element"));
-                }
-                Some(current) => current,
+                Some(current) => Self::merge_compatible_types(&current, &actual)
+                    .ok_or_else(|| self.type_error(&current, &actual, "collection element"))?,
                 None => actual,
             });
         }
         let element = element.unwrap_or(Type::Unknown);
         Ok(if array {
-            Type::Array(Box::new(element))
+            Type::Vector(Box::new(element), Some(values.len()))
         } else {
             Type::List(Box::new(element))
         })
     }
 
     fn merge_collection_type(current: &Type, actual: &Type) -> Type {
+        Self::merge_compatible_types(current, actual).unwrap_or(Type::Unknown)
+    }
+
+    fn merge_compatible_types(current: &Type, actual: &Type) -> Option<Type> {
         if current == &Type::Unknown || actual == &Type::Unknown {
-            Type::Unknown
-        } else if actual.compatible_with(current) {
-            current.clone()
-        } else if current.compatible_with(actual) {
-            actual.clone()
-        } else {
-            Type::Unknown
+            return Some(Type::Unknown);
         }
+        match (current, actual) {
+            (
+                Type::Vector(current_element, current_length),
+                Type::Vector(actual_element, actual_length),
+            ) => {
+                let element = Self::merge_compatible_types(current_element, actual_element)?;
+                let length = if current_length == actual_length {
+                    *current_length
+                } else {
+                    None
+                };
+                Some(Type::Vector(Box::new(element), length))
+            }
+            _ if actual.compatible_with(current) => Some(current.clone()),
+            _ if current.compatible_with(actual) => Some(actual.clone()),
+            _ => None,
+        }
+    }
+
+    fn merge_numeric_type(current: &Type, actual: &Type) -> Type {
+        if current == &Type::Unknown {
+            actual.clone()
+        } else if actual == &Type::Unknown {
+            current.clone()
+        } else if current == &Type::Float || actual == &Type::Float {
+            Type::Float
+        } else {
+            Type::Int
+        }
+    }
+
+    fn matrix_element_type(typ: &Type) -> Type {
+        match typ {
+            Type::TypedMatrix(element, _, _) => (**element).clone(),
+            Type::Vector(row, _) => match row.as_ref() {
+                Type::Vector(element, _) | Type::Array(element) | Type::List(element) => {
+                    (**element).clone()
+                }
+                _ => Type::Unknown,
+            },
+            _ => Type::Unknown,
+        }
+    }
+
+    fn matrix_dimensions(typ: &Type) -> (Option<usize>, Option<usize>) {
+        match typ {
+            Type::TypedMatrix(_, rows, columns) => (*rows, *columns),
+            Type::Vector(row, rows) => match row.as_ref() {
+                Type::Vector(_, columns) => (*rows, *columns),
+                _ => (*rows, None),
+            },
+            _ => (None, None),
+        }
+    }
+
+    fn is_matrix_type(typ: &Type) -> bool {
+        matches!(typ, Type::Matrix | Type::TypedMatrix(_, _, _))
+            || matches!(typ, Type::Vector(row, _) if matches!(row.as_ref(), Type::Vector(_, _) | Type::Array(_) | Type::List(_)))
+    }
+
+    fn require_rectangular_matrix_literal(&self, expression: &Expr) -> Result<(), SimplyError> {
+        let rows = match expression {
+            Expr::Array(rows) | Expr::List(rows) | Expr::Matrix(rows) => rows,
+            _ => return Ok(()),
+        };
+        let mut expected_width = None;
+        for row in rows {
+            let width = match row {
+                Expr::Array(values) | Expr::List(values) => values.len(),
+                _ => return Ok(()),
+            };
+            if expected_width.is_some_and(|expected| expected != width) {
+                return Err(self.error(
+                    DiagnosticCode::SemanticCollection,
+                    "matrix rows must have equal widths",
+                ));
+            }
+            expected_width = Some(width);
+        }
+        Ok(())
+    }
+
+    fn vector_length(typ: &Type) -> Option<usize> {
+        match typ {
+            Type::Vector(_, length) => *length,
+            Type::Tuple(values) => Some(values.len()),
+            _ => None,
+        }
+    }
+
+    fn erase_inferred_dimensions(typ: Type) -> Type {
+        match typ {
+            Type::Vector(element, _) => {
+                Type::Vector(Box::new(Self::erase_inferred_dimensions(*element)), None)
+            }
+            Type::TypedMatrix(element, _, _) => Type::TypedMatrix(
+                Box::new(Self::erase_inferred_dimensions(*element)),
+                None,
+                None,
+            ),
+            Type::Array(element) => {
+                Type::Array(Box::new(Self::erase_inferred_dimensions(*element)))
+            }
+            Type::List(element) => Type::List(Box::new(Self::erase_inferred_dimensions(*element))),
+            other => other,
+        }
+    }
+
+    fn dimensions_match(
+        left: (Option<usize>, Option<usize>),
+        right: (Option<usize>, Option<usize>),
+    ) -> bool {
+        left.0
+            .is_none_or(|value| right.0.is_none_or(|other| value == other))
+            && left
+                .1
+                .is_none_or(|value| right.1.is_none_or(|other| value == other))
+    }
+
+    fn require_square_dimensions(
+        &self,
+        name: &str,
+        shape: (Option<usize>, Option<usize>),
+    ) -> Result<(), SimplyError> {
+        if shape.0.is_some() && shape.1.is_some() && shape.0 != shape.1 {
+            return Err(self.error(
+                DiagnosticCode::SemanticCollection,
+                format!("`{name}` requires a square matrix"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_matching_vector_lengths(
+        &self,
+        name: &str,
+        left: Option<usize>,
+        right: Option<usize>,
+    ) -> Result<(), SimplyError> {
+        if left.is_some() && right.is_some() && left != right {
+            return Err(self.error(
+                DiagnosticCode::SemanticCollection,
+                format!("`{name}` requires matching vector dimensions"),
+            ));
+        }
+        Ok(())
     }
 
     fn binary_type(
@@ -1965,14 +2144,46 @@ impl SemanticAnalyzer {
             return Ok(Type::Unknown);
         }
         match operator {
-            Add if left == &Type::Matrix && right == &Type::Matrix => Ok(Type::Matrix),
+            Add if Self::is_matrix_type(left) && Self::is_matrix_type(right) => {
+                let left_shape = Self::matrix_dimensions(left);
+                let right_shape = Self::matrix_dimensions(right);
+                if !Self::dimensions_match(left_shape, right_shape) {
+                    return Err(self.error(
+                        DiagnosticCode::SemanticCollection,
+                        "matrix addition requires matching dimensions",
+                    ));
+                }
+                Ok(Type::TypedMatrix(
+                    Box::new(Self::merge_numeric_type(
+                        &Self::matrix_element_type(left),
+                        &Self::matrix_element_type(right),
+                    )),
+                    left_shape.0,
+                    left_shape.1,
+                ))
+            }
             Add if left == &Type::String && right == &Type::String => Ok(Type::String),
             Add => self.numeric_result(left, right),
             Subtract | Multiply | Divide | Remainder => self.numeric_result(left, right),
             MatrixMultiply => {
                 self.require_type(&Type::Matrix, left)?;
                 self.require_type(&Type::Matrix, right)?;
-                Ok(Type::Matrix)
+                let left_shape = Self::matrix_dimensions(left);
+                let right_shape = Self::matrix_dimensions(right);
+                if left_shape.1.is_some()
+                    && right_shape.0.is_some()
+                    && left_shape.1 != right_shape.0
+                {
+                    return Err(self.error(
+                        DiagnosticCode::SemanticCollection,
+                        "matrix multiplication dimensions do not match",
+                    ));
+                }
+                Ok(Type::TypedMatrix(
+                    Box::new(Type::Float),
+                    left_shape.0,
+                    right_shape.1,
+                ))
             }
             Greater | GreaterEqual | Less | LessEqual => {
                 self.require_numeric(left)?;
@@ -2052,7 +2263,9 @@ impl SemanticAnalyzer {
         if name == "enumerate" && !user_function {
             self.expect_count(name, &argument_types, 1)?;
             let element_type = match &argument_types[0] {
-                Type::Array(element) | Type::List(element) => (**element).clone(),
+                Type::Array(element) | Type::List(element) | Type::Vector(element, _) => {
+                    (**element).clone()
+                }
                 Type::Range => Type::Int,
                 Type::String => Type::String,
                 Type::Tuple(elements) => elements
@@ -2079,7 +2292,9 @@ impl SemanticAnalyzer {
         if name == "zip" && !user_function {
             self.expect_count(name, &argument_types, 2)?;
             let element_type = |typ: &Type| match typ {
-                Type::Array(element) | Type::List(element) => Some((**element).clone()),
+                Type::Array(element) | Type::List(element) | Type::Vector(element, _) => {
+                    Some((**element).clone())
+                }
                 Type::Range => Some(Type::Int),
                 Type::String => Some(Type::String),
                 Type::Tuple(elements) => Some(
@@ -2221,7 +2436,7 @@ impl SemanticAnalyzer {
                     ));
                 }
                 match &argument_types[1] {
-                    Type::Array(element) | Type::List(element) => {
+                    Type::Array(element) | Type::List(element) | Type::Vector(element, _) => {
                         self.require_type(&Type::String, element)?;
                     }
                     Type::Tuple(elements) => {
@@ -2414,21 +2629,47 @@ impl SemanticAnalyzer {
                 let left = self.numeric_sequence_element(&argument_types[0])?;
                 let right = self.numeric_sequence_element(&argument_types[1])?;
                 let element = self.numeric_result(&left, &right)?;
-                Ok(Type::Array(Box::new(element)))
+                let left_length = Self::vector_length(&argument_types[0]);
+                let right_length = Self::vector_length(&argument_types[1]);
+                self.require_matching_vector_lengths(name, left_length, right_length)?;
+                Ok(Type::Vector(
+                    Box::new(element),
+                    left_length.or(right_length),
+                ))
             }
             "vector_scale" => {
                 self.expect_count(name, &argument_types, 2)?;
                 self.require_numeric(&argument_types[1])?;
                 let element = self.numeric_sequence_element(&argument_types[0])?;
-                Ok(Type::Array(Box::new(
-                    self.numeric_result(&element, &argument_types[1])?,
-                )))
+                Ok(Type::Vector(
+                    Box::new(self.numeric_result(&element, &argument_types[1])?),
+                    Self::vector_length(&argument_types[0]),
+                ))
             }
             "dot" => {
                 self.expect_count(name, &argument_types, 2)?;
                 let left = self.numeric_sequence_element(&argument_types[0])?;
                 let right = self.numeric_sequence_element(&argument_types[1])?;
+                self.require_matching_vector_lengths(
+                    name,
+                    Self::vector_length(&argument_types[0]),
+                    Self::vector_length(&argument_types[1]),
+                )?;
                 self.numeric_result(&left, &right)
+            }
+            "cross" => {
+                self.expect_count(name, &argument_types, 2)?;
+                self.numeric_sequence_element(&argument_types[0])?;
+                self.numeric_sequence_element(&argument_types[1])?;
+                for typ in &argument_types {
+                    if Self::vector_length(typ).is_some_and(|length| length != 3) {
+                        return Err(self.error(
+                            DiagnosticCode::SemanticCollection,
+                            "`cross` requires vectors with exactly three elements",
+                        ));
+                    }
+                }
+                Ok(Type::Vector(Box::new(Type::Float), Some(3)))
             }
             "norm" => {
                 self.expect_count(name, &argument_types, 1)?;
@@ -2439,39 +2680,218 @@ impl SemanticAnalyzer {
                 self.expect_count(name, &argument_types, 2)?;
                 self.numeric_sequence_element(&argument_types[0])?;
                 self.numeric_sequence_element(&argument_types[1])?;
+                self.require_matching_vector_lengths(
+                    name,
+                    Self::vector_length(&argument_types[0]),
+                    Self::vector_length(&argument_types[1]),
+                )?;
                 Ok(Type::Float)
             }
             "normalize" => {
                 self.expect_count(name, &argument_types, 1)?;
                 self.numeric_sequence_element(&argument_types[0])?;
-                Ok(Type::Array(Box::new(Type::Float)))
+                Ok(Type::Vector(
+                    Box::new(Type::Float),
+                    Self::vector_length(&argument_types[0]),
+                ))
             }
             "shape" => {
                 self.expect_count(name, &argument_types, 1)?;
                 self.require_matrix(&argument_types[0])?;
                 Ok(Type::Tuple(vec![Type::Int, Type::Int]))
             }
+            "trace" => {
+                self.expect_count(name, &argument_types, 1)?;
+                self.require_matrix(&argument_types[0])?;
+                self.require_square_dimensions(name, Self::matrix_dimensions(&argument_types[0]))?;
+                Ok(Type::Float)
+            }
+            "rank" => {
+                self.expect_count(name, &argument_types, 1)?;
+                self.require_matrix(&argument_types[0])?;
+                Ok(Type::Int)
+            }
+            "matvec" => {
+                self.expect_count(name, &argument_types, 2)?;
+                self.require_matrix(&argument_types[0])?;
+                self.numeric_sequence_element(&argument_types[1])?;
+                let shape = Self::matrix_dimensions(&argument_types[0]);
+                self.require_matching_vector_lengths(
+                    name,
+                    shape.1,
+                    Self::vector_length(&argument_types[1]),
+                )?;
+                Ok(Type::Vector(Box::new(Type::Float), shape.0))
+            }
+            "determinant" => {
+                self.expect_count(name, &argument_types, 1)?;
+                self.require_matrix(&argument_types[0])?;
+                self.require_square_dimensions(name, Self::matrix_dimensions(&argument_types[0]))?;
+                Ok(Type::Float)
+            }
+            "inverse" => {
+                self.expect_count(name, &argument_types, 1)?;
+                self.require_matrix(&argument_types[0])?;
+                let shape = Self::matrix_dimensions(&argument_types[0]);
+                self.require_square_dimensions(name, shape)?;
+                Ok(Type::TypedMatrix(Box::new(Type::Float), shape.0, shape.1))
+            }
+            "lu" => {
+                self.expect_count(name, &argument_types, 1)?;
+                self.require_matrix(&argument_types[0])?;
+                let (rows, columns) = Self::matrix_dimensions(&argument_types[0]);
+                let rank_bound = rows.zip(columns).map(|(rows, columns)| rows.min(columns));
+                Ok(Type::Tuple(vec![
+                    Type::TypedMatrix(Box::new(Type::Float), rows, rank_bound),
+                    Type::TypedMatrix(Box::new(Type::Float), rank_bound, columns),
+                    Type::TypedMatrix(Box::new(Type::Float), rows, rows),
+                ]))
+            }
+            "qr" => {
+                self.expect_count(name, &argument_types, 1)?;
+                self.require_matrix(&argument_types[0])?;
+                let (rows, columns) = Self::matrix_dimensions(&argument_types[0]);
+                Ok(Type::Tuple(vec![
+                    Type::TypedMatrix(Box::new(Type::Float), rows, rows),
+                    Type::TypedMatrix(Box::new(Type::Float), rows, columns),
+                ]))
+            }
+            "cholesky" => {
+                self.expect_count(name, &argument_types, 1)?;
+                self.require_matrix(&argument_types[0])?;
+                let shape = Self::matrix_dimensions(&argument_types[0]);
+                self.require_square_dimensions(name, shape)?;
+                Ok(Type::TypedMatrix(Box::new(Type::Float), shape.0, shape.1))
+            }
+            "solve" => {
+                self.expect_count(name, &argument_types, 2)?;
+                self.require_matrix(&argument_types[0])?;
+                let shape = Self::matrix_dimensions(&argument_types[0]);
+                self.require_square_dimensions(name, shape)?;
+                if Self::is_matrix_type(&argument_types[1]) {
+                    self.require_matrix(&argument_types[1])?;
+                    let rhs_shape = Self::matrix_dimensions(&argument_types[1]);
+                    if shape.0.is_some() && rhs_shape.0.is_some() && shape.0 != rhs_shape.0 {
+                        return Err(self.error(
+                            DiagnosticCode::SemanticCollection,
+                            "`solve` requires the right-hand-side row count to match the matrix",
+                        ));
+                    }
+                    Ok(Type::TypedMatrix(
+                        Box::new(Type::Float),
+                        shape.1,
+                        rhs_shape.1,
+                    ))
+                } else if argument_types[1] == Type::Unknown {
+                    Ok(Type::Unknown)
+                } else {
+                    self.numeric_sequence_element(&argument_types[1])?;
+                    self.require_matching_vector_lengths(
+                        name,
+                        shape.0,
+                        Self::vector_length(&argument_types[1]),
+                    )?;
+                    Ok(Type::Vector(Box::new(Type::Float), shape.1))
+                }
+            }
+            "least_squares" => {
+                self.expect_count(name, &argument_types, 2)?;
+                self.require_matrix(&argument_types[0])?;
+                self.numeric_sequence_element(&argument_types[1])?;
+                let shape = Self::matrix_dimensions(&argument_types[0]);
+                if shape
+                    .0
+                    .is_some_and(|rows| shape.1.is_some_and(|columns| rows < columns))
+                {
+                    return Err(self.error(
+                        DiagnosticCode::SemanticCollection,
+                        "`least_squares` requires at least as many rows as columns",
+                    ));
+                }
+                self.require_matching_vector_lengths(
+                    name,
+                    shape.0,
+                    Self::vector_length(&argument_types[1]),
+                )?;
+                Ok(Type::Vector(Box::new(Type::Float), shape.1))
+            }
             "transpose" => {
                 self.expect_count(name, &argument_types, 1)?;
                 self.require_matrix(&argument_types[0])?;
-                Ok(Type::Matrix)
+                let (rows, columns) = Self::matrix_dimensions(&argument_types[0]);
+                Ok(Type::TypedMatrix(
+                    Box::new(Self::matrix_element_type(&argument_types[0])),
+                    columns,
+                    rows,
+                ))
             }
             "matrix_add" | "matrix_subtract" | "multiply" => {
                 self.expect_count(name, &argument_types, 2)?;
                 self.require_matrix(&argument_types[0])?;
                 self.require_matrix(&argument_types[1])?;
-                Ok(Type::Matrix)
+                let left_shape = Self::matrix_dimensions(&argument_types[0]);
+                let right_shape = Self::matrix_dimensions(&argument_types[1]);
+                let output_shape = if name == "multiply" {
+                    if left_shape.1.is_some()
+                        && right_shape.0.is_some()
+                        && left_shape.1 != right_shape.0
+                    {
+                        return Err(self.error(
+                            DiagnosticCode::SemanticCollection,
+                            "matrix multiplication dimensions do not match",
+                        ));
+                    }
+                    (left_shape.0, right_shape.1)
+                } else {
+                    if !Self::dimensions_match(left_shape, right_shape) {
+                        return Err(self.error(
+                            DiagnosticCode::SemanticCollection,
+                            "matrix operation requires matching dimensions",
+                        ));
+                    }
+                    left_shape
+                };
+                Ok(Type::TypedMatrix(
+                    Box::new(if name == "multiply" {
+                        Type::Float
+                    } else {
+                        Self::merge_numeric_type(
+                            &Self::matrix_element_type(&argument_types[0]),
+                            &Self::matrix_element_type(&argument_types[1]),
+                        )
+                    }),
+                    output_shape.0,
+                    output_shape.1,
+                ))
             }
             "matrix_scale" => {
                 self.expect_count(name, &argument_types, 2)?;
                 self.require_matrix(&argument_types[0])?;
                 self.require_numeric(&argument_types[1])?;
-                Ok(Type::Matrix)
+                let (rows, columns) = Self::matrix_dimensions(&argument_types[0]);
+                Ok(Type::TypedMatrix(
+                    Box::new(self.numeric_result(
+                        &Self::matrix_element_type(&argument_types[0]),
+                        &argument_types[1],
+                    )?),
+                    rows,
+                    columns,
+                ))
             }
             "identity" => {
                 self.expect_count(name, &argument_types, 1)?;
                 self.require_type(&Type::Int, &argument_types[0])?;
-                Ok(Type::Matrix)
+                let size = match &arguments[0] {
+                    Expr::Literal(Literal::Int(size)) if *size > 0 => usize::try_from(*size).ok(),
+                    Expr::Literal(Literal::Int(_)) => {
+                        return Err(self.error(
+                            DiagnosticCode::InvalidFunctionCall,
+                            "`identity` size must be positive",
+                        ));
+                    }
+                    _ => None,
+                };
+                Ok(Type::TypedMatrix(Box::new(Type::Int), size, size))
             }
             "mean" | "median" | "variance" | "stddev" => {
                 self.expect_count(name, &argument_types, 1)?;
@@ -2847,7 +3267,12 @@ impl SemanticAnalyzer {
                 None => result_type = Some(branch_type),
                 Some(expected) if *expected == Type::Unknown => result_type = Some(branch_type),
                 Some(_) if branch_type == Type::Unknown => {}
-                Some(expected) => self.require_type(expected, &branch_type)?,
+                Some(expected) => {
+                    result_type = Some(
+                        Self::merge_compatible_types(expected, &branch_type)
+                            .ok_or_else(|| self.type_error(expected, &branch_type, "match arm"))?,
+                    );
+                }
             }
         }
 
@@ -3061,7 +3486,9 @@ impl SemanticAnalyzer {
         }
 
         let sequence_element_type = match typ {
-            Type::Array(element) | Type::List(element) => Some((**element).clone()),
+            Type::Array(element) | Type::List(element) | Type::Vector(element, _) => {
+                Some((**element).clone())
+            }
             Type::CsvStream => Some(Type::List(Box::new(Type::String))),
             Type::Unknown if matches!(head, MatchPattern::Sequence { .. }) => Some(Type::Unknown),
             _ => None,
@@ -3851,7 +4278,7 @@ impl SemanticAnalyzer {
             }
             MatchPattern::Sequence { patterns, rest } => {
                 let (element_type, sequence_type) = match expected {
-                    Type::Array(element) | Type::List(element) => {
+                    Type::Array(element) | Type::List(element) | Type::Vector(element, _) => {
                         ((**element).clone(), expected.clone())
                     }
                     Type::Range => (Type::Int, Type::Range),
@@ -4115,7 +4542,7 @@ impl SemanticAnalyzer {
         }
         let source_type = self.analyze_expression(source)?;
         let mut item_type = match source_type {
-            Type::Array(element) | Type::List(element) => *element,
+            Type::Array(element) | Type::List(element) | Type::Vector(element, _) => *element,
             Type::Range => Type::Int,
             Type::CsvStream => Type::List(Box::new(Type::String)),
             Type::Unknown => Type::Unknown,
@@ -4386,7 +4813,7 @@ impl SemanticAnalyzer {
         index_expression: &Expr,
     ) -> Result<Type, SimplyError> {
         match target {
-            Type::Array(element) | Type::List(element) => {
+            Type::Array(element) | Type::List(element) | Type::Vector(element, _) => {
                 self.require_type(&Type::Int, index)?;
                 Ok((**element).clone())
             }
@@ -4424,12 +4851,15 @@ impl SemanticAnalyzer {
                 self.require_type(&Type::Int, index)?;
                 Ok(Type::String)
             }
-            Type::Matrix => match index {
+            Type::Matrix | Type::TypedMatrix(_, _, _) => match index {
                 Type::Tuple(types)
                     if types.len() == 2
                         && types.iter().all(|value| value.compatible_with(&Type::Int)) =>
                 {
-                    Ok(Type::Unknown)
+                    Ok(match target {
+                        Type::TypedMatrix(element, _, _) => (**element).clone(),
+                        _ => Type::Unknown,
+                    })
                 }
                 Type::Unknown => Ok(Type::Unknown),
                 _ => Err(self.error(
@@ -4443,7 +4873,9 @@ impl SemanticAnalyzer {
     }
     fn element_type(typ: &Type) -> Option<Type> {
         match typ {
-            Type::Array(element) | Type::List(element) => Some((**element).clone()),
+            Type::Array(element) | Type::List(element) | Type::Vector(element, _) => {
+                Some((**element).clone())
+            }
             Type::Range => Some(Type::Int),
             Type::Tuple(types) => Some(types.first().cloned().unwrap_or(Type::Unknown)),
             Type::Hash | Type::Tree => Some(Type::Unknown),
@@ -4460,6 +4892,9 @@ impl SemanticAnalyzer {
                 | Type::Range
                 | Type::Array(_)
                 | Type::List(_)
+                | Type::Vector(_, _)
+                | Type::Matrix
+                | Type::TypedMatrix(_, _, _)
                 | Type::Tuple(_)
                 | Type::Hash
                 | Type::Tree
@@ -4478,7 +4913,9 @@ impl SemanticAnalyzer {
 
     fn require_string_iterable(&self, typ: &Type) -> Result<(), SimplyError> {
         match typ {
-            Type::Array(element) | Type::List(element) => self.require_type(&Type::String, element),
+            Type::Array(element) | Type::List(element) | Type::Vector(element, _) => {
+                self.require_type(&Type::String, element)
+            }
             Type::Hash | Type::Tree => Ok(()),
             Type::HashValues(element) | Type::TreeValues(element) => {
                 self.require_type(&Type::String, element)
@@ -4499,7 +4936,9 @@ impl SemanticAnalyzer {
 
     fn require_boolean_iterable(&self, typ: &Type) -> Result<(), SimplyError> {
         match typ {
-            Type::Array(element) | Type::List(element) => self.require_type(&Type::Bool, element),
+            Type::Array(element) | Type::List(element) | Type::Vector(element, _) => {
+                self.require_type(&Type::Bool, element)
+            }
             Type::Tuple(types) => {
                 for element in types {
                     self.require_type(&Type::Bool, element)?;
@@ -4519,7 +4958,9 @@ impl SemanticAnalyzer {
 
     fn require_numeric_iterable(&self, typ: &Type) -> Result<(), SimplyError> {
         match typ {
-            Type::Array(element) | Type::List(element) => self.require_numeric(element),
+            Type::Array(element) | Type::List(element) | Type::Vector(element, _) => {
+                self.require_numeric(element)
+            }
             Type::Range => Ok(()),
             Type::Tuple(types) => {
                 for element in types {
@@ -4549,7 +4990,9 @@ impl SemanticAnalyzer {
 
     fn numeric_sequence_element_option(&self, typ: &Type) -> Option<Type> {
         match typ {
-            Type::Array(element) | Type::List(element) => Some((**element).clone()),
+            Type::Array(element) | Type::List(element) | Type::Vector(element, _) => {
+                Some((**element).clone())
+            }
             Type::Tuple(elements) => {
                 let first = elements.first().cloned().unwrap_or(Type::Unknown);
                 if elements
@@ -4568,7 +5011,7 @@ impl SemanticAnalyzer {
 
     fn numeric_sum_type(&self, typ: &Type) -> Type {
         let elements: Vec<&Type> = match typ {
-            Type::Array(element) | Type::List(element) => vec![element],
+            Type::Array(element) | Type::List(element) | Type::Vector(element, _) => vec![element],
             Type::Tuple(elements) => elements.iter().collect(),
             Type::Range => return Type::Int,
             _ => return Type::Unknown,
@@ -4585,7 +5028,8 @@ impl SemanticAnalyzer {
     fn require_matrix(&self, typ: &Type) -> Result<(), SimplyError> {
         let row_type = match typ {
             Type::Matrix => return Ok(()),
-            Type::Array(row) | Type::List(row) => row,
+            Type::TypedMatrix(element, _, _) => return self.require_numeric(element),
+            Type::Array(row) | Type::List(row) | Type::Vector(row, _) => row,
             Type::Unknown => return Ok(()),
             _ => {
                 return Err(self.error(
@@ -4595,7 +5039,9 @@ impl SemanticAnalyzer {
             }
         };
         match row_type.as_ref() {
-            Type::Array(element) | Type::List(element) => self.require_numeric(element),
+            Type::Array(element) | Type::List(element) | Type::Vector(element, _) => {
+                self.require_numeric(element)
+            }
             Type::HashValues(element) | Type::TreeValues(element) => self.require_numeric(element),
             Type::Unknown => Ok(()),
             _ => Err(self.error(
@@ -4670,3 +5116,7 @@ impl SemanticAnalyzer {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/internal/semantic_support.rs"]
+pub(crate) mod test_support;

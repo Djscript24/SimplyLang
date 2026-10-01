@@ -67,8 +67,11 @@ collection_op  = name ( "add" | "remove" ) expression ;
 parameters     = [ "mut" ] name [ "as" type ] { "," [ "mut" ] name [ "as" type ] } ;
 type           = "String" | "Int" | "Float" | "Bool" | "Hash" | "Tree"
                | "Matrix" | name | "Array" "[" type "]" | "List" "[" type "]"
+               | "Vector" "[" type [ "," dimension ] "]"
+               | "Matrix" "[" type [ "," dimension "," dimension ] "]"
                | "Tuple" "[" type { "," type } "]"
                | "(" type "," type { "," type } ")" ;
+dimension      = integer | "?" ;
 match          = "match" expression ":" newline
                  { pattern [ "if" expression ] ":" newline
                    { statement newline } }
@@ -244,9 +247,11 @@ reaching a pipeline terminal.
 
 Scalar math functions include `sqrt`, `pow`, `exp`, `log`, `log10`, `sin`,
 `cos`, `tan`, `floor`, `ceil`, and `sign`. Vector built-ins include
-`vector_add`, `vector_subtract`, `vector_scale`, `dot`, `norm`, `distance`, and
-`normalize`. Matrix built-ins include `shape`, `transpose`, `matrix_add`,
-`matrix_subtract`, `matrix_scale`, `multiply`, and `identity`. Statistical
+`vector_add`, `vector_subtract`, `vector_scale`, `dot`, `cross`, `norm`,
+`distance`, and `normalize`. Matrix built-ins include `shape`, `trace`, `rank`,
+`matvec`, `transpose`, `matrix_add`,
+`matrix_subtract`, `matrix_scale`, `multiply`, `identity`, `determinant`,
+`inverse`, `solve`, and `least_squares`. Statistical
 built-ins include `mean`, `median`, `variance`, `stddev`, `percentile`,
 `covariance`, and `correlation`. `multiply(...)` and `transpose(...)` are
 function-call forms of words that also participate in existing matrix syntax.

@@ -205,6 +205,7 @@ impl Evaluator {
                 let Value::Struct(instance) = value else {
                     return Ok(None);
                 };
+                let instance = self.tracked_struct(instance)?;
                 let Some(definition) = self.lookup_struct(type_name) else {
                     return Ok(None);
                 };
@@ -214,10 +215,9 @@ impl Evaluator {
                 if fields.len() != definition.fields.len() {
                     return Ok(None);
                 }
-                let instance_fields = instance.fields.borrow();
                 let mut bindings = Vec::new();
                 for (pattern, field) in fields.iter().zip(&definition.fields) {
-                    let Some(value) = instance_fields.get(&field.name) else {
+                    let Some(value) = instance.fields.get(&field.name) else {
                         return Ok(None);
                     };
                     let Some(nested) = self.match_value_pattern(pattern, value)? else {
@@ -231,13 +231,13 @@ impl Evaluator {
                 let Value::Struct(instance) = value else {
                     return Ok(None);
                 };
+                let instance = self.tracked_struct(instance)?;
                 let Some(definition) = self.lookup_struct(type_name) else {
                     return Ok(None);
                 };
                 if instance.identity != definition.identity {
                     return Ok(None);
                 }
-                let instance_fields = instance.fields.borrow();
                 let mut bindings = Vec::new();
                 for (field_name, pattern) in fields {
                     if !definition
@@ -247,7 +247,7 @@ impl Evaluator {
                     {
                         return Ok(None);
                     }
-                    let Some(value) = instance_fields.get(field_name) else {
+                    let Some(value) = instance.fields.get(field_name) else {
                         return Ok(None);
                     };
                     let Some(nested) = self.match_value_pattern(pattern, value)? else {
@@ -265,6 +265,7 @@ impl Evaluator {
                 let Value::Enum(enum_value) = value else {
                     return Ok(None);
                 };
+                let enum_value = self.tracked_enum(enum_value)?;
                 let Some(definition) = self.lookup_enum(enum_name) else {
                     return Ok(None);
                 };

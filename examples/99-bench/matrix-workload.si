@@ -2,8 +2,16 @@
 # Measures repeated matrix multiplication and transpose operations.
 # Key components: 3x3 matrices and a 100-iteration workload.
 # Runtime benchmark workload: repeated matrix multiplication and transpose
-left is matrix [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
-right is matrix [[9, 8, 7], [6, 5, 4], [3, 2, 1]]
+left as Matrix[Float, 3, 3] is matrix [
+    [1.0, 2.0, 3.0],
+    [4.0, 5.0, 6.0],
+    [7.0, 8.0, 9.0],
+]
+right as Matrix[Float, 3, 3] is matrix [
+    [9.0, 8.0, 7.0],
+    [6.0, 5.0, 4.0],
+    [3.0, 2.0, 1.0],
+]
 
 mut index is 0
 mut result is left
