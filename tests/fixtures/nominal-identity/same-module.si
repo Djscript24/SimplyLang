@@ -1,0 +1,15 @@
+type Item:
+    value as Int
+end
+enum State:
+    Ready
+end
+fn retain_item(value as Item) gives Item:
+    return value
+end
+item is retain_item(Item(1))
+state as State is State::Ready
+Sayln type_of(item)
+Sayln type_of(state)
+Sayln item == Item(1)
+Sayln state == State::Ready

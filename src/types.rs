@@ -1,6 +1,41 @@
 //! types.rs — Simply type definitions
 //! Defines the language's primitive, collection, function, and unit types used by analysis and runtime checks.
 //! Key component: Type and its compatibility helpers.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DeclarationKind {
+    Struct,
+    Enum,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DeclarationIdentity {
+    pub module: String,
+    pub local_name: String,
+    pub kind: DeclarationKind,
+}
+
+impl DeclarationIdentity {
+    pub fn new(
+        module: impl Into<String>,
+        local_name: impl Into<String>,
+        kind: DeclarationKind,
+    ) -> Self {
+        Self {
+            module: module.into(),
+            local_name: local_name.into(),
+            kind,
+        }
+    }
+
+    pub fn unresolved(local_name: impl Into<String>, kind: DeclarationKind) -> Self {
+        Self::new("memory://unresolved", local_name, kind)
+    }
+
+    pub fn is_unresolved(&self) -> bool {
+        self.module == "memory://unresolved"
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
     Unknown,
@@ -19,8 +54,8 @@ pub enum Type {
     Tree,
     TreeValues(Box<Type>),
     Matrix,
-    Struct(String),
-    Enum(String),
+    Struct(DeclarationIdentity),
+    Enum(DeclarationIdentity),
     Function {
         parameters: Vec<Option<Box<Type>>>,
         return_type: Option<Box<Type>>,
@@ -49,8 +84,7 @@ impl Type {
             Self::Tree => "Tree".into(),
             Self::TreeValues(_) => "Tree".into(),
             Self::Matrix => "Matrix".into(),
-            Self::Struct(name) => name.clone(),
-            Self::Enum(name) => name.clone(),
+            Self::Struct(identity) | Self::Enum(identity) => identity.local_name.clone(),
             Self::Function { .. } => "Function".into(),
         }
     }

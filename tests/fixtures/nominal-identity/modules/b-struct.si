@@ -1,0 +1,4 @@
+type Item:
+    value as Int
+end
+return Item(1)

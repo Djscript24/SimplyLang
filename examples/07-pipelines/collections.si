@@ -1,7 +1,7 @@
 # collections.si — collection pipeline example
-# Demonstrates selection, derivation, and terminal sum/count pipeline stages.
-# Key components: two pipelines over a numeric list.
-# Select, derive, sum, and count in collection pipelines
+# Demonstrates selection, derivation, Boolean reductions, and aggregates.
+# Key components: ordered pipeline steps and terminal operations.
+# Select, derive, reduce, sum, and count in collection pipelines
 numbers is list [10, 20, 30, 40]
 
 total is pipeline:
@@ -17,5 +17,50 @@ how_many is pipeline:
     count
 end
 
+preview is pipeline:
+    numbers
+    where item >= 20
+    skip 1
+    take_while item <= 30
+    derive item * 2
+end
+
+sampled_scores is pipeline:
+    range(1, 12)
+    where item % 2 == 0
+    step_by 3
+end
+
 Sayln total
 Sayln how_many
+Sayln preview
+Sayln sampled_scores
+
+duplicate_numbers is list [10, 20, 10, 30, 20]
+unique_numbers is pipeline:
+    duplicate_numbers
+    distinct
+end
+
+Sayln unique_numbers
+
+recent_scores is pipeline:
+    range(1, 8)
+    drop_while item < 4
+    take 2
+end
+
+Sayln recent_scores
+
+active_flags is list [false, true, true]
+has_active is pipeline:
+    active_flags
+    any
+end
+all_active is pipeline:
+    active_flags
+    all
+end
+
+Sayln has_active
+Sayln all_active

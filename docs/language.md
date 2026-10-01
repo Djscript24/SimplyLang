@@ -15,8 +15,16 @@ Simply source files use the `.si` extension. `#` starts a comment outside a stri
 - `Sayln expression` prints a value followed by a newline.
 - `fn name(parameters) gives Type: ... end` defines a function. Functions may be
   nested inside functions or control-flow blocks and resolve visible lexical bindings.
+  Top-level function declarations in an executable source file are available
+  throughout that file, including before their textual declaration. Imported
+  modules execute in isolation and in source order; their functions capture
+  module bindings when declared and must be declared before they are used.
+  Nested function declarations are also created in execution order.
   A nested function can be returned, stored in a binding, and called later as a
-  closure; captured bindings are immutable snapshots.
+  closure; captured bindings are immutable snapshots taken when the function is
+  created, and `check` rejects rebinding or collection mutation through them.
+  Nested closures do not share a live environment: a returned closure cannot
+  rely on a later-declared sibling, so sibling mutual recursion is not supported.
 - `type Name: ... end` declares a nominal struct with ordered, typed fields.
   Construct instances positionally with `Name(value, ...)`.
 - `on Name receive message(parameters): ... end` defines behavior for that
@@ -30,11 +38,28 @@ Simply source files use the `.si` extension. `#` starts a comment outside a stri
   `catch` clauses can filter by diagnostic code, for example `catch error as E0202:`.
   `throw expression` raises a user-defined runtime error, and `finally` always runs,
   including when the error is not caught. A `finally` control statement or error takes precedence.
-- `open "path.si" as name` loads a source value relative to the importing file.
+- `open "path.si" as name` loads a source module relative to the importing file
+  and binds its returned value to `name`. Modules can declare named exports
+  with `export name, other`; `open "path.si" exposing name, other` imports
+  those values directly. Rename an imported value with
+  `open "path.si" exposing name as local_name`. Exported structs and enums
+  can be imported the same way; struct messages and nominal type identity are
+  retained across aliases.
 - Lists support `name add expression` and `name remove expression`.
 - Arrays, lists, tuples, hashes, trees, and matrices support the forms shown in the examples.
 
-Conditions must be `Bool`. `if` and `for` create local scopes; `while` does not. Functions and imports execute with isolated local state. Iterating a hash or tree visits its values in deterministic key order.
+Conditions must be `Bool`. `if` and `for` create local scopes; `while` does not.
+Functions and imports execute with isolated local state. Imported modules
+return one value; explicitly selected named exports are also available, while
+unselected module declarations stay private.
+Relative paths use the importing module's directory and absolute paths are
+accepted. Canonical paths detect cycles and identify parsed-program cache
+entries. `check` recursively analyzes modules without executing them, whereas
+runtime imports execute each import occurrence in an isolated evaluator and
+reuse only parsed programs. A function returned by a module retains
+creation-time snapshots of the module bindings it references; each import
+execution creates its own function values and captures. Iterating a hash or
+tree visits its values in deterministic key order.
 
 ## Expressions
 
@@ -59,12 +84,14 @@ end
 
 Unit variants use `Result::None`; payload variants require one value of their
 declared type. Patterns recursively support identifiers, `_`, tuples, and enum
-variants with an optional single payload pattern, and positional Struct
-patterns. For example, `(left, (right, _))` matches nested tuples,
+variants with an optional single payload pattern, and positional or named
+Struct patterns. For example, `(left, (right, _))` matches nested tuples,
 `Result::Ok((left, right))` destructures a tuple payload, and
-`Person(name, Address(city))` matches nested Structs. Struct fields are matched
-in declaration order, using nominal type identity and exact field count;
-named-field patterns are not supported. Sequence patterns use brackets, such
+`Person(name, Address(city))` matches nested Structs positionally. Named fields
+can be selected in any order or as a subset, as in
+`Person(age: 17, name: person_name)`; fields are checked by name and type.
+Positional fields use declaration order and require exact arity. Both forms
+preserve nominal type identity and cannot be mixed in one pattern. Sequence patterns use brackets, such
 as `[1, 2]`, `[]`, or `[[1, 2], [3, 4]]`; fixed-length patterns match Array and
 List values only when the length is exact. A trailing rest binding, such as
 `[head, ...tail]` or `[first, second, ...rest]`, matches any length at least as
@@ -100,6 +127,12 @@ OR-patterns use `pattern | pattern`, are attempted left-to-right, and require
 all alternatives to bind the same names with compatible types. Unguarded
 alternatives contribute their union of coverage; a guarded OR-pattern does
 not.
+
+A `return expression` in a match arm body terminates the arm and supplies the
+match-expression result rather than returning from the enclosing function.
+`break` and `continue` are not valid directly in match arms, even when the
+match occurs inside a loop; a loop nested inside an arm may use its own loop
+control statements.
 
 Literal patterns support exact Int, Float, String, and Bool values and compose
 recursively with tuples, enum payloads, Struct fields, and OR-patterns. Numeric
@@ -216,15 +249,66 @@ generation; state is read and changed through messages.
 
 Operators, from lower to higher precedence, are `or`, `and`, equality, comparisons, `+ - multiply`, and `* / %`. Unary `not`, unary `-`, and `transpose` bind tightly. `and` and `or` short-circuit.
 
+## Collections
+
+Arrays and lists are ordered, zero-based sequences. Both support indexed reads
+and writes through mutable bindings; only lists support `add` and `remove`.
+Tuples are fixed-length, potentially heterogeneous ordered values and cannot
+be mutated. Their indexes are zero-based integers.
+
+Hashes and trees are string-keyed maps backed by sorted keys, so iteration and
+display order are deterministic. Hashes support indexed writes through mutable
+bindings; trees are read-only. Indexing and dot access read a value, and
+`contains(map, value)` searches map values, not keys. Both can contain nested
+collections.
+
+Matrices are collections of rows. Matrix coordinates use a two-integer tuple,
+`matrix[row, column]`, with zero-based, non-negative indexes; rows may be arrays
+or lists. `shape(matrix)` and matrix arithmetic require non-empty, rectangular
+numeric rows, and reject zero-sized dimensions. Matrix values do not support
+`length` or `contains`.
+
+`range(start, end)` represents the half-open integer sequence from `start`
+through `end - 1`, with unit step. `range(start, end, step)` uses the supplied
+non-zero integer step and excludes `end`; a positive step progresses upward
+and a negative step downward. If the step points away from the end, the range
+is empty. Ranges support indexing without negative indexes. `length` reports a
+Simply `Int`; if a range's length cannot fit in that type, it reports a runtime
+diagnostic instead of returning a saturated, inaccurate length. `contains`
+tests integer membership without materializing the range.
+Displaying a range with at most 100 values uses the familiar list form;
+larger ranges display their bounds as `Range(start..end)` without iterating
+through the represented values.
+
 ## Built-ins
 
 The built-ins are:
 
-- `range(start, end)` for lazy integer sequences. They support indexing,
+- `range(start, end[, step])` for lazy integer sequences. They support indexing,
   `length`, `for`, and pipelines like arrays without allocating every element
   up front; operations that return a collection materialize the result.
-- `length(value)` and `count(value)` for collection or string sizes.
+- `length(value)` for collection or string sizes. `count(value)` is a
+  compatibility alias for this function; prefer `length` when measuring a
+  collection to distinguish it from the pipeline `count` terminal, which counts
+  items reaching the end of a transformed pipeline.
+- `assert(condition[, message])` requires a Bool condition and optionally a
+  String message. It returns `Unit` when true; when false, it raises a runtime
+  diagnostic with the message or `assertion failed`. The optional message is
+  evaluated only when the condition is false.
 - `contains(collection, value)` for membership and string substrings.
+- `has_key(map, key)` checks whether a Hash or Tree contains a string key;
+  unlike `contains(map, value)`, it searches keys rather than values.
+- `get(map, key, default)` returns a map value or the default when the string
+  key is absent. The default is evaluated only on a miss and must match the
+  map's inferred value type when that type is known.
+- `without_key(map, key)` returns a copy of a Hash or Tree without the named
+  string key. The input is unchanged, and removing a missing key is a no-op.
+- `select_keys(map, keys)` returns a copy containing only keys from an
+  Array, List, or Tuple of strings. Missing and repeated requested keys are
+  ignored; output order follows the map's deterministic key order.
+- `keys(map)`, `values(map)`, and `entries(map)` return arrays for a Hash or
+  Tree, all in deterministic key order. Keys are strings, values retain their
+  inferred element type, and entries are `(key, value)` tuples.
 - `text[index]` returns one Unicode scalar value as a `String`; indexes are
   zero-based and out-of-range access is a runtime error. Combining marks are
   separate scalar values. `substring(text, start, length)` uses the same
@@ -233,6 +317,14 @@ The built-ins are:
 - `characters(text)` materializes an `Array[String]` with one Unicode scalar
   per element. Use this for repeated character-by-character traversal; direct
   string indexing locates a scalar from the beginning of the text.
+- `enumerate(sequence)` returns an array of `(index, value)` tuples for an
+  Array, List, Tuple, Range, or String. Indexes start at zero; strings are
+  traversed by Unicode scalar value. Unlike `zip`, it takes one sequence and
+  generates the index values.
+- `zip(left, right)` returns an array of `(left_value, right_value)` tuples for
+  two Arrays, Lists, Tuples, Ranges, or Strings. Pairing stops at the shorter
+  input; string elements are Unicode scalar values. Unlike `enumerate`, it
+  pairs two caller-provided sequences rather than generating indexes.
 - `is_ascii_alpha(character)` and `is_ascii_digit(character)` inspect one ASCII
   lexer character; `is_whitespace(character)` recognizes Unicode whitespace.
   Each requires a string containing exactly one Unicode scalar value.
@@ -247,12 +339,46 @@ The built-ins are:
   String input preserves leading and trailing spaces while removing its line
   ending; typed input ignores surrounding whitespace. Invalid typed input and
   end-of-file are runtime errors.
-- `any(collection)` and `all(collection)` for boolean collections.
+- `any(collection)` and `all(collection)` for boolean collections. The
+  function forms inspect an existing collection; the pipeline/Flow terminal
+  forms can reduce filtered or derived items and short-circuit lazy sources.
 - `join(collection, separator)` for string collections.
-- `total(collection)` for numeric arrays, lists, and tuples.
+- `total(collection)` for numeric arrays, lists, tuples, and ranges. Ranges are
+  summed incrementally without first materializing their values. Unlike the
+  pipeline `sum` terminal, `total` does not apply pipeline transformations and
+  does not accept a CSV stream.
 - `trim`, `split`, `replace`, `starts_with`, and `ends_with` for strings.
 - `is_empty(value)` for collections and strings.
-- `reverse(sequence)` for arrays, lists, and tuples.
+- `reverse(sequence)` for arrays, lists, tuples, and ranges. Reversing a range
+  materializes and returns an Array.
+- `take N` in a pipeline or Flow to keep at most N items and stop reading the
+  source once the limit is reached. N must be a non-negative integer literal;
+  zero produces an empty result. `take` may precede aggregates and `write_csv`,
+  but cannot be combined with `parallel` or `checkpoint`.
+- `skip N` in a pipeline or Flow to discard the first N items reaching that
+  step. N must be a non-negative integer literal. Its position relative to
+  `where`, `take`, and `derive` determines which items are counted or discarded;
+  like `take`, it cannot be combined with `parallel` or `checkpoint`.
+- `step_by N` keeps the first item reaching the step, then every Nth item after
+  it. N must be a positive integer literal; its position relative to `where`,
+  `take`, and `derive` determines which items are counted. It cannot be combined
+  with `parallel` or `checkpoint`.
+- `take_while condition` keeps the matching prefix at that point in a pipeline
+  or Flow and stops reading as soon as the condition is false. The condition
+  must return `Bool`; unlike `where`, later items are not examined after the
+  first failure.
+- `drop_while condition` discards the matching prefix, then passes the first
+  non-matching item and all later items without testing them again. The
+  condition must return `Bool`.
+- `distinct` removes duplicate values at its position in a pipeline or Flow,
+  using the language's equality semantics and preserving the first occurrence
+  order. Values are compared after preceding `derive` steps and before following
+  steps. Because it depends on ordered input and retains seen values, it cannot
+  be combined with `parallel` or `checkpoint`.
+- `any` and `all` are Boolean pipeline and Flow terminals. They require Boolean
+  items, short-circuit when the result is determined, and return `false` and
+  `true` respectively for empty input. These terminals are distinct from the
+  `any(collection)` and `all(collection)` built-in functions.
 - `csv_rows(path)` for lazy CSV input. Use it as a pipeline source and finish
   with `write_csv(path)` to select/derive rows and write output incrementally.
   Both Pipeline expressions and Flow declarations support `partition` as a
@@ -307,7 +433,9 @@ The built-ins are:
   Variance and covariance use population conventions (divide by N).
   `percentile(values, p)` accepts `p` from 0 through 100 and uses linear
   interpolation between sorted observations. Statistics reject empty inputs;
-  correlation also rejects a constant sequence.
+  correlation also rejects a constant sequence. `mean(values)` is the function
+  for an existing collection; `average` is a pipeline terminal for transformed
+  or streamed values.
 - Pipeline terminals `average`, `min`, and `max` aggregate numeric streams in a
   single pass.
 - `type_of(value)` and `print(value)` for inspection and output.

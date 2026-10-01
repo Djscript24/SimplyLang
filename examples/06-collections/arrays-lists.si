@@ -10,3 +10,13 @@ queue remove "first"
 
 Sayln cities
 Sayln queue
+Sayln range(0, 10, 3)
+Sayln range(10, 0, -3)
+
+for entry in enumerate(cities):
+    Sayln entry
+end
+
+for pair in zip(cities, range(1, 4)):
+    Sayln pair
+end

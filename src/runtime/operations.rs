@@ -166,21 +166,21 @@ fn matrix_add(left: &[Value], right: &[Value], span: Option<&Span>) -> Result<Va
     }
     let mut rows = Vec::new();
     for (left_row, right_row) in left.iter().zip(right) {
-        match (left_row, right_row) {
-            (Value::Array(left), Value::Array(right)) if left.len() == right.len() => {
-                let mut row = Vec::new();
-                for (left, right) in left.iter().zip(right.iter()) {
-                    row.push(binary(
-                        left.clone(),
-                        &BinaryOperator::Add,
-                        right.clone(),
-                        span,
-                    )?);
-                }
-                rows.push(Value::Array(shared_values(row)));
-            }
-            _ => return Err(error(span, "invalid matrix rows")),
+        let left = matrix_row_values(left_row, span)?;
+        let right = matrix_row_values(right_row, span)?;
+        if left.len() != right.len() {
+            return Err(error(span, "matrix dimensions do not match"));
         }
+        let mut row = Vec::new();
+        for (left, right) in left.iter().zip(right.iter()) {
+            row.push(binary(
+                left.clone(),
+                &BinaryOperator::Add,
+                right.clone(),
+                span,
+            )?);
+        }
+        rows.push(Value::Array(shared_values(row)));
     }
     Ok(Value::Matrix(shared_values(rows)))
 }
@@ -197,16 +197,12 @@ fn matrix_multiply(left: Value, right: Value, span: Option<&Span>) -> Result<Val
     }
     let mut result = Vec::with_capacity(left.len());
     for left_row in left.iter() {
-        let Value::Array(left_row) = left_row else {
-            return Err(error(span, "matrix rows must be arrays"));
-        };
+        let left_row = matrix_row_values(left_row, span)?;
         let mut output = Vec::with_capacity(right_width);
         for column in 0..right_width {
             let mut total = 0.0;
             for (index, value) in left_row.iter().enumerate() {
-                let Value::Array(right_row) = &right[index] else {
-                    return Err(error(span, "matrix rows must be arrays"));
-                };
+                let right_row = matrix_row_values(&right[index], span)?;
                 total += numeric_value(value, span)? * numeric_value(&right_row[column], span)?;
             }
             if !total.is_finite() {
@@ -526,7 +522,12 @@ pub(crate) fn statistics_values(
             .iter()
             .map(|value| numeric_value(value, span))
             .collect(),
-        Value::Range { start, end } => (*start..*end).map(|value| Ok(value as f64)).collect(),
+        Value::Range { start, end, step } => Value::range_values(*start, *end, *step)
+            .map(|value| match value {
+                Value::Int(value) => Ok(value as f64),
+                _ => unreachable!("range values are integers"),
+            })
+            .collect(),
         _ => Err(error(span, "expected a numeric sequence")),
     }
 }
@@ -704,17 +705,18 @@ fn numeric_result_value(value: Value, span: Option<&Span>) -> Result<Value, Simp
 }
 
 fn matrix_shape(matrix: &[Value], span: Option<&Span>) -> Result<usize, SimplyError> {
-    let width = match matrix.first() {
-        Some(Value::Array(values)) => values.len(),
-        Some(_) => return Err(error(span, "matrix rows must be arrays")),
-        None => return Ok(0),
-    };
+    if matrix.is_empty() {
+        return Err(error(span, "matrix must not be empty"));
+    }
+    let width = matrix_row_values(&matrix[0], span)?.len();
+    if width == 0 {
+        return Err(error(span, "matrix rows must not be empty"));
+    }
     for row in matrix {
-        let values = match row {
-            Value::Array(values) if values.len() == width => values,
-            Value::Array(_) => return Err(error(span, "matrix rows must have equal widths")),
-            _ => return Err(error(span, "matrix rows must be arrays")),
-        };
+        let values = matrix_row_values(row, span)?;
+        if values.len() != width {
+            return Err(error(span, "matrix rows must have equal widths"));
+        }
         if values
             .iter()
             .any(|value| !matches!(value, Value::Int(_) | Value::Float(_)))
@@ -725,18 +727,20 @@ fn matrix_shape(matrix: &[Value], span: Option<&Span>) -> Result<usize, SimplyEr
     Ok(width)
 }
 
+fn matrix_row_values<'a>(row: &'a Value, span: Option<&Span>) -> Result<&'a [Value], SimplyError> {
+    match row {
+        Value::Array(values) | Value::List(values) => Ok(values.as_slice()),
+        _ => Err(error(span, "matrix rows must be arrays or lists")),
+    }
+}
+
 fn matrix_transpose(rows: &[Value], span: Option<&Span>) -> Result<Value, SimplyError> {
     let width = matrix_shape(rows, span)?;
-    if rows.is_empty() {
-        return Ok(Value::Matrix(shared_values(Vec::new())));
-    }
     let mut result = Vec::with_capacity(width);
     for column in 0..width {
         let mut output = Vec::with_capacity(rows.len());
         for row in rows {
-            let Value::Array(values) = row else {
-                return Err(error(span, "matrix rows must be arrays"));
-            };
+            let values = matrix_row_values(row, span)?;
             output.push(Value::Float(numeric_value(&values[column], span)?));
         }
         result.push(Value::Array(shared_values(output)));

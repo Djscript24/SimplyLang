@@ -1,0 +1,4 @@
+open "modules/a-struct.si" as first
+open "modules/b-struct.si" as second
+mut current is first
+current -> second

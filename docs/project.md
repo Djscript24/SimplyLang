@@ -19,18 +19,31 @@ with `cargo build --release`, or install it locally with `cargo install --path
 
 The repository examples are organized by feature. The standard-library directory
 contains runnable examples for built-ins and a separate imported-value fixture;
-the fixture is intentionally not a standalone program. Declarative Flow demos
-live under `examples/10-flow/`; benchmark programs and large input fixtures
-live under `examples/99-bench/`.
+the fixture is intentionally not a standalone program. The module example's
+entry point is `examples/17-modules/main.si`; its files under `modules/` are
+imported fixtures, not standalone examples. Declarative Flow demos live under
+`examples/10-flow/`; benchmark programs and large input fixtures live under
+`examples/99-bench/`.
 
-`simply check` uses the shared semantic analyzer and recursively checks
-canonicalized imports relative to each importing module without executing them.
-`simply run` and the REPL intentionally do not run a static preflight: they keep
-runtime type and operation checks, and imports execute in isolated module
-evaluators. `fmt`, `bench`, `explain`, and `explain-flow` parse and semantically
-analyze the current source using that same analyzer; they do not execute
-imports during their analysis. `bench` subsequently executes the source for its
-runtime measurement, so it may perform the program's normal side effects.
+An `open "path.si" as value` import resolves relative paths from the file that
+contains the statement; absolute paths are accepted. Nested imports use the
+nested module's own directory. Canonical paths are used for module identity,
+cycle detection, and parsed-program reuse. A module must `return` one value;
+that value is bound to the alias. A module may additionally declare named value
+exports with `export name, other`, which callers select using
+`open "path.si" exposing name, other`. Only selected, explicitly exported
+values are bound in the importer; an imported name may be locally renamed
+with `as`, and all other module names remain private.
+
+`simply check` uses the shared semantic analyzer and recursively checks imported
+modules without executing them. `simply run` and the REPL intentionally do not
+run a static preflight: they retain runtime type and operation checks. Runtime
+imports execute in isolated module evaluators on every import, including
+repeated imports; the parsed program is cached, but module state is not shared.
+`fmt`, `bench`, `explain`, and `explain-flow` parse and semantically analyze the
+current source using that same analyzer; they do not execute imports during
+their analysis. `bench` subsequently executes the source for its runtime
+measurement, so it may perform the program's normal side effects.
 
 Function calls are limited to 16 nested invocations to prevent stack exhaustion.
 Parallel flows accept at most 64 workers, a chunk size of 1,000,000 values, and

@@ -18,6 +18,39 @@ fn declarative_flow_lowers_to_pipeline() {
 }
 
 #[test]
+fn empty_csv_float_sum_uses_derived_type_in_streaming_execution() {
+    let id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::current_dir()
+        .expect("project directory should be available")
+        .join("target")
+        .join(format!("simply-empty-float-sum-{id}.csv"));
+    fs::write(&path, "").expect("failed to create empty CSV input");
+    let source = format!(
+        "result is pipeline:\n\
+             csv_rows({:?})\n\
+             derive to_float(item[0])\n\
+             sum\n\
+         end\n\
+         fn as_float() gives Float:\n\
+             return result\n\
+         end\n\
+         Sayln type_of(as_float())\n",
+        path.to_string_lossy()
+    );
+
+    let (valid, _, check_error) = check_source(&source);
+    let (success, output) = run_source_stdout(&source);
+    fs::remove_file(&path).expect("failed to remove empty CSV input");
+
+    assert!(
+        valid,
+        "check rejected the streamed Float sum: {check_error}"
+    );
+    assert!(success, "streamed Float sum failed at runtime: {output}");
+    assert_eq!(output, "Float\n");
+}
+
+#[test]
 fn explain_flow_prints_deterministic_execution_plan() {
     let (success, output) = explain_flow_source(
         "values is list [1, 2, 3]\n\
@@ -330,6 +363,27 @@ fn flow_parallel_hint_preserves_deterministic_result() {
     );
     assert!(success, "{output}");
     assert!(output.contains("20"), "{output}");
+}
+
+#[test]
+fn parallel_pipeline_short_circuits_boolean_and_or_expressions() {
+    for (condition, expected) in [
+        ("item == 0 or 1.0 / item > 0", "3\n"),
+        ("item != 0 and 1.0 / item > 0", "2\n"),
+    ] {
+        let source = format!(
+            "values is list [0, 1, 2]\n\
+             flow matched from values:\n\
+                 parallel 2\n\
+                 where {condition}\n\
+                 count\n\
+             end\n\
+             Sayln matched\n"
+        );
+        let (success, output) = run_source_stdout(&source);
+        assert!(success, "parallel condition `{condition}` failed: {output}");
+        assert_eq!(output, expected, "condition: {condition}");
+    }
 }
 
 #[test]

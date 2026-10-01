@@ -12,6 +12,8 @@ use crate::{
 
 use super::{Evaluator, csv};
 
+type CsvSequencePrefix = (Vec<Value>, Option<Value>);
+
 impl Evaluator {
     pub(super) fn match_value_pattern(
         &self,
@@ -103,8 +105,10 @@ impl Evaluator {
                             .map(|_| Value::List(shared_values(values[patterns.len()..].to_vec())));
                         (values[..patterns.len()].to_vec(), tail)
                     }
-                    Value::Range { start, end } => {
-                        let length = (i128::from(*end) - i128::from(*start)).max(0);
+                    Value::Range { start, end, step } => {
+                        let length = Value::range_len(*start, *end, *step)
+                            .map(i128::from)
+                            .unwrap_or(i128::MAX);
                         if length < patterns.len() as i128
                             || (rest.is_none() && length != patterns.len() as i128)
                         {
@@ -113,9 +117,9 @@ impl Evaluator {
                         let mut values = Vec::with_capacity(patterns.len());
                         for index in 0..patterns.len() {
                             let index = i128::try_from(index).ok();
-                            let Some(value) = index
-                                .and_then(|index| i64::try_from(i128::from(*start) + index).ok())
-                            else {
+                            let Some(value) = index.and_then(|index| {
+                                i64::try_from(i128::from(*start) + index * i128::from(*step)).ok()
+                            }) else {
                                 return Ok(None);
                             };
                             values.push(Value::Int(value));
@@ -130,15 +134,18 @@ impl Evaluator {
                                             .into(),
                                     )
                                 })?;
-                                i64::try_from(i128::from(*start) + offset).map_err(|_| {
-                                    self.runtime_error(
-                                        "range rest position exceeds the supported range".into(),
-                                    )
-                                })?
+                                i64::try_from(i128::from(*start) + offset * i128::from(*step))
+                                    .map_err(|_| {
+                                        self.runtime_error(
+                                            "range rest position exceeds the supported range"
+                                                .into(),
+                                        )
+                                    })?
                             };
                             Some(Value::Range {
                                 start: rest_start,
-                                end: if length == 0 { rest_start } else { *end },
+                                end: *end,
+                                step: *step,
                             })
                         } else {
                             None
@@ -198,12 +205,12 @@ impl Evaluator {
                 let Value::Struct(instance) = value else {
                     return Ok(None);
                 };
-                if instance.type_name != *type_name {
-                    return Ok(None);
-                }
                 let Some(definition) = self.lookup_struct(type_name) else {
                     return Ok(None);
                 };
+                if instance.identity != definition.identity {
+                    return Ok(None);
+                }
                 if fields.len() != definition.fields.len() {
                     return Ok(None);
                 }
@@ -211,6 +218,36 @@ impl Evaluator {
                 let mut bindings = Vec::new();
                 for (pattern, field) in fields.iter().zip(&definition.fields) {
                     let Some(value) = instance_fields.get(&field.name) else {
+                        return Ok(None);
+                    };
+                    let Some(nested) = self.match_value_pattern(pattern, value)? else {
+                        return Ok(None);
+                    };
+                    bindings.extend(nested);
+                }
+                Some(bindings)
+            }
+            MatchPattern::NamedStruct { type_name, fields } => {
+                let Value::Struct(instance) = value else {
+                    return Ok(None);
+                };
+                let Some(definition) = self.lookup_struct(type_name) else {
+                    return Ok(None);
+                };
+                if instance.identity != definition.identity {
+                    return Ok(None);
+                }
+                let instance_fields = instance.fields.borrow();
+                let mut bindings = Vec::new();
+                for (field_name, pattern) in fields {
+                    if !definition
+                        .fields
+                        .iter()
+                        .any(|field| field.name == *field_name)
+                    {
+                        return Ok(None);
+                    }
+                    let Some(value) = instance_fields.get(field_name) else {
                         return Ok(None);
                     };
                     let Some(nested) = self.match_value_pattern(pattern, value)? else {
@@ -228,7 +265,12 @@ impl Evaluator {
                 let Value::Enum(enum_value) = value else {
                     return Ok(None);
                 };
-                if enum_value.enum_name != *enum_name || enum_value.variant_name != *variant_name {
+                let Some(definition) = self.lookup_enum(enum_name) else {
+                    return Ok(None);
+                };
+                if enum_value.identity != definition.identity
+                    || enum_value.variant_name != *variant_name
+                {
                     return Ok(None);
                 }
                 match (&enum_value.payload, payload) {
@@ -249,7 +291,7 @@ impl Evaluator {
         source_version: Option<&CsvStreamVersion>,
         expected_length: usize,
         has_rest: bool,
-    ) -> Result<Option<(Vec<Value>, Option<Value>)>, SimplyError> {
+    ) -> Result<Option<CsvSequencePrefix>, SimplyError> {
         let file = fs::File::open(path).map_err(|error| self.file_error(Path::new(path), error))?;
         let current_version = Self::csv_stream_version(&file, path, self)?;
         let mut reader = BufReader::new(file);

@@ -309,6 +309,11 @@ pub enum SimplyError {
         code: DiagnosticCode,
         message: String,
     },
+    InSource {
+        error: Box<SimplyError>,
+        filename: String,
+        source: String,
+    },
     Command {
         span: Span,
         code: DiagnosticCode,
@@ -317,8 +322,68 @@ pub enum SimplyError {
 }
 
 impl SimplyError {
+    pub(crate) fn in_source(self, filename: String, source: String) -> Self {
+        if matches!(self, Self::InSource { .. }) {
+            self
+        } else {
+            Self::InSource {
+                error: Box::new(self),
+                filename,
+                source,
+            }
+        }
+    }
+
+    pub(crate) fn with_span(self, span: Span) -> Self {
+        match self {
+            Self::InSource {
+                error,
+                filename,
+                source,
+            } => Self::InSource {
+                error: Box::new(error.with_span(span)),
+                filename,
+                source,
+            },
+            Self::Lex { code, message, .. } => Self::Lex {
+                span,
+                code,
+                message,
+            },
+            Self::Parse { code, message, .. } => Self::Parse {
+                span,
+                code,
+                message,
+            },
+            Self::Semantic { code, message, .. } => Self::Semantic {
+                span,
+                code,
+                message,
+            },
+            Self::Runtime { code, message, .. } => Self::Runtime {
+                span,
+                code,
+                message,
+            },
+            Self::Command { code, message, .. } => Self::Command {
+                span,
+                code,
+                message,
+            },
+        }
+    }
+
     pub(crate) fn with_context(self, context: String) -> Self {
         match self {
+            Self::InSource {
+                error,
+                filename,
+                source,
+            } => Self::InSource {
+                error: Box::new(error.with_context(context)),
+                filename,
+                source,
+            },
             Self::Lex {
                 span,
                 code,
@@ -369,6 +434,7 @@ impl SimplyError {
 
     pub fn category(&self) -> DiagnosticCategory {
         match self {
+            Self::InSource { error, .. } => error.category(),
             Self::Lex { .. } => DiagnosticCategory::Lex,
             Self::Parse { .. } => DiagnosticCategory::Parse,
             Self::Semantic { .. } => DiagnosticCategory::Semantic,
@@ -379,6 +445,7 @@ impl SimplyError {
 
     pub fn code(&self) -> DiagnosticCode {
         match self {
+            Self::InSource { error, .. } => error.code(),
             Self::Lex { code, .. }
             | Self::Parse { code, .. }
             | Self::Semantic { code, .. }
@@ -389,6 +456,7 @@ impl SimplyError {
 
     pub fn span(&self) -> &Span {
         match self {
+            Self::InSource { error, .. } => error.span(),
             Self::Lex { span, .. }
             | Self::Parse { span, .. }
             | Self::Semantic { span, .. }
@@ -399,6 +467,7 @@ impl SimplyError {
 
     pub fn message(&self) -> &str {
         match self {
+            Self::InSource { error, .. } => error.message(),
             Self::Lex { message, .. }
             | Self::Parse { message, .. }
             | Self::Semantic { message, .. }
@@ -417,6 +486,14 @@ impl SimplyError {
         source: &str,
         terminal_width: Option<usize>,
     ) -> String {
+        if let Self::InSource {
+            error,
+            filename,
+            source,
+        } = self
+        {
+            return error.render_with_terminal_width(filename, source, terminal_width);
+        }
         let code = self.code();
         let category = match self.category() {
             DiagnosticCategory::Lex => "Lex error",
@@ -427,6 +504,7 @@ impl SimplyError {
         };
         let span = self.span();
         let message = match self {
+            Self::InSource { error, .. } => error.message(),
             Self::Lex { message, .. }
             | Self::Parse { message, .. }
             | Self::Semantic { message, .. }

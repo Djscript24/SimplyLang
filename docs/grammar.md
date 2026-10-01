@@ -8,16 +8,20 @@ statement      = say | assignment | reassignment | destructure
                | destructure_assignment | call | function
                | conditional | for_loop | while_loop | return
                | try_statement | throw
-               | break | continue | import | collection_op
+               | break | continue | import | export | collection_op
                | enum | struct | message | expression ;
 flow           = "flow" name "from" expression ":" newline
                  { flow_step newline } "end" ;
 flow_step      = pipeline_step | "chunk" integer | "parallel" integer
                | "checkpoint" expression ;
 pipeline_step  = "where" expression | "derive" expression
+               | "take" integer | "skip" integer | "step_by" integer
+               | "take_while" expression
+               | "drop_while" expression
+               | "distinct"
                | "partition" name ":" newline
                  { partition_rule newline } "end"
-               | "sum" | "count" | "average" | "min" | "max"
+               | "sum" | "count" | "average" | "min" | "max" | "any" | "all"
                | "write_csv" "(" expression ")" ;
 partition_rule = expression "->" name | "otherwise" "->" name ;
 assignment     = [ "mut" ] name [ "as" type ] "is" expression ;
@@ -41,7 +45,11 @@ struct_field   = name "as" type newline ;
 message        = "on" name "receive" name [ "(" [ parameters ] ")" ] ":"
                  newline { statement newline } "end" ;
 conditional    = "if" expression ":" newline { statement newline }
-                 [ "else" ":" newline { statement newline } ] "end" ;
+                 conditional_tail ;
+conditional_tail = "end"
+                 | "else" ":" newline { statement newline } "end"
+                 | "else" "if" expression ":" newline
+                   { statement newline } conditional_tail ;
 for_loop       = "for" [ "mut" ] name "in" expression ":" newline { statement newline } "end" ;
 while_loop     = "while" expression ":" newline { statement newline } "end" ;
 try_statement = "try" ":" newline { statement newline }
@@ -50,7 +58,10 @@ try_statement = "try" ":" newline { statement newline }
                 [ "finally" ":" newline { statement newline } ] "end" ;
 throw         = "throw" expression ;
 return         = "return" expression ;
-import         = "open" string "as" name ;
+import         = "open" string ( "as" name
+               | "exposing" imported_name { "," imported_name } ) ;
+imported_name  = name [ "as" name ] ;
+export         = "export" name { "," name } ;
 collection_op  = name ( "add" | "remove" ) expression ;
 parameters     = [ "mut" ] name [ "as" type ] { "," [ "mut" ] name [ "as" type ] } ;
 type           = "String" | "Int" | "Float" | "Bool" | "Hash" | "Tree"
@@ -75,7 +86,9 @@ int_literal    = integer | "-" integer ;
 literal        = integer | float | string | "true" | "false"
                | "-" ( integer | float ) ;
 enum_pattern   = name "::" name [ "(" pattern ")" ] ;
-struct_pattern = name "(" [ pattern { "," pattern } ] ")" ;
+struct_pattern = name "(" [ pattern { "," pattern }
+               | field_pattern { "," field_pattern } ] ")" ;
+field_pattern  = name ":" pattern ;
 tuple_pattern  = "(" [ pattern { "," pattern } ] ")" ;
 sequence_pattern = "[" [ pattern { "," pattern } [ "," rest_pattern ]
                       | rest_pattern ] "]" ;
@@ -85,10 +98,12 @@ hash_entry     = ( string | name ) ":" pattern ;
 ```
 
 Match patterns are parsed in match-arm context, separately from tuple expressions.
-They recursively match tuple elements, enum payloads, and positional Struct
-fields. Struct pattern fields use declaration order, exact arity, and nominal
-type identity; named-field patterns are not supported. Tuple arity and nominal
-enum identity are type-checked; bindings are local to the selected arm.
+They recursively match tuple elements, enum payloads, and Struct fields.
+Positional Struct patterns use declaration order, exact arity, and nominal
+type identity. Named-field patterns use `Person(name: value, age: _)`; they
+may select any subset of unique declared fields and are checked by field name
+and type. A Struct pattern cannot mix positional and named fields. Tuple arity
+and nominal enum identity are type-checked; bindings are local to the selected arm.
 Sequence patterns use bracket syntax and recursively apply ordinary patterns
 to each element. Fixed-length patterns match only that exact length; a trailing
 rest binding, such as `[head, ...tail]`, matches any sequence at least as long
@@ -159,8 +174,39 @@ Struct receivers resolve by nominal type and expose their declared fields in
 the message scope. Reassigning a field binding updates the persistent instance
 and must match the field's declared type. Other receivers retain the original
 function-dispatch behavior, with the receiver passed as the first argument.
+When the target function is statically known, `check` validates its argument
+count and types; an unknown target on a statically known receiver is diagnosed
+before execution.
 Dispatch evaluates to the message's return value, or `Unit` when it returns
 nothing. `send()` is not a public function.
+
+### Modules and imports
+
+`open "path.si" as name` loads a Simply source module and binds its returned
+value to `name`. An imported module must return an expression. Modules may also
+declare named value exports with `export add, PI`; importers select them with
+`open "math.si" exposing add, PI`, which binds each selected name directly.
+An imported name may be renamed with `as`, as in
+`open "math.si" exposing add as add_numbers`.
+Struct and enum declarations can also be selected from a module's exports.
+Only explicitly exported declarations are available this way. Exported
+functions retain access to values they use from their defining module. Legacy
+return-value imports remain supported.
+
+Relative paths are resolved from the file containing the `open` statement, not
+the process working directory. Absolute paths are accepted. Paths are
+canonicalized for cycle detection and parsed-program reuse, so equivalent
+relative paths and symlinks to the same file identify the same source module.
+Nested imports resolve relative to their own importing module. A cycle is
+rejected with the canonical import chain.
+
+At runtime, each `open` evaluates the module in an isolated evaluator and
+requires it to return a value. The parsed program is cached, but module
+statements execute on every import; module state is not shared between import
+occurrences. `check` recursively parses and semantically analyzes imported
+modules without executing them. It can validate the returned module value and
+calls through returned function values, but does not export module-local
+declarations into the importer.
 
 Enum variants use `EnumName::Variant` for unit values and
 `EnumName::Variant(payload)` for one-payload values. Match patterns include
@@ -179,12 +225,18 @@ primitive type. Invalid typed input is a runtime error. The standard library
 includes collection operations such as `range`, `length`, `count`, `contains`,
 `any`, `all`, `join`, `total`, `is_empty`, and `reverse`, plus string
 operations such as `trim`, `split`, `replace`, `starts_with`, and `ends_with`.
+In call syntax, `count(collection)` is an alias for `length(collection)`;
+the pipeline terminal `count` instead counts items after pipeline transforms.
 Strings support scalar-value indexing, `substring(text, start, length)`,
 `characters(text)` for one-pass scalar materialization, and the character
 predicates `is_ascii_alpha`, `is_ascii_digit`, and `is_whitespace`.
 `read_file(path)` and `write_file(path, content)` provide UTF-8 text file I/O
 without changing the separate meaning of module imports. Pipeline terminals
 include `sum`, `count`, `average`, `min`, `max`, and `write_csv(path)`.
+Here `count` counts pipeline items; this terminal is distinct from the
+collection-size function `count(collection)`. `mean(collection)` is the
+statistical function for an existing collection; `average` aggregates values
+reaching a pipeline terminal.
 `csv_rows(path)` creates a lazy CSV pipeline source; `to_float(text)`,
 `to_int(text)`, `abs`, `round`, and `clamp` support numeric formulas; and
 `csv_row(...)` constructs an output row.

@@ -124,6 +124,25 @@ fn rejects_unknown_messages_and_wrong_message_argument_counts() {
 }
 
 #[test]
+fn checks_message_argument_and_inferred_return_types() {
+    let argument_source = "type Person:\n    name as String\nend\n\
+                          on Person receive rename(new_name as String):\n\
+                              name -> new_name\n\
+                          end\n\
+                          person is Person(\"Ada\")\nperson :: rename(1)\n";
+    let (success, _, error) = check_source(argument_source);
+    assert!(!success);
+    assert!(error.contains("expected String, found Int"), "{error}");
+
+    let return_source = "type Person:\n    name as String\nend\n\
+                         on Person receive get_name:\n    return name\nend\n\
+                         person is Person(\"Ada\")\nvalue as Int is person :: get_name\n";
+    let (success, _, error) = check_source(return_source);
+    assert!(!success);
+    assert!(error.contains("expected Int, found String"), "{error}");
+}
+
+#[test]
 fn struct_fields_are_not_exposed_as_dot_access_or_automatic_messages() {
     for source in [
         "type Person:\n    name as String\nend\nperson is Person(\"Ada\")\nSayln person.name\n",
@@ -182,6 +201,24 @@ fn messages_mutate_persistent_state_and_return_values_as_expressions() {
 }
 
 #[test]
+fn messages_can_dispatch_to_another_message_on_the_same_receiver() {
+    let source = "type Counter:\n    value as Int\nend\n\
+                  counter is Counter(0)\n\
+                  on Counter receive get:\n    return value\nend\n\
+                  on Counter receive outer:\n\
+                      value -> value + 1\n\
+                      previous is counter :: get\n\
+                      value -> value + 1\n\
+                      return previous + value\n\
+                  end\n\
+                  Sayln counter :: outer\n\
+                  Sayln counter :: get\n";
+    let (success, output) = run_source_stdout(source);
+    assert!(success, "nested message invocation failed: {output}");
+    assert_eq!(output, "3\n2\n");
+}
+
+#[test]
 fn messages_can_mutate_typed_fields_and_accept_arguments() {
     let source = "type Person:\n    name as String\n    age as Int\nend\n\
                   on Person receive rename(new_name as String):\n\
@@ -216,6 +253,22 @@ fn message_state_mutations_preserve_declared_field_types() {
     assert!(!success);
     assert!(error.contains("type String"), "{error}");
     assert!(error.contains("remains type Int"), "{error}");
+}
+
+#[test]
+fn recursive_message_dispatch_is_bounded() {
+    let source = "type Counter:\n    value as Int\nend\n\
+                  counter is Counter(0)\n\
+                  on Counter receive recurse(amount as Int):\n\
+                      return counter :: recurse(amount)\n\
+                  end\n\
+                  counter :: recurse(0)\n";
+    let (success, error) = run_source(source);
+    assert!(!success, "recursive message dispatch did not stop");
+    assert!(
+        error.contains("function call depth exceeds the limit"),
+        "{error}"
+    );
 }
 
 #[test]

@@ -19,11 +19,11 @@ pub(crate) fn index(
         let row = coordinate(&coordinates[0], span)?;
         let column = coordinate(&coordinates[1], span)?;
         return match rows.get(row) {
-            Some(Value::Array(values)) => values
+            Some(Value::Array(values)) | Some(Value::List(values)) => values
                 .get(column)
                 .cloned()
                 .ok_or_else(|| error(span, "matrix index out of bounds")),
-            Some(_) => Err(error(span, "matrix row is not an array")),
+            Some(_) => Err(error(span, "matrix row is not an array or list")),
             None => Err(error(span, "matrix index out of bounds")),
         };
     }
@@ -36,13 +36,28 @@ pub(crate) fn index(
         }
         return Err(error(span, "hash key must be a string"));
     }
-    if let Value::Range { start, end } = target {
-        let index = collection_index(index, span)?;
-        let value = start
-            .checked_add(index as i64)
-            .filter(|value| *value < *end)
-            .ok_or_else(|| error(span, "collection index out of bounds"))?;
-        return Ok(Value::Int(value));
+    if let Value::Range { start, end, step } = target {
+        let index = match index {
+            Value::Int(index) if *index >= 0 => *index,
+            _ => {
+                return Err(error(
+                    span,
+                    "collection index must be a non-negative integer",
+                ));
+            }
+        };
+        let value = i128::from(*start) + i128::from(index) * i128::from(*step);
+        let in_bounds = if *step > 0 {
+            value < i128::from(*end)
+        } else {
+            value > i128::from(*end)
+        };
+        if !in_bounds {
+            return Err(error(span, "collection index out of bounds"));
+        }
+        return i64::try_from(value)
+            .map(Value::Int)
+            .map_err(|_| error(span, "collection index out of bounds"));
     }
     let index = collection_index(index, span)?;
     match target {

@@ -19,14 +19,15 @@ runtime behavior, useful diagnostics, and a compact command-line workflow.
 - Arrays, lists, tuples, hashes, trees, and matrices.
 - Tuple and sequence destructuring declarations with nested targets, wildcards,
   and lazy rest suffixes.
-- Structural match patterns for enums, structs, sequences, partial hashes, and
-  whole-value aliases.
-- Pipelines with `where`, `derive`, `partition`, and aggregate terminals.
+- Structural match patterns for enums, positional and named-field structs,
+  sequences, partial hashes, and whole-value aliases.
+- Pipelines with `where`, `derive`, `take_while`, `drop_while`, `skip`, `distinct`,
+  `step_by`, boolean `any`/`all` terminals, `partition`, and aggregate terminals.
 - Streaming CSV pipelines for selecting, deriving, and rewriting large files.
 - Flow chunking and file checkpoints for resumable long-running pipelines.
 - Parallel scalar `where`/`derive` flow workers with deterministic ordered merge
   and explicit rejection of unsupported expressions.
-- Relative imports with isolated module evaluation.
+- Relative imports with isolated evaluation and explicit named exports.
 - Structured lexer, parser, semantic, and runtime diagnostics.
 - Formatter, REPL, native Simply tests, and runtime benchmarks.
 - Deterministic hash/tree iteration and copy-on-write collection storage.
@@ -200,10 +201,13 @@ coordinates is (12, 30)
 grid is matrix [[1, 2], [3, 4]]
 ```
 
-Arrays are fixed-length values, while lists support mutation through mutable
-bindings. Hashes and trees use string keys and iterate deterministically.
-Matrix dimensions and numeric contents are validated at runtime. Matrix
-multiplication returns floating-point cells.
+Arrays are fixed-length ordered values; both arrays and lists support indexed
+access and writes through mutable bindings, while only lists support `add` and
+`remove`. Tuples are fixed-length and heterogeneous. Hashes and trees use
+string keys and sorted, deterministic iteration; hashes are mutable and trees
+are read-only. Matrices use two-dimensional row/column indexing and require
+rectangular numeric rows for matrix operations. Ranges are lazy half-open
+integer sequences. Matrix multiplication returns floating-point cells.
 
 ### Structs and messages
 
@@ -383,6 +387,16 @@ end
 Sayln total
 ```
 
+Ordered pipeline steps also include `take N`, `skip N`, `step_by N`,
+`take_while condition`, `drop_while condition`, and `distinct`. They compose in
+source order and stream lazy ranges and CSV input; order-dependent steps cannot
+be combined with `parallel` or `checkpoint`.
+`step_by N` keeps the first item and then every Nth item reaching that step;
+N must be a positive integer.
+The `any` and `all` terminals reduce Boolean pipeline items to a single Boolean,
+short-circuiting on the first `true` or `false` respectively. They return `false`
+and `true` for empty input.
+
 The evaluator fuses supported `where`/`derive` chains ending in `sum` or
 `count`, avoiding intermediate collection materialization where possible.
 
@@ -406,27 +420,55 @@ Import a Simply source file relative to the importing file:
 open "math.si" as math
 ```
 
-Imported programs are evaluated with isolated module state and their parsed
-programs are cached for reuse.
+An imported module must return a value; that value is bound to the alias. For
+example, a module can return a function for the importer to call. Module-local
+function, struct, enum, and message declarations are not imported into the
+caller's declaration scope. Modules may also expose selected values with
+`export name, other`; use `open "module.si" exposing name, other` to bind only
+those named exports directly. Imported names may be renamed with `as`, for
+example `open "math.si" exposing add as add_numbers`. Structs and enums can
+also be exported and imported this way; their nominal identity and struct
+messages are preserved across aliases.
+
+Relative paths use the importing file's directory, including for nested
+imports. Absolute paths are also accepted. Canonical paths identify modules
+for cycle detection and parsed-program reuse. At runtime each import executes
+the module in an isolated evaluator; parsing is cached, but execution and
+module-local state are not shared between import occurrences. `simply check`
+recursively checks imported source without executing it.
 
 ## Built-in Functions
 
-The standard library includes:
+The following table highlights commonly used built-ins; see the
+[language reference](docs/language.md) for the complete behavior and
+signatures.
 
 | Function | Purpose |
 | --- | --- |
-| `range(start, end)` | Create a lazy integer sequence. |
-| `length(value)` / `count(value)` | Get collection or string size. |
+| `assert(condition[, message])` | Check a condition and fail with an optional diagnostic message. |
+| `range(start, end[, step])` | Create a lazy integer sequence with an optional non-zero step. |
+| `length(value)` | Get collection or string size; `count(value)` is a compatibility alias. |
+| `enumerate(sequence)` | Return zero-based `(index, value)` pairs for sequences and strings. |
+| `zip(left, right)` | Pair sequence values into tuples, stopping at the shorter input. |
 | `contains(collection, value)` | Test collection membership or a string substring. |
-| `any(collection)` / `all(collection)` | Evaluate boolean collections. |
+| `has_key(map, key)` | Test whether a Hash or Tree contains a string key. |
+| `get(map, key, default)` | Get a map value or lazily evaluate a fallback. |
+| `without_key(map, key)` | Return a Hash or Tree copy with the named key removed. |
+| `select_keys(map, keys)` | Copy a map with only the requested string keys. |
+| `keys(map)` / `values(map)` / `entries(map)` | Return map keys, values, or `(key, value)` tuples in deterministic key order. |
+| `any(collection)` / `all(collection)` | Reduce Boolean collections; pipeline terminals also work on transformed lazy sources. |
 | `join(collection, separator)` | Join string values. |
-| `total(collection)` | Sum numeric arrays, lists, or tuples. |
+| `total(collection)` | Sum numeric arrays, lists, tuples, or ranges. |
+| `sum` pipeline terminal | Sum transformed pipeline values, including CSV streams. |
+| `count` pipeline terminal | Count items reaching the end of a transformed pipeline. |
 | `trim`, `split`, `replace` | Transform strings. |
 | `starts_with`, `ends_with` | Test string prefixes and suffixes. |
 | `characters(text)` | Materialize a string as an array of scalar strings. |
 | `substring(text, start, length)` | Slice a string by Unicode scalar positions. |
+| `to_float(value)`, `to_int(value)` | Convert numeric values or parse numeric strings. |
 | `is_ascii_alpha`, `is_ascii_digit`, `is_whitespace` | Inspect one character. |
 | `read_file(path)`, `write_file(path, content)` | Read and write UTF-8 text files. |
+| `csv_rows(path)`, `csv_row(...)` | Read lazy CSV rows or construct a mixed-type output row. |
 | `Ask(prompt[, type])` | Read a line as String or parse it as Int, Float, String, or Bool. |
 | `sqrt`, `pow`, `exp`, `log`, `log10`, `sin`, `cos`, `tan` | Scalar mathematical functions. |
 | `floor`, `ceil`, `sign`, `abs`, `round`, `clamp` | Numeric rounding, sign, and bounds operations. |
@@ -435,7 +477,7 @@ The standard library includes:
 | `mean`, `median`, `variance`, `stddev`, `percentile` | Descriptive statistics; variance uses the population convention. |
 | `covariance`, `correlation` | Pairwise population statistics for equal-length sequences. |
 | `is_empty(value)` | Test collections and strings. |
-| `reverse(sequence)` | Reverse arrays, lists, or tuples. |
+| `reverse(sequence)` | Reverse arrays, lists, tuples, or ranges (range results are arrays). |
 | `type_of(value)` / `print(value)` | Inspect values or print them. |
 | `receiver :: message(arguments)` | Dispatch a message; struct receivers use type-specific behavior. |
 
@@ -516,14 +558,26 @@ Function bodies and imported programs use shared storage where appropriate.
 .
 ├── src/                    # Rust interpreter implementation
 ├── docs/                   # Language, semantics, project, and performance docs
-├── examples/               # Runnable programs grouped by feature and workload
-│   ├── 01-09-*/            # Language and standard-library examples
-│   ├── 10-flow/            # Declarative Flow, quality, CSV, and resume demos
-│   ├── 11-compiler-foundations/ # String, file, and miniature lexer example
-│   ├── 12-mathematics/     # Scalar, vector, matrix, statistics, and gradient examples
-│   ├── 13-objects/         # Nominal structs and type-specific messages
-│   ├── 99-smoke/           # Small smoke program
-│   └── 99-bench/           # Benchmark programs and large input fixtures
+├── examples/               # Programs, module fixtures, and benchmarks
+│   ├── 01-basics/           # Basic language examples
+│   ├── 02-variables/        # Bindings and types
+│   ├── 03-operators/        # Operators and expressions
+│   ├── 04-control-flow/     # Control flow and error handling
+│   ├── 05-functions/        # Functions and closures
+│   ├── 06-collections/      # Collection operations
+│   ├── 07-pipelines/        # Collection pipelines
+│   ├── 08-standard-library/ # Standard-library examples and fixtures
+│   ├── 09-quality/          # Diagnostics and quality examples
+│   ├── 10-flow/             # Declarative Flow, CSV, and resume demos
+│   ├── 11-compiler-foundations/ # String, file, and miniature lexer examples
+│   ├── 12-mathematics/      # Scalar, vector, matrix, and statistics examples
+│   ├── 13-objects/          # Structs and type-specific messages
+│   ├── 14-enums/            # Enum declarations and values
+│   ├── 17-modules/          # Imports and module fixtures
+│   ├── 15-patterns/         # Structural pattern matching
+│   ├── 16-user-input/       # Interactive input examples
+│   ├── 99-bench/            # Benchmark programs and large input fixtures
+│   └── 99-smoke/            # Small smoke program
 ├── tests/                  # Native Simply fixtures and Rust integration tests
 ├── Cargo.toml              # Rust package metadata
 └── LICENSE                 # MIT license

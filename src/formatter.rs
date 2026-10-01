@@ -25,6 +25,7 @@ struct Formatter {
     output: String,
     source_lines: Vec<String>,
     comments: HashMap<usize, String>,
+    match_arm_comments: HashMap<String, VecDeque<(usize, String)>>,
     emitted_comments: HashSet<usize>,
     end_lines: VecDeque<usize>,
     source_line: usize,
@@ -34,12 +35,38 @@ struct Formatter {
 impl Formatter {
     fn new(source: &str) -> Self {
         let mut comments = HashMap::new();
+        let mut match_arm_comments = HashMap::<String, VecDeque<(usize, String)>>::new();
         let mut end_lines = VecDeque::new();
+        let mut block_stack = Vec::new();
+        let mut match_depths = 0usize;
         for (index, raw_line) in source.lines().enumerate() {
             let line = index + 1;
             let (code, comment) = split_code_comment(raw_line);
             if let Some(comment) = comment {
                 comments.insert(line, comment.to_owned());
+            }
+            let trimmed = code.trim();
+            if trimmed == "end" {
+                if block_stack.pop().unwrap_or(false) {
+                    match_depths = match_depths.saturating_sub(1);
+                }
+            } else if trimmed.starts_with("match ") || trimmed.contains(" is match ") {
+                match_depths += 1;
+                block_stack.push(true);
+            } else {
+                if let Some(comment) = comment
+                    && trimmed.ends_with(':')
+                    && match_depths > 0
+                    && !is_match_arm_block_header(trimmed)
+                {
+                    match_arm_comments
+                        .entry(compact_code(trimmed))
+                        .or_default()
+                        .push_back((line, comment.to_owned()));
+                }
+                if is_nested_block_header(trimmed) {
+                    block_stack.push(false);
+                }
             }
             if code.trim() == "end" {
                 end_lines.push_back(line);
@@ -49,6 +76,7 @@ impl Formatter {
             output: String::new(),
             source_lines: source.lines().map(str::to_owned).collect(),
             comments,
+            match_arm_comments,
             emitted_comments: HashSet::new(),
             end_lines,
             source_line: 0,
@@ -91,11 +119,31 @@ impl Formatter {
             Stmt::Say(value) => self.line(&format!("Say {}", expr(value)), indent, None),
             Stmt::Sayln(value) => self.line(&format!("Sayln {}", expr(value)), indent, None),
             Stmt::Expression(value) => self.expression_line(value, indent),
-            Stmt::Import { path, alias } => self.line(
+            Stmt::Import {
+                path,
+                alias: Some(alias),
+                ..
+            } => self.line(
                 &format!("open {} as {alias}", string_literal(path)),
                 indent,
                 None,
             ),
+            Stmt::Import {
+                path,
+                exposing,
+                alias: None,
+            } => self.line(
+                &format!(
+                    "open {} exposing {}",
+                    string_literal(path),
+                    format_named_imports(exposing)
+                ),
+                indent,
+                None,
+            ),
+            Stmt::Export { names } => {
+                self.line(&format!("export {}", names.join(", ")), indent, None)
+            }
             Stmt::Assign {
                 name,
                 mutable,
@@ -318,6 +366,20 @@ impl Formatter {
                     .expression_line(&Expr::Identifier(format!("where {}", expr(value))), indent),
                 PipelineStep::Derive(value) => self
                     .expression_line(&Expr::Identifier(format!("derive {}", expr(value))), indent),
+                PipelineStep::Take(count) => self.line(&format!("take {count}"), indent, None),
+                PipelineStep::Skip(count) => self.line(&format!("skip {count}"), indent, None),
+                PipelineStep::StepBy(interval) => {
+                    self.line(&format!("step_by {interval}"), indent, None)
+                }
+                PipelineStep::TakeWhile(value) => self.expression_line(
+                    &Expr::Identifier(format!("take_while {}", expr(value))),
+                    indent,
+                ),
+                PipelineStep::DropWhile(value) => self.expression_line(
+                    &Expr::Identifier(format!("drop_while {}", expr(value))),
+                    indent,
+                ),
+                PipelineStep::Distinct => self.line("distinct", indent, None),
                 PipelineStep::Partition { item, rules } => {
                     self.line(&format!("partition {item}:"), indent, None);
                     for rule in rules {
@@ -339,6 +401,8 @@ impl Formatter {
                 PipelineStep::Average => self.line("average", indent, None),
                 PipelineStep::Min => self.line("min", indent, None),
                 PipelineStep::Max => self.line("max", indent, None),
+                PipelineStep::Any => self.line("any", indent, None),
+                PipelineStep::All => self.line("all", indent, None),
                 PipelineStep::WriteCsv(path) => {
                     self.line(&format!("write_csv({})", expr(path)), indent, None)
                 }
@@ -398,12 +462,12 @@ impl Formatter {
             self.output.push_str(&padding);
             self.output.push_str(first);
             let active_line = self.active_line.take();
-            if let Some(line) = source_line.or(active_line) {
-                if let Some(comment) = self.comments.get(&line) {
-                    self.output.push(' ');
-                    self.output.push_str(comment);
-                    self.emitted_comments.insert(line);
-                }
+            if let Some(line) = source_line.or(active_line)
+                && let Some(comment) = self.comments.get(&line)
+            {
+                self.output.push(' ');
+                self.output.push_str(comment);
+                self.emitted_comments.insert(line);
             }
             self.output.push('\n');
         } else {
@@ -427,12 +491,22 @@ impl Formatter {
             }
             self.output.push_str(&padding);
             self.output.push_str(line);
-            if let Some(close_line) = close_line {
-                if let Some(comment) = self.comments.get(&close_line) {
-                    self.output.push(' ');
-                    self.output.push_str(comment);
-                    self.emitted_comments.insert(close_line);
-                }
+            if line.trim_end().ends_with(':')
+                && let Some((comment_line, comment)) = self
+                    .match_arm_comments
+                    .get_mut(&compact_code(line.trim()))
+                    .and_then(VecDeque::pop_front)
+            {
+                self.output.push(' ');
+                self.output.push_str(&comment);
+                self.emitted_comments.insert(comment_line);
+            }
+            if let Some(close_line) = close_line
+                && let Some(comment) = self.comments.get(&close_line)
+            {
+                self.output.push(' ');
+                self.output.push_str(comment);
+                self.emitted_comments.insert(close_line);
             }
             self.output.push('\n');
         }
@@ -455,6 +529,68 @@ fn split_code_comment(line: &str) -> (&str, Option<&str>) {
         }
     }
     (line, None)
+}
+
+fn is_match_arm_block_header(line: &str) -> bool {
+    [
+        "if ",
+        "else",
+        "for ",
+        "while ",
+        "try:",
+        "catch",
+        "finally:",
+        "fn ",
+        "type ",
+        "enum ",
+        "hash:",
+        "tree:",
+        "pipeline:",
+        "flow ",
+        "partition ",
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix))
+}
+
+fn is_nested_block_header(line: &str) -> bool {
+    line.ends_with(':')
+        && [
+            "if ",
+            "for ",
+            "while ",
+            "try:",
+            "fn ",
+            "type ",
+            "enum ",
+            "hash:",
+            "tree:",
+            "pipeline:",
+            "flow ",
+            "partition ",
+        ]
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
+}
+
+fn compact_code(line: &str) -> String {
+    let mut compact = String::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for character in line.chars() {
+        if !in_string && character.is_whitespace() {
+            continue;
+        }
+        compact.push(character);
+        if character == '"' && !escaped {
+            in_string = !in_string;
+        }
+        escaped = character == '\\' && !escaped;
+        if character != '\\' {
+            escaped = false;
+        }
+    }
+    compact
 }
 
 fn parameters_text(parameters: &[(String, Option<Type>, bool)]) -> String {
@@ -555,6 +691,20 @@ fn binary_symbol(operator: &BinaryOperator) -> &'static str {
         BinaryOperator::Equal => "==",
         BinaryOperator::NotEqual => "!=",
     }
+}
+
+fn format_named_imports(imports: &[(String, String)]) -> String {
+    imports
+        .iter()
+        .map(|(exported, local)| {
+            if exported == local {
+                exported.clone()
+            } else {
+                format!("{exported} as {local}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn expr(expression: &Expr) -> String {
@@ -700,6 +850,12 @@ fn pipeline_expr(source: &Expr, steps: &[PipelineStep]) -> String {
         match step {
             PipelineStep::Where(value) => lines.push(format!("    where {}", expr(value))),
             PipelineStep::Derive(value) => lines.push(format!("    derive {}", expr(value))),
+            PipelineStep::Take(count) => lines.push(format!("    take {count}")),
+            PipelineStep::Skip(count) => lines.push(format!("    skip {count}")),
+            PipelineStep::StepBy(interval) => lines.push(format!("    step_by {interval}")),
+            PipelineStep::TakeWhile(value) => lines.push(format!("    take_while {}", expr(value))),
+            PipelineStep::DropWhile(value) => lines.push(format!("    drop_while {}", expr(value))),
+            PipelineStep::Distinct => lines.push("    distinct".into()),
             PipelineStep::Partition { item, rules } => {
                 lines.push(format!("    partition {item}:"));
                 lines.extend(rules.iter().map(|rule| {
@@ -719,6 +875,8 @@ fn pipeline_expr(source: &Expr, steps: &[PipelineStep]) -> String {
             PipelineStep::Average => lines.push("    average".into()),
             PipelineStep::Min => lines.push("    min".into()),
             PipelineStep::Max => lines.push("    max".into()),
+            PipelineStep::Any => lines.push("    any".into()),
+            PipelineStep::All => lines.push("    all".into()),
             PipelineStep::WriteCsv(path) => lines.push(format!("    write_csv({})", expr(path))),
             PipelineStep::Chunk(size) => lines.push(format!("    chunk {size}")),
             PipelineStep::Parallel(workers) => lines.push(format!("    parallel {workers}")),
@@ -759,7 +917,21 @@ fn statement_text(statement: &Stmt) -> String {
         Stmt::Say(value) => format!("Say {}", expr(value)),
         Stmt::Sayln(value) => format!("Sayln {}", expr(value)),
         Stmt::Expression(value) => expr(value),
-        Stmt::Import { path, alias } => format!("open {} as {alias}", string_literal(path)),
+        Stmt::Import {
+            path,
+            alias: Some(alias),
+            ..
+        } => format!("open {} as {alias}", string_literal(path)),
+        Stmt::Import {
+            path,
+            exposing,
+            alias: None,
+        } => format!(
+            "open {} exposing {}",
+            string_literal(path),
+            format_named_imports(exposing)
+        ),
+        Stmt::Export { names } => format!("export {}", names.join(", ")),
         Stmt::Assign {
             name,
             mutable,
@@ -974,6 +1146,16 @@ fn render_steps(steps: &[PipelineStep], indent: usize) -> Vec<String> {
         match step {
             PipelineStep::Where(value) => lines.push(format!("{pad}where {}", expr(value))),
             PipelineStep::Derive(value) => lines.push(format!("{pad}derive {}", expr(value))),
+            PipelineStep::Take(count) => lines.push(format!("{pad}take {count}")),
+            PipelineStep::Skip(count) => lines.push(format!("{pad}skip {count}")),
+            PipelineStep::StepBy(interval) => lines.push(format!("{pad}step_by {interval}")),
+            PipelineStep::TakeWhile(value) => {
+                lines.push(format!("{pad}take_while {}", expr(value)))
+            }
+            PipelineStep::DropWhile(value) => {
+                lines.push(format!("{pad}drop_while {}", expr(value)))
+            }
+            PipelineStep::Distinct => lines.push(format!("{pad}distinct")),
             PipelineStep::Partition { item, rules } => {
                 lines.push(format!("{pad}partition {item}:"));
                 for rule in rules {
@@ -993,6 +1175,8 @@ fn render_steps(steps: &[PipelineStep], indent: usize) -> Vec<String> {
             PipelineStep::Average => lines.push(format!("{pad}average")),
             PipelineStep::Min => lines.push(format!("{pad}min")),
             PipelineStep::Max => lines.push(format!("{pad}max")),
+            PipelineStep::Any => lines.push(format!("{pad}any")),
+            PipelineStep::All => lines.push(format!("{pad}all")),
             PipelineStep::WriteCsv(path) => lines.push(format!("{pad}write_csv({})", expr(path))),
             PipelineStep::Chunk(size) => lines.push(format!("{pad}chunk {size}")),
             PipelineStep::Parallel(workers) => lines.push(format!("{pad}parallel {workers}")),
@@ -1076,6 +1260,14 @@ fn render_pattern(value: &MatchPattern) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        MatchPattern::NamedStruct { type_name, fields } => format!(
+            "{type_name}({})",
+            fields
+                .iter()
+                .map(|(name, pattern)| format!("{name}: {}", render_pattern(pattern)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         MatchPattern::Wildcard => "_".into(),
     }
 }
@@ -1131,6 +1323,23 @@ mod tests {
             format(source),
             "Say \"  # not a comment  \" # keep  \n#  keep trailing spaces  \n"
         );
+    }
+
+    #[test]
+    fn keeps_match_arm_header_comments_with_their_arms() {
+        let source = "result is match 1:\n\
+                      1: # first arm\n\
+                      10\n\
+                      _: # fallback arm\n\
+                      0\n\
+                      end\n\
+                      Sayln result\n";
+        let formatted = format(source);
+
+        assert!(formatted.contains("    1: # first arm\n"), "{formatted}");
+        assert!(formatted.contains("    _: # fallback arm\n"), "{formatted}");
+        assert!(!formatted.contains("# first arm\nend"), "{formatted}");
+        assert_eq!(format(&formatted), formatted);
     }
 
     #[test]
@@ -1224,9 +1433,28 @@ mod tests {
 
     #[test]
     fn canonicalizes_message_dispatch_spacing_without_changing_strings() {
+        for source in [
+            "person::greet\n",
+            "person ::greet\n",
+            "person:: greet\n",
+            "person :: greet\n",
+        ] {
+            assert_eq!(format(source), "person :: greet\n");
+        }
         assert_eq!(
-            format("person::greet\nperson::rename(\"a::b\")\n"),
-            "person :: greet\nperson :: rename(\"a::b\")\n"
+            format("person::rename(\"a::b\") # note\n"),
+            "person :: rename(\"a::b\") # note\n"
+        );
+    }
+
+    #[test]
+    fn canonicalizes_import_spacing_and_preserves_trailing_comments() {
+        assert_eq!(
+            format(
+                "open   \"nested/math.si\"   as   math # library\n\
+                 open \"values.si\" as values\n"
+            ),
+            "open \"nested/math.si\" as math # library\nopen \"values.si\" as values\n"
         );
     }
 

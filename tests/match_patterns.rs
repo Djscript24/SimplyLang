@@ -616,17 +616,18 @@ fn rest_sequence_exhaustiveness_matrix_covers_minimum_lengths_and_fixed_arms() {
         assert!(error.contains("non-exhaustive match"), "{error}");
     }
 
-    for source in [
-        "match xs:\n    [head, ...rest]:\n        1\n    [first, second]:\n        2\n    _:\n        0\nend\n",
-    ] {
-        let source = format!("xs is [1, 2]\n{source}");
-        let (valid, _, error) = check_source(&source);
-        assert!(
-            !valid,
-            "unreachable fixed/rest matrix was accepted: {source}"
-        );
-        assert!(error.contains("unreachable match pattern"), "{error}");
-    }
+    let source = "xs is [1, 2]\n\
+        match xs:\n\
+            [head, ...rest]:\n                1\n\
+            [first, second]:\n                2\n\
+            _:\n                0\n\
+        end\n";
+    let (valid, _, error) = check_source(source);
+    assert!(
+        !valid,
+        "unreachable fixed/rest matrix was accepted: {source}"
+    );
+    assert!(error.contains("unreachable match pattern"), "{error}");
 
     let empty_after_nonempty_rest = "xs is [1, 2]\n\
         match xs:\n\
@@ -1235,6 +1236,49 @@ fn matches_struct_fields_positionally_and_supports_field_wildcards() {
     let (success, output) = run_source_stdout(source);
     assert!(success, "struct matching failed: {output}");
     assert_eq!(output, "Andi\n17\nAndi\nmatched\n");
+}
+
+#[test]
+fn matches_named_struct_fields_partially_and_recursively() {
+    let source = "type Address:\n    city as String\n    country as String\nend\n\
+                  type Person:\n    name as String\n    age as Int\n    address as Address\nend\n\
+                  person is Person(\"Andi\", 17, Address(\"Bandung\", \"Indonesia\"))\n\
+                  result is match person:\n\
+                      Person(address: Address(city: city), age: 17):\n    city\n\
+                      _:\n    \"other\"\n\
+                  end\n\
+                  exhaustive is match person:\n\
+                      Person(name: _, age: _, address: _):\n    \"person\"\n\
+                  end\n\
+                  Sayln result\nSayln exhaustive\n";
+    let (valid, _, error) = check_source(source);
+    assert!(valid, "named struct patterns did not type-check: {error}");
+    let (success, output) = run_source_stdout(source);
+    assert!(success, "named struct matching failed: {output}");
+    assert_eq!(output, "Bandung\nperson\n");
+}
+
+#[test]
+fn named_struct_patterns_reject_unknown_and_duplicate_fields() {
+    let unknown_field = "type Person:\n    name as String\nend\n\
+                         person is Person(\"Andi\")\n\
+                         match person:\n    Person(age: years):\n        years\nend\n";
+    let (success, _, error) = check_source(unknown_field);
+    assert!(!success);
+    assert!(
+        error.contains("struct pattern `Person` has no field `age`"),
+        "{error}"
+    );
+
+    let duplicate_field = "type Person:\n    name as String\nend\n\
+                           person is Person(\"Andi\")\n\
+                           match person:\n    Person(name: first, name: second):\n        first\nend\n";
+    let (success, _, error) = check_source(duplicate_field);
+    assert!(!success);
+    assert!(
+        error.contains("duplicate field in named struct pattern"),
+        "{error}"
+    );
 }
 
 #[test]

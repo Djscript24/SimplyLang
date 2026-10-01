@@ -1,0 +1,7 @@
+type Item:
+    value as Int
+end
+on Item receive kind:
+    return "module"
+end
+return Item(1)

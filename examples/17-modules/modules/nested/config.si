@@ -1,0 +1,2 @@
+open "../constants.si" as base
+return base + 2

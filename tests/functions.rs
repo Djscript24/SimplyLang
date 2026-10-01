@@ -16,6 +16,8 @@ fn direct_and_mutual_recursion_stop_at_the_call_depth_limit() {
          fn second(value as Int) gives Int:\n    return first(value + 1)\nend\n\
          first(0)\n",
     ] {
+        let (checked, _, error) = check_source(source);
+        assert!(checked, "recursive functions failed check: {error}");
         let (success, error) = run_source(source);
         assert!(!success, "unbounded recursion unexpectedly succeeded");
         assert!(
@@ -44,6 +46,67 @@ fn nested_functions_resolve_lexical_bindings() {
 }
 
 #[test]
+fn top_level_functions_are_hoisted_but_later_nested_siblings_are_not_captured() {
+    let top_level_forward = "Sayln first()\n\
+                             saved is second\n\
+                             fn first() gives Int:\n\
+                                 return second()\n\
+                             end\n\
+                             fn second() gives Int:\n\
+                                 return 42\n\
+                             end\n\
+                             Sayln saved()\n";
+    let (checked, _, error) = check_source(top_level_forward);
+    assert!(checked, "top-level forward call failed check: {error}");
+    let (success, output) = run_source_stdout(top_level_forward);
+    assert!(
+        success,
+        "runtime rejected a top-level forward call: {output}"
+    );
+    assert_eq!(output, "42\n42\n");
+
+    let declared_before_use = "fn first() gives Int:\n\
+                                   return second()\n\
+                               end\n\
+                               fn second() gives Int:\n\
+                                   return 42\n\
+                               end\n\
+                               Sayln first()\n";
+    let (checked, _, error) = check_source(declared_before_use);
+    assert!(
+        checked,
+        "functions declared before use failed check: {error}"
+    );
+    let (success, output) = run_source_stdout(declared_before_use);
+    assert!(
+        success,
+        "functions declared before use failed at runtime: {output}"
+    );
+    assert_eq!(output, "42\n");
+
+    let later_sibling = "fn outer():\n\
+                             fn use_later() gives Int:\n\
+                                 return later()\n\
+                             end\n\
+                             fn later() gives Int:\n\
+                                 return 1\n\
+                             end\n\
+                             return use_later\n\
+                         end\n\
+                         f is outer()\n\
+                         Sayln f()\n";
+    let (checked, _, error) = check_source(later_sibling);
+    assert!(
+        !checked,
+        "check accepted a later sibling closure dependency"
+    );
+    assert!(
+        error.contains("declared later and is not captured by this closure"),
+        "{error}"
+    );
+}
+
+#[test]
 fn nested_closures_preserve_dependencies_and_shadowing() {
     let (success, output) = run_source_stdout(
         "fn make_outer(base as Int):\n\
@@ -63,6 +126,154 @@ fn nested_closures_preserve_dependencies_and_shadowing() {
 
     assert!(success);
     assert_eq!(output, "32\n");
+}
+
+#[test]
+fn returned_nested_functions_can_recurse() {
+    let source = "fn make_countdown():\n\
+                      fn countdown(value as Int) gives Int:\n\
+                          if value == 0:\n\
+                              return 0\n\
+                          else:\n\
+                              return countdown(value - 1)\n\
+                          end\n\
+                      end\n\
+                      return countdown\n\
+                  end\n\
+                  run_countdown is make_countdown()\n\
+                  Sayln run_countdown(3)\n";
+    let (success, output) = run_source_stdout(source);
+
+    assert!(success, "returned recursive closure failed: {output}");
+    assert_eq!(output, "0\n");
+}
+
+#[test]
+fn closure_capture_analysis_respects_nested_block_shadowing() {
+    let source = "fn make_reader():\n\
+                      value is 7\n\
+                      fn read(flag as Bool) gives Int:\n\
+                          if flag:\n\
+                              value is 100\n\
+                          end\n\
+                          return value\n\
+                      end\n\
+                      return read\n\
+                  end\n\
+                  read is make_reader()\n\
+                  Sayln read(false)\n";
+    let (checked, _, error) = check_source(source);
+    assert!(checked, "closure did not pass semantic checking: {error}");
+    let (success, output) = run_source_stdout(source);
+
+    assert!(success, "closure lost its outer binding: {output}");
+    assert_eq!(output, "7\n");
+}
+
+#[test]
+fn closures_keep_creation_time_snapshots_across_rebinding() {
+    let source = "fn make_reader():\n\
+                      mut value is 1\n\
+                      fn read() gives Int:\n\
+                          return value\n\
+                      end\n\
+                      value -> 2\n\
+                      return read\n\
+                  end\n\
+                  read is make_reader()\n\
+                  Sayln read()\n\
+                  Sayln read()\n";
+    let (success, output) = run_source_stdout(source);
+
+    assert!(success, "snapshot closure failed: {output}");
+    assert_eq!(output, "1\n1\n");
+}
+
+#[test]
+fn closures_can_capture_pattern_arm_bindings() {
+    let source = "fn make_reader(value as Int):\n\
+                      return match value:\n\
+                          captured:\n\
+                              fn read() gives Int:\n\
+                                  return captured\n\
+                              end\n\
+                              read\n\
+                      end\n\
+                  end\n\
+                  read is make_reader(42)\n\
+                  Sayln read()\n";
+    let (checked, _, error) = check_source(source);
+    assert!(checked, "pattern-binding closure failed check: {error}");
+    let (success, output) = run_source_stdout(source);
+
+    assert!(success, "closure lost a pattern-arm binding: {output}");
+    assert_eq!(output, "42\n");
+}
+
+#[test]
+fn check_rejects_reassignment_of_snapshot_captures() {
+    let source = "fn make_setter():\n\
+                      mut value is 1\n\
+                      fn set_value():\n\
+                          value -> 2\n\
+                          return value\n\
+                      end\n\
+                      return set_value\n\
+                  end\n";
+    let (success, _, error) = check_source(source);
+
+    assert!(!success, "check accepted mutation of an immutable capture");
+    assert!(
+        error.contains("cannot reassign immutable variable `value`"),
+        "{error}"
+    );
+
+    let source = format!("{source}setter is make_setter()\nsetter()\n");
+    let (success, error) = run_source(&source);
+    assert!(!success, "runtime allowed mutation of a snapshot capture");
+    assert!(
+        error.contains("cannot reassign immutable variable `value`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn nested_function_names_remain_in_their_lexical_scope() {
+    let hidden = "fn outer():\n\
+                      fn local():\n\
+                          return 1\n\
+                      end\n\
+                      return 0\n\
+                  end\n\
+                  local()\n";
+    let (success, _, error) = check_source(hidden);
+    assert!(
+        !success,
+        "check exposed a nested function outside its scope"
+    );
+    assert!(error.contains("unknown function `local`"), "{error}");
+
+    let same_name_in_separate_functions = "fn first():\n\
+                                               fn local():\n\
+                                                   return 1\n\
+                                               end\n\
+                                               return local()\n\
+                                           end\n\
+                                           fn second():\n\
+                                               fn local():\n\
+                                                   return 2\n\
+                                               end\n\
+                                               return local()\n\
+                                           end\n\
+                                           Sayln first() + second()\n";
+    let (checked, _, error) = check_source(same_name_in_separate_functions);
+    assert!(
+        checked,
+        "same-scope function names conflicted in check: {error}"
+    );
+    let (success, output) = run_source_stdout(same_name_in_separate_functions);
+    assert!(success, "separate lexical functions conflicted: {output}");
+    assert_eq!(output, "3\n");
 }
 
 #[test]
@@ -152,6 +363,54 @@ fn unknown_messages_fail_at_runtime() {
         "fn greet(self as Hash):\n    return self[\"name\"]\nend\nperson is hash:\n    name is \"Ada\"\nend\nSayln person :: greet\n",
     );
     assert!(success, "valid message failed semantic checking: {error}");
+}
+
+#[test]
+fn rejects_unknown_dispatch_targets_for_statically_known_receivers() {
+    let (success, _, error) =
+        check_source("person is hash:\n    name is \"Ada\"\nend\nSayln person :: missing\n");
+
+    assert!(!success, "unknown dispatch target passed semantic checking");
+    assert!(error.contains("unknown message `missing` for a Hash receiver"));
+
+    let wrong_receiver = "fn greet(value as String):\n    return value\nend\n\
+                          person is hash:\n    name is \"Ada\"\nend\nperson :: greet\n";
+    let (success, _, error) = check_source(wrong_receiver);
+    assert!(
+        !success,
+        "incompatible receiver type passed semantic checking"
+    );
+    assert!(error.contains("expected String, found Hash"), "{error}");
+}
+
+#[test]
+fn dispatches_to_function_values_when_their_type_is_known() {
+    let source = "fn greet(person as String, suffix as String) gives String:\n\
+                      return person + suffix\n\
+                  end\n\
+                  alias is greet\n\
+                  Sayln \"Ada\" :: alias(\"!\")\n";
+    let (success, output) = run_source_stdout(source);
+    assert!(success, "function-value dispatch failed: {output}");
+    assert_eq!(output, "Ada!\n");
+
+    let inferred_source = "fn greet(person as String, suffix as String):\n\
+                               return person + suffix\n\
+                           end\n\
+                           alias is greet\n\
+                           value as String is \"Ada\" :: alias(\"!\")\n\
+                           Sayln value\n";
+    let (success, _, error) = check_source(inferred_source);
+    assert!(
+        success,
+        "inferred function-value return was rejected: {error}"
+    );
+    let (success, output) = run_source_stdout(inferred_source);
+    assert!(
+        success,
+        "inferred function-value return was rejected: {output}"
+    );
+    assert_eq!(output, "Ada!\n");
 }
 
 #[test]

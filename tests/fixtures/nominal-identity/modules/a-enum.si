@@ -1,0 +1,4 @@
+enum State:
+    Ready
+end
+return State::Ready

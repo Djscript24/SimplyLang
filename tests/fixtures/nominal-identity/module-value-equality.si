@@ -1,0 +1,6 @@
+open "modules/a-struct.si" as first_item
+open "modules/b-struct.si" as second_item
+open "modules/a-enum.si" as first_state
+open "modules/b-enum.si" as second_state
+Sayln first_item == second_item
+Sayln first_state == second_state

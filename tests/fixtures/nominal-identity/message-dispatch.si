@@ -1,0 +1,8 @@
+open "modules/messaged-item.si" as foreign
+type Item:
+    value as Int
+end
+on Item receive kind:
+    return "local"
+end
+Sayln foreign :: kind

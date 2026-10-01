@@ -108,3 +108,242 @@ fn keeps_branch_bindings_local_at_runtime() {
     assert!(!success);
     assert!(error.contains("unknown variable `branch_value`"));
 }
+
+#[test]
+fn for_loop_scope_is_restored_when_an_error_escapes_the_loop() {
+    let source = "try:\n\
+                      hidden is 9\n\
+                      for item in [1]:\n\
+                          throw \"stop\"\n\
+                      end\n\
+                  catch error:\n\
+                      Sayln \"caught\"\n\
+                  end\n\
+                  Sayln hidden\n";
+
+    let (success, error) = run_source(source);
+
+    assert!(!success, "try scope leaked after loop error cleanup");
+    assert!(error.contains("unknown variable `hidden`"), "{error}");
+}
+
+#[test]
+fn check_does_not_allow_loop_control_to_cross_a_function_boundary() {
+    let source = "while true:\n\
+                      fn invalid():\n\
+                          break\n\
+                      end\n\
+                      invalid()\n\
+                      break\n\
+                  end\n";
+    let (success, _, error) = check_source(source);
+
+    assert!(
+        !success,
+        "check accepted break outside the nested function's loop"
+    );
+    assert!(
+        error.contains("break or continue used outside a loop"),
+        "{error}"
+    );
+
+    let (ran, error) = run_source(source);
+    assert!(
+        !ran,
+        "runtime accepted loop control across a function boundary"
+    );
+    assert!(
+        error.contains("break/continue used outside a loop"),
+        "{error}"
+    );
+}
+
+#[test]
+fn check_accepts_a_returning_try_with_a_non_returning_finally() {
+    let source = "fn value() gives Int:\n\
+                      try:\n\
+                          return 1\n\
+                      finally:\n\
+                          Sayln \"cleanup\"\n\
+                      end\n\
+                  end\n\
+                  Sayln value()\n";
+    let (checked, _, error) = check_source(source);
+    assert!(checked, "check rejected a returning try/finally: {error}");
+
+    let (ran, output) = run_source_stdout(source);
+    assert!(ran, "returning try/finally failed at runtime: {output}");
+    assert_eq!(output, "cleanup\n1\n");
+}
+
+#[test]
+fn check_requires_every_handled_catch_path_to_return() {
+    let source = "fn value() gives Int:\n\
+                      try:\n\
+                          return 1\n\
+                      catch arithmetic as E0202:\n\
+                          return 2\n\
+                      catch other:\n\
+                          Sayln \"handled without returning\"\n\
+                      end\n\
+                  end\n\
+                  Sayln value()\n";
+    let (checked, _, error) = check_source(source);
+
+    assert!(!checked, "check accepted a non-returning catch path");
+    assert!(error.contains("must return Int"), "{error}");
+}
+
+#[test]
+fn short_circuit_checks_dynamic_operands_and_skips_literal_unreachable_operands() {
+    let dynamic = "flag is false\nSayln flag and missing_value\n";
+    let (checked, _, error) = check_source(dynamic);
+    assert!(!checked, "check skipped a dynamically reachable operand");
+    assert!(
+        error.contains("unknown variable `missing_value`"),
+        "{error}"
+    );
+
+    let literal = "Sayln false and missing_value\n\
+                   Sayln true or missing_value\n";
+    let (checked, _, error) = check_source(literal);
+    assert!(
+        checked,
+        "check did not preserve literal short-circuit semantics: {error}"
+    );
+
+    let source = "Sayln false and (1 / 0 == 0)\n\
+                  Sayln true or (1 / 0 == 0)\n";
+    let (checked, _, error) = check_source(source);
+    assert!(
+        checked,
+        "valid short-circuit expressions failed check: {error}"
+    );
+
+    let (ran, output) = run_source_stdout(source);
+    assert!(ran, "short-circuited division was evaluated: {output}");
+    assert_eq!(output, "false\ntrue\n");
+}
+
+#[test]
+fn returns_in_match_arms_supply_the_match_expression_value() {
+    let source = "fn choose() gives Int:\n\
+                      return match true:\n\
+                          true:\n\
+                              return 1\n\
+                          false:\n\
+                              return 2\n\
+                      end\n\
+                  end\n\
+                  Sayln choose()\n";
+    let (checked, _, error) = check_source(source);
+
+    assert!(checked, "check rejected match-arm return values: {error}");
+    let (ran, output) = run_source_stdout(source);
+    assert!(ran, "match-arm return failed at runtime: {output}");
+    assert_eq!(output, "1\n");
+}
+
+#[test]
+fn check_rejects_loop_control_inside_match_arms() {
+    let source = "while true:\n\
+                      match 1:\n\
+                          _:\n\
+                              break\n\
+                      end\n\
+                  end\n";
+    let (checked, _, error) = check_source(source);
+
+    assert!(!checked, "check accepted loop control intercepted by match");
+    assert!(
+        error.contains("break or continue used outside a loop"),
+        "{error}"
+    );
+
+    let (ran, error) = run_source(source);
+    assert!(!ran, "runtime accepted loop control intercepted by match");
+    assert!(
+        error.contains("break/continue used outside a loop"),
+        "{error}"
+    );
+}
+
+#[test]
+fn loops_inside_match_arms_consume_their_own_control_flow() {
+    let source = "match 1:\n\
+                      _:\n\
+                          for item in [1, 2]:\n\
+                              Sayln item\n\
+                              break\n\
+                          end\n\
+                  end\n";
+    let (checked, _, error) = check_source(source);
+    assert!(checked, "nested loop control failed check: {error}");
+
+    let (ran, output) = run_source_stdout(source);
+    assert!(
+        ran,
+        "loop control escaped its loop in the match arm: {output}"
+    );
+    assert_eq!(output, "1\n");
+}
+
+#[test]
+fn nested_loops_consume_only_their_own_break_and_continue() {
+    let source = "for outer in [1, 2, 3]:\n\
+                      for inner in [1, 2, 3]:\n\
+                          if inner == 2:\n\
+                              continue\n\
+                          end\n\
+                          Sayln outer * 10 + inner\n\
+                          if outer == 2 and inner == 3:\n\
+                              break\n\
+                          end\n\
+                      end\n\
+                  end\n";
+    let (success, output) = run_source_stdout(source);
+
+    assert!(success, "nested loop control failed: {output}");
+    assert_eq!(output, "11\n13\n21\n23\n31\n33\n");
+}
+
+#[test]
+fn iterable_is_evaluated_once_and_return_exits_the_enclosing_function() {
+    let source = "fn values():\n\
+                      Sayln \"iterable\"\n\
+                      return [1, 2, 3]\n\
+                  end\n\
+                  fn find() gives Int:\n\
+                      for item in values():\n\
+                          if item == 2:\n\
+                              return item\n\
+                          end\n\
+                      end\n\
+                      return 0\n\
+                  end\n\
+                  Sayln find()\n";
+    let (checked, _, error) = check_source(source);
+    assert!(checked, "valid loop return failed check: {error}");
+
+    let (success, output) = run_source_stdout(source);
+    assert!(success, "return from a loop failed: {output}");
+    assert_eq!(output, "iterable\n2\n");
+}
+
+#[test]
+fn if_evaluates_only_the_selected_branch_and_mutates_outer_bindings() {
+    let source = "mut value is 0\n\
+                  if true:\n\
+                      value -> 1\n\
+                  else:\n\
+                      Sayln 1 / 0\n\
+                      value -> 2\n\
+                  end\n\
+                  Sayln value\n";
+    let (checked, _, error) = check_source(source);
+    assert!(checked, "valid branch mutation failed check: {error}");
+
+    let (ran, output) = run_source_stdout(source);
+    assert!(ran, "unselected branch was evaluated: {output}");
+    assert_eq!(output, "1\n");
+}

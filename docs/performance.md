@@ -9,8 +9,18 @@ Simply is currently an interpreter. The optimization work is intentionally split
 - Parsed imports are cached as shared `Arc<Program>` values. Imported programs are still evaluated in isolated module evaluators, so evaluation side effects are not cached away.
 - Pipeline values are moved into the temporary `item` binding and recovered without cloning each element.
 - `where`/`derive` pipelines ending in `count` or `sum` are fused across multiple stages without materializing intermediate vectors.
-- Integer `range(start, end)` values are lazy. `for` loops and fused `count`/`sum` pipelines consume them directly, avoiding a million-element allocation for large numeric workloads.
+- Integer `range(start, end[, step])` values are lazy. `for` loops and fused `count`/`sum` pipelines consume them directly, avoiding a million-element allocation for large numeric workloads.
+- Range pipelines with pure scalar `where`/`derive` expressions and an aggregate terminal evaluate those expressions directly against each item, without creating and removing a temporary `item` scope for every stage. Other expressions keep the general streaming evaluator.
 - Non-terminal `where`/`derive` pipelines are evaluated in one streaming pass, so each stage does not allocate a separate intermediate collection.
+- `take N` short-circuits collection, range, and CSV sources as soon as N items reach that step; filters before `take` count only matching items. `take 0` does not consume the source.
+- `skip N` is applied during the same streaming pass and does not materialize a prefix; items skipped after a `where` are counted only after the filter.
+- `step_by N` samples in the same streaming pass without materializing skipped items; it counts only items that reach its position after preceding steps.
+- `enumerate(sequence)` materializes an array of index/value tuples; use it for reusable indexed data, while direct `for` iteration remains preferable when only one pass is needed.
+- `zip(left, right)` iterates both input sequences together and stops at the shorter one, so a long range is not fully consumed when paired with a shorter collection.
+- `take_while condition` stops a lazy range or CSV stream at the first item that fails the condition, without scanning the remaining source.
+- `drop_while condition` evaluates its condition only on the initial matching prefix, then passes the remaining stream through without further condition checks.
+- `distinct` retains previously observed values while streaming; it uses language equality, so arbitrary values work consistently but membership checks grow with the number of unique values.
+- Boolean `any` and `all` terminals stop consuming collections, ranges, or CSV rows once the result is determined.
 - `csv_rows(path) -> where/derive -> write_csv(path)` keeps one input row and one output row in memory at a time. CSV fields support quoted commas, escaped quotes, and newlines inside quoted fields.
 - Numeric formulas can use `to_float` and `csv_row` while preserving streaming memory usage; aggregation and cleanup are separate passes over the source.
 - `average`, `min`, and `max` are streaming terminals for ranges, collections, and CSV sources. They retain only aggregate state, not all rows.
@@ -27,6 +37,7 @@ Simply is currently an interpreter. The optimization work is intentionally split
 - Lexer and parser vectors reserve an estimated capacity to reduce reallocations.
 - Runtime value scopes, evaluator type scopes, and semantic-analysis scopes maintain nearest-binding indexes, avoiding a scan through every nested frame on lookup.
 - Runtime and type scope stacks reuse popped hash maps across function calls and nested blocks, reducing allocation churn without changing shadowing semantics.
+- Function calls avoid creating a separate function/capture scope when a capture-free named function already resolves to the same function value in the caller; parameter bindings remain isolated in their own scope. The release `function-dispatch` workload improved from roughly 14 ms to a roughly 10 ms median across three runs.
 
 ## Important semantic safeguards
 

@@ -1,0 +1,11 @@
+open "modules/a-struct.si" as foreign
+type Item:
+    value as Int
+end
+result is match foreign:
+    Item(value):
+        "local"
+    _:
+        "foreign"
+end
+Sayln result

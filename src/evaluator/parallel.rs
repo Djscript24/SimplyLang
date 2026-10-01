@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
-    ast::{Expr, Literal, PipelineStep},
+    ast::{BinaryOperator, Expr, Literal, PipelineStep},
     runtime::{limits, operations, value::Value},
 };
 
@@ -60,6 +60,13 @@ fn evaluate_expression(expression: &Expr, item: &ParallelValue) -> Result<Parall
             right,
         } => {
             let left = evaluate_expression(left, item)?.into_value();
+            if matches!(operator, BinaryOperator::And | BinaryOperator::Or)
+                && let Value::Bool(value) = left
+                && ((*operator == BinaryOperator::And && !value)
+                    || (*operator == BinaryOperator::Or && value))
+            {
+                return Ok(ParallelValue::Bool(value));
+            }
             let right = evaluate_expression(right, item)?.into_value();
             operations::binary(left, operator, right, None).map_err(|error| error.to_string())?
         }

@@ -14,3 +14,13 @@ end
 Sayln profile.name
 Sayln profile["role"]
 Sayln catalog["featured"].name
+Sayln keys(profile)
+Sayln values(profile)
+Sayln entries(profile)
+Sayln has_key(profile, "role")
+Sayln has_key(profile, "missing")
+Sayln get(profile, "role", "unknown")
+Sayln get(profile, "missing", "unknown")
+Sayln keys(without_key(profile, "role"))
+Sayln keys(profile)
+Sayln entries(select_keys(profile, ["role", "name"]))

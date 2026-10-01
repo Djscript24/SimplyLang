@@ -1,0 +1,11 @@
+open "modules/a-enum.si" as foreign
+enum State:
+    Ready
+end
+result is match foreign:
+    State::Ready:
+        "local"
+    _:
+        "foreign"
+end
+Sayln result

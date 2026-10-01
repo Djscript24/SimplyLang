@@ -8,13 +8,19 @@ use crate::{
     },
     error::{DiagnosticCode, SimplyError, Span},
     lexer::{Token, TokenKind},
-    types::Type,
+    types::{DeclarationIdentity, DeclarationKind, Type},
 };
+
+const MAX_PARSER_NESTING: usize = 64;
 
 pub struct Parser {
     tokens: Vec<Token>,
     current: usize,
     enum_names: std::collections::HashSet<String>,
+    expression_depth: usize,
+    statement_depth: usize,
+    type_depth: usize,
+    pattern_depth: usize,
 }
 
 impl Parser {
@@ -48,6 +54,10 @@ impl Parser {
             tokens,
             current: 0,
             enum_names,
+            expression_depth: 0,
+            statement_depth: 0,
+            type_depth: 0,
+            pattern_depth: 0,
         }
     }
 
@@ -76,6 +86,16 @@ impl Parser {
     }
 
     fn statement(&mut self) -> Result<Stmt, SimplyError> {
+        if self.statement_depth >= MAX_PARSER_NESTING {
+            return Err(self.error_here("maximum parser nesting depth exceeded"));
+        }
+        self.statement_depth += 1;
+        let result = self.statement_inner();
+        self.statement_depth -= 1;
+        result
+    }
+
+    fn statement_inner(&mut self) -> Result<Stmt, SimplyError> {
         if self.match_kind(TokenKind::Say) {
             let expr = self.expression()?;
             return Ok(Stmt::Say(expr));
@@ -86,13 +106,50 @@ impl Parser {
         }
 
         if self.match_kind(TokenKind::Open) {
-            let path = match self.advance().kind.clone() {
+            let token = self.advance().clone();
+            let path = match token.kind {
                 TokenKind::String(path) => path,
-                _ => return Err(self.error_here("expected a source path after `open`")),
+                _ => {
+                    return Err(self.error_at(token.span, "expected a source path after `open`"));
+                }
             };
-            self.expect(TokenKind::As, "expected `as` after source path")?;
-            let alias = self.expect_identifier("expected import alias")?;
-            return Ok(Stmt::Import { path, alias });
+            if self.match_kind(TokenKind::As) {
+                let alias = self.expect_identifier("expected import alias")?;
+                return Ok(Stmt::Import {
+                    path,
+                    alias: Some(alias),
+                    exposing: Vec::new(),
+                });
+            }
+            if self.match_kind(TokenKind::Exposing) {
+                let mut exposing = Vec::new();
+                loop {
+                    let exported = self.expect_identifier("expected exported name")?;
+                    let local = if self.match_kind(TokenKind::As) {
+                        self.expect_identifier("expected local name after `as`")?
+                    } else {
+                        exported.clone()
+                    };
+                    exposing.push((exported, local));
+                    if !self.match_kind(TokenKind::Comma) {
+                        break;
+                    }
+                }
+                return Ok(Stmt::Import {
+                    path,
+                    alias: None,
+                    exposing,
+                });
+            }
+            return Err(self.error_here("expected `as` or `exposing` after source path"));
+        }
+
+        if self.match_kind(TokenKind::Export) {
+            let mut names = vec![self.expect_identifier("expected exported name")?];
+            while self.match_kind(TokenKind::Comma) {
+                names.push(self.expect_identifier("expected exported name after `,`")?);
+            }
+            return Ok(Stmt::Export { names });
         }
 
         if self.match_kind(TokenKind::Flow) {
@@ -240,11 +297,12 @@ impl Parser {
             return Ok(Stmt::Expression(self.expression()?));
         }
 
-        let name = match self.advance().kind.clone() {
+        let token = self.advance().clone();
+        let name = match token.kind {
             TokenKind::Identifier(name) => name,
             TokenKind::Count => "count".into(),
             TokenKind::Tree => "tree".into(),
-            _ => return Err(self.error_here("expected a statement")),
+            _ => return Err(self.error_at(token.span, "expected a statement")),
         };
         {
             let declared_type = if self.match_kind(TokenKind::As) {
@@ -590,6 +648,16 @@ impl Parser {
     }
 
     fn match_pattern_atom(&mut self) -> Result<MatchPattern, SimplyError> {
+        if self.pattern_depth >= MAX_PARSER_NESTING {
+            return Err(self.error_here("maximum pattern nesting depth exceeded"));
+        }
+        self.pattern_depth += 1;
+        let result = self.match_pattern_atom_inner();
+        self.pattern_depth -= 1;
+        result
+    }
+
+    fn match_pattern_atom_inner(&mut self) -> Result<MatchPattern, SimplyError> {
         if self.match_kind(TokenKind::DotDot) {
             let end = self.range_pattern_endpoint()?;
             if end.is_none() {
@@ -733,6 +801,30 @@ impl Parser {
             return Err(self.error_here("range pattern bounds must be literal values"));
         }
         if self.match_kind(TokenKind::LeftParen) {
+            if matches!(self.peek().kind, TokenKind::Identifier(_))
+                && self
+                    .tokens
+                    .get(self.current + 1)
+                    .is_some_and(|token| token.kind == TokenKind::Colon)
+            {
+                let mut fields = Vec::new();
+                while !self.check(TokenKind::RightParen) {
+                    let field_name = self.expect_identifier("expected a struct field name")?;
+                    if fields.iter().any(|(existing, _)| existing == &field_name) {
+                        return Err(self.error_here("duplicate field in named struct pattern"));
+                    }
+                    self.expect(TokenKind::Colon, "expected `:` after struct field name")?;
+                    fields.push((field_name, self.match_pattern()?));
+                    if !self.match_kind(TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(TokenKind::RightParen, "expected `)` after struct pattern")?;
+                return Ok(MatchPattern::NamedStruct {
+                    type_name: name,
+                    fields,
+                });
+            }
             let mut fields = Vec::new();
             while !self.check(TokenKind::RightParen) {
                 fields.push(self.match_pattern()?);
@@ -1083,6 +1175,16 @@ impl Parser {
     }
 
     fn type_name(&mut self) -> Result<Type, SimplyError> {
+        if self.type_depth >= MAX_PARSER_NESTING {
+            return Err(self.error_here("maximum type nesting depth exceeded"));
+        }
+        self.type_depth += 1;
+        let result = self.type_name_inner();
+        self.type_depth -= 1;
+        result
+    }
+
+    fn type_name_inner(&mut self) -> Result<Type, SimplyError> {
         if self.match_kind(TokenKind::LeftParen) {
             let mut types = vec![self.type_name()?];
             while self.match_kind(TokenKind::Comma) {
@@ -1092,14 +1194,15 @@ impl Parser {
             return Ok(Type::Tuple(types));
         }
 
-        let name = match self.advance().kind.clone() {
+        let token = self.advance().clone();
+        let name = match token.kind {
             TokenKind::Identifier(name) => name,
             TokenKind::Array => "Array".into(),
             TokenKind::List => "List".into(),
             TokenKind::Hash => "Hash".into(),
             TokenKind::Tree => "Tree".into(),
             TokenKind::Matrix => "Matrix".into(),
-            _ => return Err(self.error_here("expected a supported type")),
+            _ => return Err(self.error_at(token.span, "expected a supported type")),
         };
         let base = match name.as_str() {
             "Unit" => Type::Unit,
@@ -1115,8 +1218,14 @@ impl Parser {
             "Tree" => Type::Tree,
             "Matrix" => Type::Matrix,
             "Tuple" => Type::Tuple(Vec::new()),
-            _ if self.enum_names.contains(&name) => Type::Enum(name.clone()),
-            _ => Type::Struct(name.clone()),
+            _ if self.enum_names.contains(&name) => Type::Enum(DeclarationIdentity::unresolved(
+                name.clone(),
+                DeclarationKind::Enum,
+            )),
+            _ => Type::Struct(DeclarationIdentity::unresolved(
+                name.clone(),
+                DeclarationKind::Struct,
+            )),
         };
         if self.match_kind(TokenKind::LeftBracket) {
             if name == "Tuple" {
@@ -1140,7 +1249,17 @@ impl Parser {
     }
 
     fn parse_binary(&mut self, minimum_precedence: u8) -> Result<Expr, SimplyError> {
-        let mut left = self.parse_unary()?;
+        if self.expression_depth >= MAX_PARSER_NESTING {
+            return Err(self.error_here("maximum expression nesting depth exceeded"));
+        }
+        self.expression_depth += 1;
+        let result = self.parse_binary_inner(minimum_precedence);
+        self.expression_depth -= 1;
+        result
+    }
+
+    fn parse_binary_inner(&mut self, minimum_precedence: u8) -> Result<Expr, SimplyError> {
+        let mut left = self.parse_unary_inner()?;
         while let Some((precedence, operator)) = self.binary_operator() {
             if precedence < minimum_precedence {
                 break;
@@ -1157,6 +1276,16 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, SimplyError> {
+        if self.expression_depth >= MAX_PARSER_NESTING {
+            return Err(self.error_here("maximum expression nesting depth exceeded"));
+        }
+        self.expression_depth += 1;
+        let result = self.parse_unary_inner();
+        self.expression_depth -= 1;
+        result
+    }
+
+    fn parse_unary_inner(&mut self) -> Result<Expr, SimplyError> {
         if self.match_kind(TokenKind::Not) {
             return Ok(Expr::Unary {
                 operator: UnaryOperator::Not,
@@ -1346,6 +1475,18 @@ impl Parser {
                 steps.push(PipelineStep::Where(self.expression()?));
             } else if self.match_kind(TokenKind::Derive) {
                 steps.push(PipelineStep::Derive(self.expression()?));
+            } else if self.match_kind(TokenKind::Take) {
+                steps.push(self.take_step()?);
+            } else if self.match_kind(TokenKind::Skip) {
+                steps.push(self.skip_step()?);
+            } else if self.match_kind(TokenKind::StepBy) {
+                steps.push(self.step_by_step()?);
+            } else if self.match_kind(TokenKind::TakeWhile) {
+                steps.push(PipelineStep::TakeWhile(self.expression()?));
+            } else if self.match_kind(TokenKind::DropWhile) {
+                steps.push(PipelineStep::DropWhile(self.expression()?));
+            } else if self.match_kind(TokenKind::Distinct) {
+                steps.push(PipelineStep::Distinct);
             } else if self.match_kind(TokenKind::Partition) {
                 steps.push(self.partition_step()?);
                 terminal = true;
@@ -1363,6 +1504,12 @@ impl Parser {
                 terminal = true;
             } else if self.match_kind(TokenKind::Max) {
                 steps.push(PipelineStep::Max);
+                terminal = true;
+            } else if self.match_word("any") {
+                steps.push(PipelineStep::Any);
+                terminal = true;
+            } else if self.match_word("all") {
+                steps.push(PipelineStep::All);
                 terminal = true;
             } else if self.match_kind(TokenKind::WriteCsv) {
                 self.expect(TokenKind::LeftParen, "expected `(` after write_csv")?;
@@ -1410,6 +1557,18 @@ impl Parser {
                 steps.push(PipelineStep::Where(self.expression()?));
             } else if self.match_kind(TokenKind::Derive) {
                 steps.push(PipelineStep::Derive(self.expression()?));
+            } else if self.match_kind(TokenKind::Take) {
+                steps.push(self.take_step()?);
+            } else if self.match_kind(TokenKind::Skip) {
+                steps.push(self.skip_step()?);
+            } else if self.match_kind(TokenKind::StepBy) {
+                steps.push(self.step_by_step()?);
+            } else if self.match_kind(TokenKind::TakeWhile) {
+                steps.push(PipelineStep::TakeWhile(self.expression()?));
+            } else if self.match_kind(TokenKind::DropWhile) {
+                steps.push(PipelineStep::DropWhile(self.expression()?));
+            } else if self.match_kind(TokenKind::Distinct) {
+                steps.push(PipelineStep::Distinct);
             } else if self.match_kind(TokenKind::Sum) {
                 steps.push(PipelineStep::Sum);
                 terminal = true;
@@ -1425,6 +1584,12 @@ impl Parser {
             } else if self.match_kind(TokenKind::Max) {
                 steps.push(PipelineStep::Max);
                 terminal = true;
+            } else if self.match_word("any") {
+                steps.push(PipelineStep::Any);
+                terminal = true;
+            } else if self.match_word("all") {
+                steps.push(PipelineStep::All);
+                terminal = true;
             } else if self.match_kind(TokenKind::WriteCsv) {
                 self.expect(TokenKind::LeftParen, "expected `(` after write_csv")?;
                 let path = self.expression()?;
@@ -1432,18 +1597,25 @@ impl Parser {
                 steps.push(PipelineStep::WriteCsv(path));
                 terminal = true;
             } else if self.match_kind(TokenKind::Chunk) {
-                let size = match self.advance().kind {
-                    TokenKind::Int(value) if value > 0 => value,
-                    _ => return Err(self.error_here("chunk size must be a positive integer")),
-                };
-                steps.push(PipelineStep::Chunk(size));
-            } else if self.match_word("parallel") {
-                let workers = match self.advance().kind {
+                let token = self.advance().clone();
+                let size = match token.kind {
                     TokenKind::Int(value) if value > 0 => value,
                     _ => {
                         return Err(
-                            self.error_here("parallel worker count must be a positive integer")
+                            self.error_at(token.span, "chunk size must be a positive integer")
                         );
+                    }
+                };
+                steps.push(PipelineStep::Chunk(size));
+            } else if self.match_word("parallel") {
+                let token = self.advance().clone();
+                let workers = match token.kind {
+                    TokenKind::Int(value) if value > 0 => value,
+                    _ => {
+                        return Err(self.error_at(
+                            token.span,
+                            "parallel worker count must be a positive integer",
+                        ));
                     }
                 };
                 steps.push(PipelineStep::Parallel(workers));
@@ -1463,6 +1635,30 @@ impl Parser {
             source,
             steps,
         })
+    }
+
+    fn take_step(&mut self) -> Result<PipelineStep, SimplyError> {
+        let token = self.advance().clone();
+        match token.kind {
+            TokenKind::Int(count) if count >= 0 => Ok(PipelineStep::Take(count)),
+            _ => Err(self.error_at(token.span, "take count must be a non-negative integer")),
+        }
+    }
+
+    fn skip_step(&mut self) -> Result<PipelineStep, SimplyError> {
+        let token = self.advance().clone();
+        match token.kind {
+            TokenKind::Int(count) if count >= 0 => Ok(PipelineStep::Skip(count)),
+            _ => Err(self.error_at(token.span, "skip count must be a non-negative integer")),
+        }
+    }
+
+    fn step_by_step(&mut self) -> Result<PipelineStep, SimplyError> {
+        let token = self.advance().clone();
+        match token.kind {
+            TokenKind::Int(interval) if interval > 0 => Ok(PipelineStep::StepBy(interval)),
+            _ => Err(self.error_at(token.span, "`step_by` interval must be a positive integer")),
+        }
     }
 
     fn partition_step(&mut self) -> Result<PipelineStep, SimplyError> {
@@ -1591,9 +1787,10 @@ impl Parser {
     }
 
     fn expect_identifier(&mut self, message: &str) -> Result<String, SimplyError> {
-        match self.advance().kind.clone() {
+        let token = self.advance().clone();
+        match token.kind {
             TokenKind::Identifier(name) => Ok(name),
-            _ => Err(self.error_here(message)),
+            _ => Err(self.error_at(token.span, message)),
         }
     }
 
@@ -1601,17 +1798,17 @@ impl Parser {
         let token = self.advance().clone();
         match token.kind {
             TokenKind::Identifier(name) => Ok(name),
-            _ => Err(SimplyError::Parse {
-                span: token.span,
-                code: DiagnosticCode::UnexpectedToken,
-                message: "expected an identifier after `::`".into(),
-            }),
+            _ => Err(self.error_at(token.span, "expected an identifier after `::`")),
         }
     }
 
     fn error_here(&self, message: &str) -> SimplyError {
+        self.error_at(self.peek().span.clone(), message)
+    }
+
+    fn error_at(&self, span: Span, message: &str) -> SimplyError {
         SimplyError::Parse {
-            span: self.peek().span.clone(),
+            span,
             code: DiagnosticCode::UnexpectedToken,
             message: message.into(),
         }
@@ -1821,6 +2018,90 @@ mod tests {
             }) if message == "city"
                 && matches!(receiver.as_ref(), Expr::MessageDispatch { message, .. } if message == "address")
         ));
+    }
+
+    #[test]
+    fn bounds_expression_nesting_with_a_located_parse_error() {
+        let nested = format!("Sayln {}1{}\n", "(".repeat(32), ")".repeat(32));
+        let program = Parser::new(Lexer::new(&nested).tokenize().unwrap())
+            .parse()
+            .expect("ordinary nested expressions should parse");
+        assert_eq!(program.statements.len(), 1);
+
+        let deeply_nested = format!("Sayln {}1{}\n", "(".repeat(1024), ")".repeat(1024));
+        let error = Parser::new(Lexer::new(&deeply_nested).tokenize().unwrap())
+            .parse()
+            .expect_err("excessive expression nesting should be diagnosed");
+        assert_eq!(error.code(), DiagnosticCode::UnexpectedToken);
+        assert_eq!(error.span().line, 1);
+        assert!(error.message().contains("nesting depth"));
+    }
+
+    #[test]
+    fn bounds_nested_blocks_without_rejecting_flat_operator_chains() {
+        let ordinary_blocks = format!("{}Sayln 1\n{}", "if true:\n".repeat(16), "end\n".repeat(16));
+        Parser::new(Lexer::new(&ordinary_blocks).tokenize().unwrap())
+            .parse()
+            .expect("ordinary nested blocks should parse");
+
+        let nested_blocks = format!(
+            "{}Sayln 1\n{}",
+            "if true:\n".repeat(1024),
+            "end\n".repeat(1024)
+        );
+        let error = Parser::new(Lexer::new(&nested_blocks).tokenize().unwrap())
+            .parse()
+            .expect_err("excessive block nesting should be diagnosed");
+        assert_eq!(error.code(), DiagnosticCode::UnexpectedToken);
+        assert_eq!(error.span().line, 65);
+        assert!(error.message().contains("maximum parser nesting depth"));
+
+        let flat_chain = format!("Sayln {}\n", vec!["1"; 2049].join(" + "));
+        Parser::new(Lexer::new(&flat_chain).tokenize().unwrap())
+            .parse()
+            .expect("a long flat operator chain should not count as nested syntax");
+    }
+
+    #[test]
+    fn bounds_nested_match_expressions() {
+        let nested_matches = format!(
+            "Sayln {}{}",
+            "match true:\ntrue:\n".repeat(1024),
+            "0\nfalse:\n0\nend\n".repeat(1024)
+        );
+        let error = Parser::new(Lexer::new(&nested_matches).tokenize().unwrap())
+            .parse()
+            .expect_err("excessive match nesting should be diagnosed");
+        assert_eq!(error.code(), DiagnosticCode::UnexpectedToken);
+        assert!(error.message().contains("nesting depth"));
+    }
+
+    #[test]
+    fn bounds_recursive_type_and_pattern_parsing() {
+        let nested_type = format!(
+            "fn accept(value as {}Int{}):\n    return 1\nend\n",
+            "List[".repeat(1024),
+            "]".repeat(1024)
+        );
+        let type_error = Parser::new(Lexer::new(&nested_type).tokenize().unwrap())
+            .parse()
+            .expect_err("excessive type nesting should be diagnosed");
+        assert_eq!(type_error.code(), DiagnosticCode::UnexpectedToken);
+        assert!(type_error.message().contains("maximum type nesting depth"));
+
+        let nested_pattern = format!(
+            "Sayln match 0:\n{}:\n    1\n_:\n    0\nend\n",
+            "(".repeat(1024) + "value" + &")".repeat(1024)
+        );
+        let pattern_error = Parser::new(Lexer::new(&nested_pattern).tokenize().unwrap())
+            .parse()
+            .expect_err("excessive pattern nesting should be diagnosed");
+        assert_eq!(pattern_error.code(), DiagnosticCode::UnexpectedToken);
+        assert!(
+            pattern_error
+                .message()
+                .contains("maximum pattern nesting depth")
+        );
     }
 
     #[test]

@@ -1,0 +1,8 @@
+type Item:
+    value as Int
+end
+enum State:
+    Ready
+end
+export Item, State
+return 1

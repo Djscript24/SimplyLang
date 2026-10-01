@@ -1,0 +1,4 @@
+open "modules/a-enum.si" as first
+open "modules/b-enum.si" as second
+mut current is first
+current -> second

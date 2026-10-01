@@ -1,0 +1,17 @@
+open "modules/nested/config.si" as config
+open "modules/math.si" exposing add as add_numbers, plus_base, base, Person as ImportedPerson, State as ImportedState
+
+Sayln config
+Sayln add_numbers(2, 3)
+Sayln plus_base(2)
+Sayln base
+person is ImportedPerson("Ada")
+Sayln person :: greeting
+state is ImportedState::Ready(7)
+message is match state:
+    ImportedState::Ready(value):
+        value
+    ImportedState::Failed(error):
+        error
+end
+Sayln message

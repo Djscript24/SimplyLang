@@ -1,0 +1,4 @@
+open "modules/shared-types.si" exposing Item as ItemA, State as StateA
+open "modules/shared-types.si" exposing Item as ItemB, State as StateB
+Sayln ItemA(7) == ItemB(7)
+Sayln StateA::Ready == StateB::Ready

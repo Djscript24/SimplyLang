@@ -71,6 +71,10 @@ pub enum MatchPattern {
         type_name: String,
         fields: Vec<MatchPattern>,
     },
+    NamedStruct {
+        type_name: String,
+        fields: Vec<(String, MatchPattern)>,
+    },
     Wildcard,
 }
 
@@ -99,7 +103,8 @@ impl MatchPattern {
                 | MatchPattern::Hash(_)
                 | MatchPattern::Alias { .. }
                 | MatchPattern::EnumVariant { .. }
-                | MatchPattern::Struct { .. } => {}
+                | MatchPattern::Struct { .. }
+                | MatchPattern::NamedStruct { .. } => {}
             }
         }
 
@@ -120,7 +125,11 @@ pub enum Stmt {
     Expression(Expr),
     Import {
         path: String,
-        alias: String,
+        alias: Option<String>,
+        exposing: Vec<(String, String)>,
+    },
+    Export {
+        names: Vec<String>,
     },
     Assign {
         name: String,
@@ -278,6 +287,12 @@ pub enum UnaryOperator {
 pub enum PipelineStep {
     Where(Expr),
     Derive(Expr),
+    Take(i64),
+    Skip(i64),
+    StepBy(i64),
+    TakeWhile(Expr),
+    DropWhile(Expr),
+    Distinct,
     Partition {
         item: String,
         rules: Vec<PartitionRule>,
@@ -287,6 +302,8 @@ pub enum PipelineStep {
     Average,
     Min,
     Max,
+    Any,
+    All,
     WriteCsv(Expr),
     /// Process items in batches and persist progress at each batch boundary.
     Chunk(i64),

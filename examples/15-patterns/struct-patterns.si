@@ -1,4 +1,4 @@
-# Struct patterns recursively match nominal values in declaration order.
+# Struct patterns recursively match nominal values by position or field name.
 type Address:
     city as String
 end
@@ -17,7 +17,7 @@ person is Person("Andi", Address("Surabaya"))
 result is Result::Ok(person)
 
 message is match result:
-    Result::Ok(Person(name, Address(city))):
+    Result::Ok(Person(name: name, address: Address(city: city))):
         name
     Result::Error(error):
         error

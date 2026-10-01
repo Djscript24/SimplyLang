@@ -18,7 +18,7 @@ use std::{
 
 use crate::{
     ast::{
-        BinaryOperator, Expr, Literal, PartitionRule, PipelineStep, Program, Stmt,
+        BinaryOperator, Expr, Literal, PartitionRule, PipelineStep, Program, Stmt, UnaryOperator,
         is_parallel_safe_expression,
     },
     error::{DiagnosticCode, SimplyError, Span},
@@ -28,12 +28,66 @@ use crate::{
         collections, files, limits, operations,
         scope::ScopeStack,
         value::{
-            CsvStreamVersion, EnumValue, FunctionValue, StructInstance, Value, owned_map_values,
-            owned_values, shared_map, shared_values,
+            CsvStreamVersion, EnumValue, FunctionValue, SourceContext, StructInstance, Value,
+            owned_map_values, owned_values, shared_map, shared_values,
         },
     },
-    types::Type,
+    types::{DeclarationIdentity, DeclarationKind, Type},
 };
+
+type ImportCache = Rc<RefCell<HashMap<PathBuf, (Arc<Program>, Rc<str>)>>>;
+
+fn enumerate_values(values: impl Iterator<Item = Value>) -> Result<Vec<Value>, String> {
+    let mut indexed = Vec::new();
+    let mut index = 0i64;
+    for value in values {
+        indexed
+            .try_reserve(1)
+            .map_err(|_| "`enumerate` result is too large to allocate".to_owned())?;
+        indexed.push(Value::Tuple(shared_values(vec![Value::Int(index), value])));
+        index = index
+            .checked_add(1)
+            .ok_or_else(|| "`enumerate` index exceeds the Int range".to_owned())?;
+    }
+    Ok(indexed)
+}
+
+fn sequence_values(value: Value) -> Result<Box<dyn Iterator<Item = Value>>, String> {
+    match value {
+        Value::Array(values) | Value::List(values) | Value::Tuple(values) => {
+            let mut index = 0usize;
+            Ok(Box::new(std::iter::from_fn(move || {
+                let value = values.get(index)?.clone();
+                index += 1;
+                Some(value)
+            })))
+        }
+        Value::Range { start, end, step } => Ok(Box::new(Value::range_values(start, end, step))),
+        Value::String(text) => {
+            let mut byte_index = 0usize;
+            Ok(Box::new(std::iter::from_fn(move || {
+                let character = text.get(byte_index..)?.chars().next()?;
+                byte_index += character.len_utf8();
+                Some(Value::String(character.to_string()))
+            })))
+        }
+        _ => Err("`zip` requires arrays, lists, tuples, ranges, or strings".into()),
+    }
+}
+
+fn zip_values(
+    left: impl Iterator<Item = Value>,
+    right: impl Iterator<Item = Value>,
+) -> Result<Vec<Value>, String> {
+    let mut pairs = Vec::new();
+    for (left, right) in left.zip(right) {
+        pairs
+            .try_reserve(1)
+            .map_err(|_| "`zip` result is too large to allocate".to_owned())?;
+        pairs.push(Value::Tuple(shared_values(vec![left, right])));
+    }
+    Ok(pairs)
+}
 
 fn clamp_numeric(
     value: Value,
@@ -299,6 +353,36 @@ fn total_to_f64(value: Value, span: Option<&Span>) -> Result<f64, SimplyError> {
     }
 }
 
+struct SumAccumulator {
+    total: Value,
+    has_values: bool,
+    result_type: Type,
+}
+
+impl SumAccumulator {
+    fn new(result_type: Type) -> Self {
+        Self {
+            total: Value::Int(0),
+            has_values: false,
+            result_type,
+        }
+    }
+
+    fn add(&mut self, value: Value, span: Option<&Span>) -> Result<(), SimplyError> {
+        self.total = operations::binary(self.total.clone(), &BinaryOperator::Add, value, span)?;
+        self.has_values = true;
+        Ok(())
+    }
+
+    fn finish(self) -> Value {
+        if !self.has_values && self.result_type == Type::Float {
+            Value::Float(0.0)
+        } else {
+            self.total
+        }
+    }
+}
+
 fn empty_partition_categories(rules: &[PartitionRule]) -> BTreeMap<String, Vec<Value>> {
     rules
         .iter()
@@ -371,65 +455,18 @@ fn closure_dependencies(
     body: &[Stmt],
     parameters: &[(String, Option<Type>, bool)],
 ) -> HashSet<String> {
-    let mut bound: HashSet<String> = parameters.iter().map(|(name, _, _)| name.clone()).collect();
-    collect_declared_names(body, &mut bound);
+    let mut bound = parameters
+        .iter()
+        .map(|(name, _, _)| name.clone())
+        .collect::<HashSet<_>>();
     let mut dependencies = HashSet::new();
-    collect_statement_dependencies(body, &bound, &mut dependencies);
+    collect_statement_dependencies(body, &mut bound, &mut dependencies);
     dependencies
-}
-
-fn collect_declared_names(statements: &[Stmt], names: &mut HashSet<String>) {
-    for statement in statements {
-        let statement = match statement {
-            Stmt::Located { statement, .. } => statement.as_ref(),
-            statement => statement,
-        };
-        match statement {
-            Stmt::Assign { name, .. } | Stmt::Flow { name, .. } | Stmt::Function { name, .. } => {
-                names.insert(name.clone());
-            }
-            Stmt::Destructure { pattern, .. } => {
-                names.extend(
-                    pattern
-                        .destructure_binding_names()
-                        .into_iter()
-                        .map(str::to_owned),
-                );
-            }
-            Stmt::For { name, .. } => {
-                names.insert(name.clone());
-            }
-            Stmt::If {
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                collect_declared_names(then_branch, names);
-                collect_declared_names(else_branch, names);
-            }
-            Stmt::Try {
-                try_body,
-                catches,
-                finally_body,
-            } => {
-                collect_declared_names(try_body, names);
-                for catch in catches {
-                    if let Some(binding) = &catch.binding {
-                        names.insert(binding.clone());
-                    }
-                    collect_declared_names(&catch.body, names);
-                }
-                collect_declared_names(finally_body, names);
-            }
-            Stmt::While { body, .. } => collect_declared_names(body, names),
-            _ => {}
-        }
-    }
 }
 
 fn collect_statement_dependencies(
     statements: &[Stmt],
-    bound: &HashSet<String>,
+    bound: &mut HashSet<String>,
     dependencies: &mut HashSet<String>,
 ) {
     for statement in statements {
@@ -450,8 +487,15 @@ fn collect_statement_dependencies(
             | Stmt::Return(expression) => {
                 collect_expression_dependencies(expression, bound, dependencies)
             }
-            Stmt::Assign { value, .. } | Stmt::Reassign { value, .. } => {
-                collect_expression_dependencies(value, bound, dependencies)
+            Stmt::Assign { name, value, .. } => {
+                collect_expression_dependencies(value, bound, dependencies);
+                bound.insert(name.clone());
+            }
+            Stmt::Reassign { name, value } => {
+                collect_expression_dependencies(value, bound, dependencies);
+                if !bound.contains(name) {
+                    dependencies.insert(name.clone());
+                }
             }
             Stmt::DestructureReassign { pattern, value } => {
                 collect_expression_dependencies(value, bound, dependencies);
@@ -461,18 +505,37 @@ fn collect_statement_dependencies(
                     }
                 }
             }
-            Stmt::Flow { source, steps, .. } => {
+            Stmt::Flow {
+                name,
+                source,
+                steps,
+            } => {
                 collect_expression_dependencies(source, bound, dependencies);
                 collect_pipeline_step_dependencies(steps, bound, dependencies);
+                bound.insert(name.clone());
             }
-            Stmt::SetIndex { index, value, .. } => {
+            Stmt::SetIndex {
+                name, index, value, ..
+            } => {
+                if !bound.contains(name) {
+                    dependencies.insert(name.clone());
+                }
                 collect_expression_dependencies(index, bound, dependencies);
                 collect_expression_dependencies(value, bound, dependencies);
             }
-            Stmt::Destructure { value, .. } => {
-                collect_expression_dependencies(value, bound, dependencies)
+            Stmt::Destructure { pattern, value, .. } => {
+                collect_expression_dependencies(value, bound, dependencies);
+                bound.extend(
+                    pattern
+                        .destructure_binding_names()
+                        .into_iter()
+                        .map(str::to_owned),
+                );
             }
-            Stmt::CollectionOp { value, .. } => {
+            Stmt::CollectionOp { name, value, .. } => {
+                if !bound.contains(name) {
+                    dependencies.insert(name.clone());
+                }
                 collect_expression_dependencies(value, bound, dependencies)
             }
             Stmt::If {
@@ -481,35 +544,54 @@ fn collect_statement_dependencies(
                 else_branch,
             } => {
                 collect_expression_dependencies(condition, bound, dependencies);
-                collect_statement_dependencies(then_branch, bound, dependencies);
-                collect_statement_dependencies(else_branch, bound, dependencies);
+                let mut then_bound = bound.clone();
+                collect_statement_dependencies(then_branch, &mut then_bound, dependencies);
+                let mut else_bound = bound.clone();
+                collect_statement_dependencies(else_branch, &mut else_bound, dependencies);
             }
             Stmt::Try {
                 try_body,
                 catches,
                 finally_body,
             } => {
-                collect_statement_dependencies(try_body, bound, dependencies);
+                let mut try_bound = bound.clone();
+                collect_statement_dependencies(try_body, &mut try_bound, dependencies);
                 for catch in catches {
-                    collect_statement_dependencies(&catch.body, bound, dependencies);
+                    let mut catch_bound = bound.clone();
+                    if let Some(binding) = &catch.binding {
+                        catch_bound.insert(binding.clone());
+                    }
+                    collect_statement_dependencies(&catch.body, &mut catch_bound, dependencies);
                 }
-                collect_statement_dependencies(finally_body, bound, dependencies);
+                let mut finally_bound = bound.clone();
+                collect_statement_dependencies(finally_body, &mut finally_bound, dependencies);
             }
             Stmt::Function {
                 parameters, body, ..
             } => {
                 let nested = closure_dependencies(body, parameters);
                 dependencies.extend(nested.into_iter().filter(|name| !bound.contains(name)));
+                if let Stmt::Function { name, .. } = statement {
+                    bound.insert(name.clone());
+                }
             }
-            Stmt::For { iterable, body, .. } => {
+            Stmt::For {
+                name,
+                iterable,
+                body,
+                ..
+            } => {
                 collect_expression_dependencies(iterable, bound, dependencies);
-                collect_statement_dependencies(body, bound, dependencies);
+                let mut body_bound = bound.clone();
+                body_bound.insert(name.clone());
+                collect_statement_dependencies(body, &mut body_bound, dependencies);
             }
             Stmt::While { condition, body } => {
                 collect_expression_dependencies(condition, bound, dependencies);
                 collect_statement_dependencies(body, bound, dependencies);
             }
             Stmt::Import { .. }
+            | Stmt::Export { .. }
             | Stmt::Struct { .. }
             | Stmt::Enum { .. }
             | Stmt::Message { .. }
@@ -575,16 +657,10 @@ fn collect_expression_dependencies(
             for arm in arms {
                 let mut arm_bound = bound.clone();
                 collect_pattern_bindings(&arm.pattern, &mut arm_bound);
-                for statement in &arm.body {
-                    collect_statement_dependencies(
-                        std::slice::from_ref(statement),
-                        &arm_bound,
-                        dependencies,
-                    );
-                }
                 if let Some(guard) = &arm.guard {
                     collect_expression_dependencies(guard, &arm_bound, dependencies);
                 }
+                collect_statement_dependencies(&arm.body, &mut arm_bound, dependencies);
                 if let Some(result) = &arm.result {
                     collect_expression_dependencies(result, &arm_bound, dependencies);
                 }
@@ -631,6 +707,11 @@ fn collect_expression_dependencies(
                             collect_pattern_bindings(pattern, bindings);
                         }
                     }
+                    crate::ast::MatchPattern::NamedStruct { fields, .. } => {
+                        for (_, pattern) in fields {
+                            collect_pattern_bindings(pattern, bindings);
+                        }
+                    }
                     crate::ast::MatchPattern::Hash(entries) => {
                         for (_, pattern) in entries {
                             collect_pattern_bindings(pattern, bindings);
@@ -671,7 +752,10 @@ fn collect_pipeline_step_dependencies(
 ) {
     for step in steps {
         match step {
-            PipelineStep::Where(expression) | PipelineStep::Derive(expression) => {
+            PipelineStep::Where(expression)
+            | PipelineStep::Derive(expression)
+            | PipelineStep::TakeWhile(expression)
+            | PipelineStep::DropWhile(expression) => {
                 let mut item_bound = bound.clone();
                 item_bound.insert("item".into());
                 collect_expression_dependencies(expression, &item_bound, dependencies);
@@ -691,21 +775,44 @@ fn collect_pipeline_step_dependencies(
             | PipelineStep::Average
             | PipelineStep::Min
             | PipelineStep::Max
+            | PipelineStep::Any
+            | PipelineStep::All
             | PipelineStep::Chunk(_)
-            | PipelineStep::Parallel(_) => {}
+            | PipelineStep::Parallel(_)
+            | PipelineStep::Take(_)
+            | PipelineStep::Skip(_)
+            | PipelineStep::StepBy(_)
+            | PipelineStep::Distinct => {}
         }
     }
 }
 
 #[derive(Clone)]
 struct StructDefinition {
+    identity: DeclarationIdentity,
     fields: Vec<crate::ast::StructField>,
 }
 
 #[derive(Clone)]
 struct EnumDefinition {
+    identity: DeclarationIdentity,
     variants: Vec<crate::ast::EnumVariant>,
 }
+
+#[derive(Clone)]
+enum ExportedRuntimeType {
+    Struct {
+        definition: StructDefinition,
+        messages: HashMap<(DeclarationIdentity, String), MessageBehavior>,
+    },
+    Enum(EnumDefinition),
+}
+
+type ImportedModule = (
+    Value,
+    HashMap<String, Value>,
+    HashMap<String, ExportedRuntimeType>,
+);
 
 #[derive(Clone)]
 struct MessageBehavior {
@@ -722,15 +829,19 @@ struct ActiveMessageState {
 pub struct Evaluator {
     scopes: ScopeStack,
     variable_types: TypeScopes,
-    function_scopes: Vec<HashMap<String, Arc<Function>>>,
+    function_scopes: Vec<HashMap<String, Rc<Function>>>,
     struct_scopes: Vec<HashMap<String, StructDefinition>>,
     enum_scopes: Vec<HashMap<String, EnumDefinition>>,
-    message_scopes: Vec<HashMap<(String, String), MessageBehavior>>,
+    message_scopes: Vec<HashMap<(DeclarationIdentity, String), MessageBehavior>>,
+    hoisted_functions: HashSet<(usize, String)>,
     active_message_states: Vec<ActiveMessageState>,
     current_span: Option<Span>,
     current_file: Option<PathBuf>,
+    module_identity: String,
+    current_source: Option<Rc<str>>,
     import_stack: Vec<PathBuf>,
-    import_cache: Rc<RefCell<HashMap<PathBuf, Arc<Program>>>>,
+    module_is_imported: bool,
+    import_cache: ImportCache,
     output_enabled: bool,
     call_depth: usize,
 }
@@ -785,6 +896,20 @@ impl TypeScopes {
         self.scopes.get(scope_index)?.get(name)
     }
 
+    fn replace_visible(&mut self, name: &str, typ: Type) {
+        let Some(scope_index) = self
+            .bindings
+            .get(name)
+            .and_then(|indices| indices.last())
+            .copied()
+        else {
+            return;
+        };
+        if let Some(scope) = self.scopes.get_mut(scope_index) {
+            scope.insert(name.to_owned(), typ);
+        }
+    }
+
     fn push(&mut self) {
         self.scopes
             .push(self.reusable_scopes.pop().unwrap_or_default());
@@ -820,6 +945,52 @@ impl Default for TypeScopes {
 }
 
 impl Evaluator {
+    fn identity(&self, name: &str, kind: DeclarationKind) -> DeclarationIdentity {
+        DeclarationIdentity::new(self.module_identity.clone(), name, kind)
+    }
+
+    fn resolve_type_identity(&self, typ: &Type) -> Type {
+        match typ {
+            Type::Struct(identity) if identity.is_unresolved() => {
+                Type::Struct(self.identity(&identity.local_name, DeclarationKind::Struct))
+            }
+            Type::Enum(identity) if identity.is_unresolved() => {
+                Type::Enum(self.identity(&identity.local_name, DeclarationKind::Enum))
+            }
+            Type::Array(element) => Type::Array(Box::new(self.resolve_type_identity(element))),
+            Type::List(element) => Type::List(Box::new(self.resolve_type_identity(element))),
+            Type::Tuple(elements) => Type::Tuple(
+                elements
+                    .iter()
+                    .map(|element| self.resolve_type_identity(element))
+                    .collect(),
+            ),
+            Type::HashValues(element) => {
+                Type::HashValues(Box::new(self.resolve_type_identity(element)))
+            }
+            Type::TreeValues(element) => {
+                Type::TreeValues(Box::new(self.resolve_type_identity(element)))
+            }
+            Type::Function {
+                parameters,
+                return_type,
+            } => Type::Function {
+                parameters: parameters
+                    .iter()
+                    .map(|parameter| {
+                        parameter
+                            .as_ref()
+                            .map(|typ| Box::new(self.resolve_type_identity(typ)))
+                    })
+                    .collect(),
+                return_type: return_type
+                    .as_ref()
+                    .map(|typ| Box::new(self.resolve_type_identity(typ))),
+            },
+            _ => typ.clone(),
+        }
+    }
+
     fn track_function(&mut self, function: Rc<FunctionValue>) -> Rc<FunctionValue> {
         function
     }
@@ -971,6 +1142,7 @@ struct Function {
     parameters: Vec<(String, Option<Type>, bool)>,
     return_type: Option<Type>,
     body: Arc<[Stmt]>,
+    source: Option<SourceContext>,
 }
 
 impl Evaluator {
@@ -982,6 +1154,8 @@ impl Evaluator {
             struct_scopes: vec![HashMap::new()],
             enum_scopes: vec![HashMap::new()],
             message_scopes: vec![HashMap::new()],
+            module_identity: "memory://root".into(),
+            module_is_imported: false,
             output_enabled: true,
             ..Self::default()
         }
@@ -992,9 +1166,9 @@ impl Evaluator {
     }
 
     fn register_declarations(&mut self, statements: &[Stmt]) -> Result<(), SimplyError> {
-        for statement in statements.iter().filter_map(|statement| match statement {
-            Stmt::Located { statement, .. } => Some(statement.as_ref()),
-            statement => Some(statement),
+        for statement in statements.iter().map(|statement| match statement {
+            Stmt::Located { statement, .. } => statement.as_ref(),
+            statement => statement,
         }) {
             if let Stmt::Enum { name, variants } = statement {
                 let existing_type = self.lookup_struct(name).is_some()
@@ -1008,20 +1182,33 @@ impl Evaluator {
                         format!("type `{name}` is already declared"),
                     ));
                 }
+                let identity = self.identity(name, DeclarationKind::Enum);
+                let resolved_variants = variants
+                    .iter()
+                    .cloned()
+                    .map(|mut variant| {
+                        variant.payload_type = variant
+                            .payload_type
+                            .as_ref()
+                            .map(|typ| self.resolve_type_identity(typ));
+                        variant
+                    })
+                    .collect();
                 self.enum_scopes
                     .last_mut()
                     .expect("enum scope stack always has a scope")
                     .insert(
                         name.clone(),
                         EnumDefinition {
-                            variants: variants.clone(),
+                            identity,
+                            variants: resolved_variants,
                         },
                     );
             }
         }
-        for statement in statements.iter().filter_map(|statement| match statement {
-            Stmt::Located { statement, .. } => Some(statement.as_ref()),
-            statement => Some(statement),
+        for statement in statements.iter().map(|statement| match statement {
+            Stmt::Located { statement, .. } => statement.as_ref(),
+            statement => statement,
         }) {
             if let Stmt::Struct { name, fields } = statement {
                 if self
@@ -1044,20 +1231,30 @@ impl Evaluator {
                         format!("type `{name}` is already declared"),
                     ));
                 }
+                let identity = self.identity(name, DeclarationKind::Struct);
+                let resolved_fields = fields
+                    .iter()
+                    .cloned()
+                    .map(|mut field| {
+                        field.field_type = self.resolve_type_identity(&field.field_type);
+                        field
+                    })
+                    .collect();
                 self.struct_scopes
                     .last_mut()
                     .expect("struct scope stack always has a scope")
                     .insert(
                         name.clone(),
                         StructDefinition {
-                            fields: fields.clone(),
+                            identity,
+                            fields: resolved_fields,
                         },
                     );
             }
         }
-        for statement in statements.iter().filter_map(|statement| match statement {
-            Stmt::Located { statement, .. } => Some(statement.as_ref()),
-            statement => Some(statement),
+        for statement in statements.iter().map(|statement| match statement {
+            Stmt::Located { statement, .. } => statement.as_ref(),
+            statement => statement,
         }) {
             if let Stmt::Message {
                 receiver_type,
@@ -1072,7 +1269,7 @@ impl Evaluator {
                         format!("unknown receiver type `{receiver_type}` for message `{name}`"),
                     )
                 })?;
-                let key = (receiver_type.clone(), name.clone());
+                let key = (definition.identity.clone(), name.clone());
                 if self
                     .message_scopes
                     .last()
@@ -1088,12 +1285,20 @@ impl Evaluator {
                     .iter()
                     .map(|field| (field.name.clone(), Some(field.field_type.clone()), true))
                     .collect::<Vec<_>>();
-                function_parameters.extend(parameters.iter().cloned());
+                function_parameters.extend(parameters.iter().map(|(parameter, typ, mutable)| {
+                    (
+                        parameter.clone(),
+                        typ.as_ref().map(|typ| self.resolve_type_identity(typ)),
+                        *mutable,
+                    )
+                }));
                 let function = Rc::new(FunctionValue {
+                    name: None,
                     parameters: function_parameters,
                     return_type: None,
                     body: Arc::clone(body),
                     captures: RefCell::new(HashMap::new()),
+                    source: self.function_source_context(),
                 });
                 self.message_scopes
                     .last_mut()
@@ -1124,14 +1329,26 @@ impl Evaluator {
             .find_map(|scope| scope.get(name))
     }
 
+    fn lookup_struct_identity(&self, identity: &DeclarationIdentity) -> Option<&StructDefinition> {
+        self.struct_scopes
+            .iter()
+            .rev()
+            .flat_map(|scope| scope.values())
+            .find(|definition| &definition.identity == identity)
+    }
+
     pub(crate) fn enum_names(&self) -> impl Iterator<Item = String> + '_ {
         self.enum_scopes
             .iter()
             .flat_map(|scope| scope.keys().cloned())
     }
 
-    fn lookup_message(&self, type_name: &str, message: &str) -> Option<&MessageBehavior> {
-        let key = (type_name.to_owned(), message.to_owned());
+    fn lookup_message(
+        &self,
+        type_identity: &DeclarationIdentity,
+        message: &str,
+    ) -> Option<&MessageBehavior> {
+        let key = (type_identity.clone(), message.to_owned());
         self.message_scopes
             .iter()
             .rev()
@@ -1144,7 +1361,9 @@ impl Evaluator {
         resolved: &Path,
     ) -> Result<(), SimplyError> {
         self.current_file = Some(resolved.to_path_buf());
+        self.module_identity = resolved.display().to_string();
         self.import_stack = vec![resolved.to_path_buf()];
+        self.module_is_imported = false;
         self.run_with_output(program, false)
     }
 
@@ -1155,6 +1374,7 @@ impl Evaluator {
     ) -> Result<(), SimplyError> {
         self.output_enabled = output_enabled;
         self.register_declarations(&program.statements)?;
+        self.register_top_level_functions(&program.statements)?;
         match self.execute_statements(&program.statements)? {
             Flow::None => Ok(()),
             _ => Err(self.runtime_error("control statement is outside its valid context".into())),
@@ -1188,6 +1408,90 @@ impl Evaluator {
         Ok(())
     }
 
+    fn register_top_level_functions(&mut self, statements: &[Stmt]) -> Result<(), SimplyError> {
+        if self.import_stack.len() > 1 || self.function_scopes.len() != 1 {
+            return Ok(());
+        }
+        for statement in statements.iter().map(|statement| match statement {
+            Stmt::Located { statement, .. } => statement.as_ref(),
+            statement => statement,
+        }) {
+            let Stmt::Function {
+                name,
+                parameters,
+                return_type,
+                body,
+            } = statement
+            else {
+                continue;
+            };
+            if self.scopes.has_in_current_scope(name)
+                || self
+                    .function_scopes
+                    .last()
+                    .is_some_and(|scope| scope.contains_key(name))
+            {
+                return Err(self.runtime_error_with_code(
+                    DiagnosticCode::DuplicateDeclaration,
+                    format!("function `{name}` is already declared in this scope"),
+                ));
+            }
+            let source = self.function_source_context();
+            let resolved_parameters = parameters
+                .iter()
+                .map(|(name, typ, mutable)| {
+                    (
+                        name.clone(),
+                        typ.as_ref().map(|typ| self.resolve_type_identity(typ)),
+                        *mutable,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let resolved_return_type = return_type
+                .as_ref()
+                .map(|typ| self.resolve_type_identity(typ));
+            let function_value = self.track_function(Rc::new(FunctionValue {
+                name: Some(name.clone()),
+                parameters: resolved_parameters.clone(),
+                return_type: resolved_return_type.clone(),
+                body: Arc::clone(body),
+                captures: RefCell::new(HashMap::new()),
+                source: source.clone(),
+            }));
+            self.function_scopes
+                .last_mut()
+                .expect("function scope stack always has a global scope")
+                .insert(
+                    name.clone(),
+                    Rc::new(Function {
+                        parameters: resolved_parameters.clone(),
+                        return_type: resolved_return_type.clone(),
+                        body: Arc::clone(body),
+                        source,
+                    }),
+                );
+            self.variable_types.define(
+                name.clone(),
+                Type::Function {
+                    parameters: resolved_parameters
+                        .iter()
+                        .map(|(_, typ, _)| typ.clone().map(Box::new))
+                        .collect(),
+                    return_type: resolved_return_type.map(Box::new),
+                },
+                false,
+            );
+            self.scopes
+                .define(name.clone(), Value::Function(function_value), false)
+                .map_err(|error| {
+                    self.runtime_error_with_code(DiagnosticCode::DuplicateDeclaration, error)
+                })?;
+            self.hoisted_functions
+                .insert((self.scopes.current_scope_index(), name.clone()));
+        }
+        Ok(())
+    }
+
     pub fn run_file(&mut self, path: &Path) -> Result<(), SimplyError> {
         let resolved = fs::canonicalize(path).map_err(|error| self.file_error(path, error))?;
         let source =
@@ -1195,7 +1499,10 @@ impl Evaluator {
         let tokens = Lexer::new(&source).tokenize()?;
         let program = Parser::new(tokens).parse()?;
         self.current_file = Some(resolved.clone());
+        self.module_identity = resolved.display().to_string();
+        self.current_source = Some(Rc::from(source));
         self.import_stack = vec![resolved];
+        self.module_is_imported = false;
         self.run(&program)
     }
 
@@ -1221,11 +1528,113 @@ impl Evaluator {
                         print_value(&value, true);
                     }
                 }
-                Stmt::Import { path, alias } => {
-                    let value = self.load_import(path)?;
-                    self.define(alias.clone(), value).map_err(|error| {
-                        self.runtime_error_with_code(DiagnosticCode::DuplicateDeclaration, error)
-                    })?;
+                Stmt::Import {
+                    path,
+                    alias,
+                    exposing,
+                } => {
+                    let (value, exports, exported_types) = self.load_import(path)?;
+                    if let Some(alias) = alias {
+                        self.define(alias.clone(), value).map_err(|error| {
+                            self.runtime_error_with_code(
+                                DiagnosticCode::DuplicateDeclaration,
+                                error,
+                            )
+                        })?;
+                    } else {
+                        let mut bindings = Vec::with_capacity(exposing.len());
+                        let mut local_names = HashSet::with_capacity(exposing.len());
+                        for (exported, local) in exposing {
+                            if !local_names.insert(local) {
+                                return Err(self.runtime_error_with_code(
+                                    DiagnosticCode::DuplicateDeclaration,
+                                    format!("`{local}` is imported more than once"),
+                                ));
+                            }
+                            let Some(value) = exports.get(exported) else {
+                                if exported_types.contains_key(exported) {
+                                    continue;
+                                }
+                                return Err(self.runtime_error_with_code(
+                                    DiagnosticCode::RuntimeImport,
+                                    format!("module does not export `{exported}`"),
+                                ));
+                            };
+                            if self.scopes.has_in_current_scope(local)
+                                || self.lookup_struct(local).is_some()
+                                || self.lookup_enum(local).is_some()
+                            {
+                                return Err(self.runtime_error_with_code(
+                                    DiagnosticCode::DuplicateDeclaration,
+                                    format!("`{local}` is already declared in this scope"),
+                                ));
+                            }
+                            bindings.push((local.clone(), value.clone()));
+                        }
+                        for (name, value) in bindings {
+                            self.variable_types.define(
+                                name.clone(),
+                                Self::type_of_value(&value),
+                                false,
+                            );
+                            self.define(name, value).map_err(|error| {
+                                self.runtime_error_with_code(
+                                    DiagnosticCode::DuplicateDeclaration,
+                                    error,
+                                )
+                            })?;
+                        }
+                        for (exported, local) in exposing {
+                            let Some(exported_type) = exported_types.get(exported) else {
+                                continue;
+                            };
+                            match exported_type {
+                                ExportedRuntimeType::Struct {
+                                    definition,
+                                    messages,
+                                } => {
+                                    if self.lookup_struct(local).is_some()
+                                        || self.lookup_enum(local).is_some()
+                                    {
+                                        return Err(self.runtime_error_with_code(
+                                            DiagnosticCode::DuplicateDeclaration,
+                                            format!("type `{local}` is already declared"),
+                                        ));
+                                    }
+                                    self.struct_scopes
+                                        .last_mut()
+                                        .expect("struct scope stack always has a scope")
+                                        .insert(local.clone(), definition.clone());
+                                    self.message_scopes
+                                        .last_mut()
+                                        .expect("message scope stack always has a scope")
+                                        .extend(messages.clone());
+                                }
+                                ExportedRuntimeType::Enum(definition) => {
+                                    if self.lookup_struct(local).is_some()
+                                        || self.lookup_enum(local).is_some()
+                                    {
+                                        return Err(self.runtime_error_with_code(
+                                            DiagnosticCode::DuplicateDeclaration,
+                                            format!("type `{local}` is already declared"),
+                                        ));
+                                    }
+                                    self.enum_scopes
+                                        .last_mut()
+                                        .expect("enum scope stack always has a scope")
+                                        .insert(local.clone(), definition.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                Stmt::Export { .. } => {
+                    if !self.module_is_imported || self.scopes.current_scope_index() != 0 {
+                        return Err(self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeImport,
+                            "`export` is only allowed at the top level of an imported module",
+                        ));
+                    }
                 }
                 Stmt::Expression(expr) => {
                     self.evaluate(expr)?;
@@ -1238,9 +1647,9 @@ impl Evaluator {
                 } => {
                     let value = self.evaluate(value)?;
                     if let Some(expected) = declared_type {
-                        self.ensure_type(&value, expected, name)?;
-                        self.variable_types
-                            .define(name.clone(), expected.clone(), *mutable);
+                        let expected = self.resolve_type_identity(expected);
+                        self.ensure_type(&value, &expected, name)?;
+                        self.variable_types.define(name.clone(), expected, *mutable);
                     } else {
                         self.variable_types.define(
                             name.clone(),
@@ -1324,10 +1733,15 @@ impl Evaluator {
                         ));
                     }
                     let value = self.evaluate(value)?;
-                    if let Some(expected) = self.variable_types.lookup(name)
-                        && let Type::List(element) = expected
-                    {
-                        self.ensure_type(&value, element, name)?;
+                    if let Some(Type::List(element)) = self.variable_types.lookup(name).cloned() {
+                        if *element == Type::Unknown {
+                            self.variable_types.replace_visible(
+                                name,
+                                Type::List(Box::new(Self::type_of_value(&value))),
+                            );
+                        } else {
+                            self.ensure_type(&value, &element, name)?;
+                        }
                     }
                     let span = self.current_span.clone();
                     let target = match self.lookup_mut(name) {
@@ -1416,16 +1830,35 @@ impl Evaluator {
                     return_type,
                     body,
                 } => {
+                    let source = self.function_source_context();
+                    let resolved_parameters = parameters
+                        .iter()
+                        .map(|(name, typ, mutable)| {
+                            (
+                                name.clone(),
+                                typ.as_ref().map(|typ| self.resolve_type_identity(typ)),
+                                *mutable,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let resolved_return_type = return_type
+                        .as_ref()
+                        .map(|typ| self.resolve_type_identity(typ));
                     let function = self.track_function(Rc::new(FunctionValue {
-                        parameters: parameters.clone(),
-                        return_type: return_type.clone(),
+                        name: Some(name.clone()),
+                        parameters: resolved_parameters.clone(),
+                        return_type: resolved_return_type.clone(),
                         body: Arc::clone(body),
-                        captures: RefCell::new(if self.function_scopes.len() > 1 {
-                            let dependencies = closure_dependencies(body, parameters);
-                            self.scopes.values_for(&dependencies)
-                        } else {
-                            HashMap::new()
-                        }),
+                        captures: RefCell::new(
+                            if self.function_scopes.len() > 1 || self.import_stack.len() > 1 {
+                                let mut dependencies = closure_dependencies(body, parameters);
+                                dependencies.remove(name);
+                                self.scopes.values_for(&dependencies)
+                            } else {
+                                HashMap::new()
+                            },
+                        ),
+                        source: source.clone(),
                     }));
                     let function_value = Value::Function(function);
                     self.function_scopes
@@ -1433,31 +1866,43 @@ impl Evaluator {
                         .expect("function scope stack always has a global scope")
                         .insert(
                             name.clone(),
-                            Arc::new(Function {
-                                parameters: parameters.clone(),
-                                return_type: return_type.clone(),
+                            Rc::new(Function {
+                                parameters: resolved_parameters.clone(),
+                                return_type: resolved_return_type.clone(),
                                 body: Arc::clone(body),
+                                source,
                             }),
                         );
                     self.variable_types.define(
                         name.clone(),
                         Type::Function {
-                            parameters: parameters
+                            parameters: resolved_parameters
                                 .iter()
                                 .map(|(_, typ, _)| typ.clone().map(Box::new))
                                 .collect(),
-                            return_type: return_type.clone().map(Box::new),
+                            return_type: resolved_return_type.clone().map(Box::new),
                         },
                         false,
                     );
-                    self.scopes
-                        .define(name.clone(), function_value, false)
-                        .map_err(|error| {
-                            self.runtime_error_with_code(
-                                DiagnosticCode::DuplicateDeclaration,
-                                error,
-                            )
-                        })?;
+                    if self
+                        .hoisted_functions
+                        .remove(&(self.scopes.current_scope_index(), name.clone()))
+                    {
+                        if !self.scopes.assign_current(name, function_value) {
+                            return Err(self.runtime_error(format!(
+                                "hoisted function `{name}` is missing its runtime binding"
+                            )));
+                        }
+                    } else {
+                        self.scopes
+                            .define(name.clone(), function_value, false)
+                            .map_err(|error| {
+                                self.runtime_error_with_code(
+                                    DiagnosticCode::DuplicateDeclaration,
+                                    error,
+                                )
+                            })?;
+                    }
                 }
                 Stmt::Struct { .. } | Stmt::Enum { .. } | Stmt::Message { .. } => {}
                 Stmt::Return(expr) => return Ok(Flow::Return(self.evaluate(expr)?)),
@@ -1475,7 +1920,9 @@ impl Evaluator {
                     body,
                 } => {
                     let values: Box<dyn Iterator<Item = Value>> = match self.evaluate(iterable)? {
-                        Value::Range { start, end } => Box::new(Value::range_values(start, end)),
+                        Value::Range { start, end, step } => {
+                            Box::new(Value::range_values(start, end, step))
+                        }
                         Value::Array(values) | Value::List(values) | Value::Tuple(values) => {
                             Box::new(owned_values(values).into_iter())
                         }
@@ -1485,29 +1932,32 @@ impl Evaluator {
                         _ => return Err(self.runtime_error("for requires a collection".into())),
                     };
                     self.push_scope();
-                    for value in values {
-                        if self.scopes.has_in_current_scope(name) {
-                            self.scopes.assign_current(name, value);
-                        } else {
-                            self.scopes
-                                .define(name.clone(), value, *mutable)
-                                .map_err(|error| {
-                                    self.runtime_error_with_code(
-                                        DiagnosticCode::DuplicateDeclaration,
-                                        error,
-                                    )
-                                })?;
-                        }
-                        match self.execute_statements(body)? {
-                            Flow::None | Flow::Continue => {}
-                            Flow::Break => break,
-                            Flow::Return(value) => {
-                                self.pop_scope();
-                                return Ok(Flow::Return(value));
+                    let result = (|| {
+                        for value in values {
+                            if self.scopes.has_in_current_scope(name) {
+                                self.scopes.assign_current(name, value);
+                            } else {
+                                self.scopes.define(name.clone(), value, *mutable).map_err(
+                                    |error| {
+                                        self.runtime_error_with_code(
+                                            DiagnosticCode::DuplicateDeclaration,
+                                            error,
+                                        )
+                                    },
+                                )?;
+                            }
+                            match self.execute_statements(body)? {
+                                Flow::None | Flow::Continue => {}
+                                Flow::Break => break,
+                                Flow::Return(value) => return Ok(Some(value)),
                             }
                         }
-                    }
+                        Ok(None)
+                    })();
                     self.pop_scope();
+                    if let Some(value) = result? {
+                        return Ok(Flow::Return(value));
+                    }
                 }
                 Stmt::While { condition, body } => {
                     while match self.evaluate(condition)? {
@@ -1625,7 +2075,7 @@ impl Evaluator {
         Value::Tree(shared_map(fields))
     }
 
-    fn load_import(&mut self, path: &str) -> Result<Value, SimplyError> {
+    fn load_import(&mut self, path: &str) -> Result<ImportedModule, SimplyError> {
         let base = self
             .current_file
             .as_deref()
@@ -1639,46 +2089,152 @@ impl Evaluator {
         };
         let resolved =
             fs::canonicalize(&resolved).map_err(|error| self.file_error(&resolved, error))?;
-        if self.import_stack.contains(&resolved) {
+        if let Some(cycle_start) = self
+            .import_stack
+            .iter()
+            .position(|imported| imported == &resolved)
+        {
+            let mut chain = self.import_stack[cycle_start..]
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>();
+            chain.push(resolved.display().to_string());
             return Err(self.runtime_error_with_code(
                 DiagnosticCode::RuntimeImport,
-                format!("cyclic import of `{path}`"),
+                format!("cyclic import: {}", chain.join(" -> ")),
             ));
         }
-        let program = if let Some(program) = self.import_cache.borrow().get(&resolved) {
-            Arc::clone(program)
+        let (program, source) = if let Some(cached) = self.import_cache.borrow().get(&resolved) {
+            (Arc::clone(&cached.0), Rc::clone(&cached.1))
         } else {
             let source =
                 fs::read_to_string(&resolved).map_err(|error| self.file_error(&resolved, error))?;
-            let tokens = Lexer::new(&source).tokenize()?;
-            let program = Parser::new(tokens).parse()?;
+            let tokens = Lexer::new(&source)
+                .tokenize()
+                .map_err(|error| error.in_source(resolved.display().to_string(), source.clone()))?;
+            let program = Parser::new(tokens)
+                .parse()
+                .map_err(|error| error.in_source(resolved.display().to_string(), source.clone()))?;
             let program = Arc::new(program);
+            let source: Rc<str> = Rc::from(source);
             self.import_cache
                 .borrow_mut()
-                .insert(resolved.clone(), Arc::clone(&program));
-            program
+                .insert(resolved.clone(), (Arc::clone(&program), Rc::clone(&source)));
+            (program, source)
         };
         let mut module = Self {
             current_file: Some(resolved.clone()),
+            module_identity: resolved.display().to_string(),
+            current_source: Some(Rc::clone(&source)),
             import_stack: self
                 .import_stack
                 .iter()
                 .cloned()
                 .chain(std::iter::once(resolved.clone()))
                 .collect(),
+            module_is_imported: true,
             import_cache: Rc::clone(&self.import_cache),
             ..Self::new()
         };
-        module.register_declarations(&program.statements)?;
-        match module.execute_statements(&program.statements)? {
-            Flow::Return(value) => Ok(value),
-            Flow::None => {
-                Err(self.runtime_error(format!("imported file `{path}` must return a value")))
-            }
-            Flow::Break | Flow::Continue => {
-                Err(self.runtime_error("control statement is outside its valid context".into()))
+        let mut export_names = Vec::new();
+        let mut seen_exports = HashSet::new();
+        for statement in &program.statements {
+            let statement = match statement {
+                Stmt::Located { statement, .. } => statement.as_ref(),
+                statement => statement,
+            };
+            if let Stmt::Export { names } = statement {
+                for name in names {
+                    if !seen_exports.insert(name.clone()) {
+                        return Err(module.runtime_error_with_code(
+                            DiagnosticCode::RuntimeImport,
+                            format!("`{name}` is exported more than once"),
+                        ));
+                    }
+                    export_names.push(name.clone());
+                }
             }
         }
+        let result = (|| {
+            module.register_declarations(&program.statements)?;
+            let returned_value = match module.execute_statements(&program.statements)? {
+                Flow::Return(value) => value,
+                Flow::None => {
+                    return Err(
+                        module.runtime_error(format!("imported file `{path}` must return a value"))
+                    );
+                }
+                Flow::Break | Flow::Continue => {
+                    return Err(module
+                        .runtime_error("control statement is outside its valid context".into()));
+                }
+            };
+            let mut exports = HashMap::new();
+            let mut exported_types = HashMap::new();
+            for name in export_names {
+                if let Some(value) = module.lookup(&name).cloned() {
+                    if let Value::Function(function) = &value
+                        && function.captures.borrow().is_empty()
+                    {
+                        let mut dependencies =
+                            closure_dependencies(&function.body, &function.parameters);
+                        if let Some(function_name) = &function.name {
+                            dependencies.remove(function_name);
+                        }
+                        function
+                            .captures
+                            .replace(module.scopes.values_for(&dependencies));
+                    }
+                    exports.insert(name, value);
+                    continue;
+                }
+                if let Some(definition) = module.lookup_struct(&name).cloned() {
+                    let messages = module
+                        .message_scopes
+                        .iter()
+                        .flat_map(|scope| scope.iter())
+                        .filter(|((identity, _), _)| identity == &definition.identity)
+                        .map(|(key, behavior)| {
+                            let behavior = behavior.clone();
+                            let mut dependencies = closure_dependencies(
+                                &behavior.function.body,
+                                &behavior.function.parameters,
+                            );
+                            for (parameter, _, _) in &behavior.function.parameters {
+                                dependencies.remove(parameter);
+                            }
+                            behavior
+                                .function
+                                .captures
+                                .replace(module.scopes.values_for(&dependencies));
+                            (key.clone(), behavior)
+                        })
+                        .collect();
+                    exported_types.insert(
+                        name,
+                        ExportedRuntimeType::Struct {
+                            definition,
+                            messages,
+                        },
+                    );
+                    continue;
+                }
+                if let Some(definition) = module.lookup_enum(&name).cloned() {
+                    exported_types.insert(name, ExportedRuntimeType::Enum(definition));
+                    continue;
+                }
+                return Err(module.runtime_error_with_code(
+                    DiagnosticCode::RuntimeImport,
+                    format!("cannot export unknown value `{name}` or type"),
+                ));
+            }
+            Ok((returned_value, exports, exported_types))
+        })();
+        result.map_err(|error: SimplyError| {
+            error
+                .in_source(resolved.display().to_string(), source.as_ref().to_owned())
+                .with_context(format!("in imported module `{}`", resolved.display()))
+        })
     }
 
     fn file_error(&self, path: &Path, error: std::io::Error) -> SimplyError {
@@ -1686,6 +2242,16 @@ impl Evaluator {
             DiagnosticCode::RuntimeImport,
             format!("could not open `{}`: {error}", path.display()),
         )
+    }
+
+    fn function_source_context(&self) -> Option<SourceContext> {
+        if self.import_stack.len() <= 1 {
+            return None;
+        }
+        Some(SourceContext {
+            filename: self.current_file.as_ref()?.display().to_string(),
+            source: Rc::clone(self.current_source.as_ref()?),
+        })
     }
 
     fn evaluate(&mut self, expr: &Expr) -> Result<Value, SimplyError> {
@@ -1715,32 +2281,34 @@ impl Evaluator {
                 Ok(Value::Tree(shared_map(values)))
             }
             Expr::Pipeline { source, steps } => {
-                let source = match self.evaluate(source)? {
+                let sum_type = self.pipeline_sum_type(source, steps);
+                let result = match self.evaluate(source)? {
                     Value::CsvStream {
                         path,
                         start_record,
                         start_offset,
                         source_version,
-                    } => {
-                        return self.evaluate_csv_pipeline(
-                            &path,
-                            start_record,
-                            start_offset,
-                            source_version.as_ref(),
-                            steps,
-                        );
+                    } => self.evaluate_csv_pipeline(
+                        &path,
+                        start_record,
+                        start_offset,
+                        source_version.as_ref(),
+                        steps,
+                        sum_type.clone(),
+                    )?,
+                    Value::Range { start, end, step } => {
+                        self.evaluate_range_pipeline(start, end, step, steps, sum_type.clone())?
                     }
-                    Value::Range { start, end } => {
-                        return self.evaluate_range_pipeline(start, end, steps);
+                    Value::Array(values) | Value::List(values) => {
+                        self.evaluate_pipeline(owned_values(values), steps, sum_type.clone())?
                     }
-                    Value::Array(values) | Value::List(values) => owned_values(values),
                     _ => {
                         return Err(
                             self.runtime_error("pipeline source must be an array or list".into())
                         );
                     }
                 };
-                self.evaluate_pipeline(source, steps)
+                Ok(result)
             }
             Expr::Identifier(name) => self
                 .lookup(name)
@@ -1865,6 +2433,34 @@ impl Evaluator {
                         print_value(&value, true);
                     }
                     return Ok(Value::Unit);
+                }
+                if name == "assert" {
+                    if !(1..=2).contains(&arguments.len()) {
+                        return Err(self.runtime_error(
+                            "`assert` expects a condition and an optional message".into(),
+                        ));
+                    }
+                    let condition = self.evaluate(&arguments[0])?;
+                    let Value::Bool(condition) = condition else {
+                        return Err(self.runtime_error("`assert` condition must be Bool".into()));
+                    };
+                    if condition {
+                        return Ok(Value::Unit);
+                    }
+                    let message = match arguments.get(1) {
+                        Some(expression) => match self.evaluate(expression)? {
+                            Value::String(message) => message,
+                            _ => {
+                                return Err(
+                                    self.runtime_error("`assert` message must be a string".into())
+                                );
+                            }
+                        },
+                        None => "assertion failed".into(),
+                    };
+                    return Err(
+                        self.runtime_error_with_code(DiagnosticCode::RuntimeGeneral, message)
+                    );
                 }
                 if name == "type_of" {
                     if arguments.len() != 1 {
@@ -2028,8 +2624,13 @@ impl Evaluator {
                         Value::Array(values) | Value::List(values) | Value::Tuple(values) => {
                             values.iter().any(|value| value == &searched)
                         }
-                        Value::Range { start, end } => {
-                            matches!(searched, Value::Int(value) if value >= start && value < end)
+                        Value::Range { start, end, step } => {
+                            matches!(searched, Value::Int(value)
+                                if (step > 0 && value >= start && value < end
+                                    || step < 0 && value <= start && value > end)
+                                    && (i128::from(value) - i128::from(start))
+                                        % i128::from(step)
+                                        == 0)
                         }
                         Value::Hash(values) | Value::Tree(values) => {
                             values.values().any(|value| value == &searched)
@@ -2041,6 +2642,17 @@ impl Evaluator {
                         }
                     };
                     return Ok(Value::Bool(result));
+                }
+                if (name == "keys"
+                    || name == "values"
+                    || name == "entries"
+                    || name == "has_key"
+                    || name == "get"
+                    || name == "without_key"
+                    || name == "select_keys")
+                    && !matches!(self.lookup(name), Some(Value::Function(_)))
+                {
+                    return self.evaluate_map_keys_or_values(name, arguments);
                 }
                 if name == "any" || name == "all" {
                     if arguments.len() != 1 {
@@ -2109,27 +2721,30 @@ impl Evaluator {
                     if arguments.len() != 1 {
                         return Err(self.runtime_error("`total` expects one argument".into()));
                     }
+                    let sum_type = self.sequence_sum_type(&arguments[0]);
                     let collection = self.evaluate(&arguments[0])?;
-                    let values = match collection {
+                    let span = self.current_span.clone();
+                    let mut total = SumAccumulator::new(sum_type);
+                    let mut add_value =
+                        |value| -> Result<(), SimplyError> { total.add(value, span.as_ref()) };
+                    match collection {
                         Value::Array(values) | Value::List(values) | Value::Tuple(values) => {
-                            values.iter().cloned().collect::<Vec<_>>()
+                            for value in values.iter() {
+                                add_value(value.clone())?;
+                            }
                         }
-                        Value::Range { start, end } => Value::range_values(start, end).collect(),
+                        Value::Range { start, end, step } => {
+                            for value in Value::range_values(start, end, step) {
+                                add_value(value)?;
+                            }
+                        }
                         _ => {
                             return Err(self.runtime_error(
                                 "`total` requires an array, list, tuple, or range".into(),
                             ));
                         }
-                    };
-                    let mut total = Value::Int(0);
-                    for value in values {
-                        total = operations::binary(
-                            total,
-                            &BinaryOperator::Add,
-                            value,
-                            self.current_span.as_ref(),
-                        )?;
                     }
+                    let total = total.finish();
                     return Ok(total);
                 }
                 if name == "trim" {
@@ -2315,7 +2930,9 @@ impl Evaluator {
                         Value::Array(values) | Value::List(values) | Value::Tuple(values) => {
                             values.is_empty()
                         }
-                        Value::Range { start, end } => start >= end,
+                        Value::Range { start, end, step } => {
+                            Value::range_len(start, end, step) == Some(0)
+                        }
                         Value::Hash(values) | Value::Tree(values) => values.is_empty(),
                         Value::String(value) => value.is_empty(),
                         _ => {
@@ -2347,15 +2964,32 @@ impl Evaluator {
                             values.reverse();
                             Value::Tuple(shared_values(values))
                         }
-                        Value::Range { start, end } => {
-                            Value::Array(shared_values(Value::range_values(start, end).collect()))
+                        Value::Range { start, end, step } => {
+                            let length = Value::range_len(start, end, step)
+                                .and_then(|length| usize::try_from(length).ok())
+                                .ok_or_else(|| {
+                                    self.runtime_error("range is too large to reverse".into())
+                                })?;
+                            let mut values = Vec::new();
+                            values.try_reserve_exact(length).map_err(|_| {
+                                self.runtime_error("range is too large to reverse".into())
+                            })?;
+                            values.extend(Value::range_values(start, end, step));
+                            values.reverse();
+                            Value::Array(shared_values(values))
                         }
                         _ => {
                             return Err(self.runtime_error(
-                                "`reverse` requires an array, list, or tuple".into(),
+                                "`reverse` requires an array, list, tuple, or range".into(),
                             ));
                         }
                     });
+                }
+                if name == "enumerate" && !matches!(self.lookup(name), Some(Value::Function(_))) {
+                    return self.evaluate_enumerate(arguments);
+                }
+                if name == "zip" && !matches!(self.lookup(name), Some(Value::Function(_))) {
+                    return self.evaluate_zip(arguments);
                 }
                 if name == "length" || name == "count" {
                     if arguments.len() != 1 {
@@ -2365,7 +2999,11 @@ impl Evaluator {
                         Value::Array(values) | Value::List(values) | Value::Tuple(values) => {
                             Ok(Value::Int(values.len() as i64))
                         }
-                        Value::Range { start, end } => Ok(Value::Int(Value::range_len(start, end))),
+                        Value::Range { start, end, step } => Value::range_len(start, end, step)
+                            .map(Value::Int)
+                            .ok_or_else(|| {
+                                self.runtime_error("range length exceeds the Int range".into())
+                            }),
                         Value::Hash(values) | Value::Tree(values) => {
                             Ok(Value::Int(values.len() as i64))
                         }
@@ -2377,17 +3015,28 @@ impl Evaluator {
                     };
                 }
                 if name == "range" {
-                    if arguments.len() != 2 {
-                        return Err(
-                            self.runtime_error("`range` expects two integer arguments".into())
-                        );
+                    if !(2..=3).contains(&arguments.len()) {
+                        return Err(self.runtime_error(
+                            "`range` expects start, end, and an optional step".into(),
+                        ));
                     }
                     let start = self.evaluate(&arguments[0])?;
                     let end = self.evaluate(&arguments[1])?;
-                    if let (Value::Int(start), Value::Int(end)) = (start, end) {
-                        return Ok(Value::Range { start, end });
+                    let step = match arguments.get(2) {
+                        Some(step) => self.evaluate(step)?,
+                        None => Value::Int(1),
+                    };
+                    if let (Value::Int(start), Value::Int(end), Value::Int(step)) =
+                        (start, end, step)
+                    {
+                        if step == 0 {
+                            return Err(self.runtime_error("`range` step cannot be zero".into()));
+                        }
+                        return Ok(Value::Range { start, end, step });
                     }
-                    return Err(self.runtime_error("`range` expects two integer arguments".into()));
+                    return Err(self.runtime_error(
+                        "`range` expects integer bounds and an optional integer step".into(),
+                    ));
                 }
                 if name == "csv_rows" {
                     if arguments.len() != 1 {
@@ -2476,6 +3125,7 @@ impl Evaluator {
                     };
                     Ok(Value::Enum(Rc::new(EnumValue {
                         enum_name: enum_name.clone(),
+                        identity: definition.identity,
                         variant_name: variant_name.clone(),
                         payload,
                     })))
@@ -2522,7 +3172,7 @@ impl Evaluator {
         }
         if let Value::Struct(instance) = &receiver {
             let behavior = self
-                .lookup_message(&instance.type_name, message)
+                .lookup_message(&instance.identity, message)
                 .cloned()
                 .ok_or_else(|| {
                     self.runtime_error_with_code(
@@ -2534,7 +3184,7 @@ impl Evaluator {
                     )
                 })?;
             let fields = self
-                .lookup_struct(&instance.type_name)
+                .lookup_struct_identity(&instance.identity)
                 .ok_or_else(|| {
                     self.runtime_error_with_code(
                         DiagnosticCode::RuntimeMessage,
@@ -2729,6 +3379,7 @@ impl Evaluator {
             fields.insert(field.name.clone(), value);
         }
         Ok(Value::Struct(Rc::new(StructInstance {
+            identity: definition.identity.clone(),
             type_name: name.into(),
             fields: Rc::new(RefCell::new(fields)),
         })))
@@ -2759,10 +3410,12 @@ impl Evaluator {
                         self.runtime_error_with_code(DiagnosticCode::RuntimeMessage, description)
                     })?;
                 self.track_function(Rc::new(FunctionValue {
+                    name: Some(name.to_owned()),
                     parameters: function.parameters.clone(),
                     return_type: function.return_type.clone(),
                     body: Arc::clone(&function.body),
                     captures: RefCell::new(HashMap::new()),
+                    source: function.source.clone(),
                 }))
             }
         };
@@ -2816,18 +3469,57 @@ impl Evaluator {
                 ),
             ));
         }
+        let needs_function_scope = !function.captures.borrow().is_empty()
+            || function.name.as_ref().is_some_and(|function_name| {
+                !matches!(
+                    self.lookup(function_name),
+                    Some(Value::Function(current)) if Rc::ptr_eq(current, &function)
+                )
+            });
         self.call_depth += 1;
+        let function_source = function.source.clone();
+        let previous_source = std::mem::replace(
+            &mut self.current_source,
+            function_source
+                .as_ref()
+                .map(|context| Rc::clone(&context.source)),
+        );
+        let mut scopes_pushed = 0;
         let result = (|| {
-            self.push_scope();
-            for (capture, value) in function.captures.borrow().iter() {
-                self.variable_types
-                    .define(capture.clone(), Self::type_of_value(value), false);
-                self.scopes
-                    .define(capture.clone(), value.clone(), false)
-                    .map_err(|error| {
-                        self.runtime_error_with_code(DiagnosticCode::DuplicateDeclaration, error)
-                    })?;
+            if needs_function_scope {
+                self.push_scope();
+                scopes_pushed += 1;
+                if let Some(function_name) = &function.name {
+                    let value = Value::Function(function.clone());
+                    self.variable_types.define(
+                        function_name.clone(),
+                        Self::type_of_value(&value),
+                        false,
+                    );
+                    self.scopes
+                        .define(function_name.clone(), value, false)
+                        .map_err(|error| {
+                            self.runtime_error_with_code(
+                                DiagnosticCode::DuplicateDeclaration,
+                                error,
+                            )
+                        })?;
+                }
+                for (capture, value) in function.captures.borrow().iter() {
+                    self.variable_types
+                        .define(capture.clone(), Self::type_of_value(value), false);
+                    self.scopes
+                        .define(capture.clone(), value.clone(), false)
+                        .map_err(|error| {
+                            self.runtime_error_with_code(
+                                DiagnosticCode::DuplicateDeclaration,
+                                error,
+                            )
+                        })?;
+                }
             }
+            self.push_scope();
+            scopes_pushed += 1;
             for ((parameter, _, mutable), value) in function.parameters.iter().zip(values) {
                 self.variable_types.define(
                     parameter.clone(),
@@ -2851,28 +3543,34 @@ impl Evaluator {
             if is_message_invocation {
                 self.active_message_states.pop();
             }
-            let result = match result {
+            Ok(match result {
                 Ok(flow) => match flow {
                     Flow::None => Value::Unit,
                     Flow::Return(value) => value,
                     Flow::Break | Flow::Continue => {
-                        self.pop_scope();
                         return Err(self.runtime_error("break/continue used outside a loop".into()));
                     }
                 },
-                Err(error) => {
-                    self.pop_scope();
-                    return Err(error);
-                }
-            };
+                Err(error) => return Err(error),
+            })
+        })();
+        for _ in 0..scopes_pushed {
             self.pop_scope();
+        }
+        self.current_source = previous_source;
+        self.call_depth -= 1;
+        let result = result.and_then(|result| {
             if let Some(expected) = &function.return_type {
                 self.ensure_type(&result, expected, name)?;
             }
             Ok(result)
-        })();
-        self.call_depth -= 1;
-        result
+        });
+        match function_source {
+            Some(context) => result.map_err(|error| {
+                error.in_source(context.filename, context.source.as_ref().to_owned())
+            }),
+            None => result,
+        }
     }
 
     fn evaluate_values(&mut self, expressions: &[Expr]) -> Result<Vec<Value>, SimplyError> {
@@ -2886,6 +3584,7 @@ impl Evaluator {
         &mut self,
         mut values: Vec<Value>,
         steps: &[PipelineStep],
+        sum_type: Type,
     ) -> Result<Value, SimplyError> {
         if steps
             .iter()
@@ -2908,7 +3607,7 @@ impl Evaluator {
             ));
         }
         self.push_scope();
-        let result = self.evaluate_pipeline_steps(&mut values, steps);
+        let result = self.evaluate_pipeline_steps(&mut values, steps, sum_type);
         self.pop_scope();
         result
     }
@@ -2917,7 +3616,9 @@ impl Evaluator {
         &mut self,
         start: i64,
         end: i64,
+        step: i64,
         steps: &[PipelineStep],
+        sum_type: Type,
     ) -> Result<Value, SimplyError> {
         if steps
             .iter()
@@ -2939,10 +3640,191 @@ impl Evaluator {
                 "`checkpoint` requires a `csv_rows` source and `write_csv` terminal".into(),
             ));
         }
+        if let Some(terminal) = steps.last()
+            && matches!(
+                terminal,
+                PipelineStep::Count
+                    | PipelineStep::Sum
+                    | PipelineStep::Average
+                    | PipelineStep::Min
+                    | PipelineStep::Max
+                    | PipelineStep::Any
+                    | PipelineStep::All
+            )
+            && steps[..steps.len() - 1].iter().all(|step| match step {
+                PipelineStep::Where(expression) | PipelineStep::Derive(expression) => {
+                    is_parallel_safe_expression(expression)
+                }
+                _ => false,
+            })
+        {
+            return self.evaluate_scalar_range_pipeline(
+                start,
+                end,
+                step,
+                &steps[..steps.len() - 1],
+                terminal,
+                sum_type,
+            );
+        }
         self.push_scope();
-        let result = self.evaluate_streaming_pipeline(Value::range_values(start, end), steps);
+        let result = self.evaluate_streaming_pipeline_with_sum_type(
+            Value::range_values(start, end, step),
+            steps,
+            sum_type,
+        );
         self.pop_scope();
         result
+    }
+
+    fn evaluate_scalar_range_pipeline(
+        &self,
+        start: i64,
+        end: i64,
+        step: i64,
+        transforms: &[PipelineStep],
+        terminal: &PipelineStep,
+        sum_type: Type,
+    ) -> Result<Value, SimplyError> {
+        let mut count = 0i64;
+        let mut total = Value::Int(0);
+        let mut sum = SumAccumulator::new(sum_type);
+        let mut minimum = None;
+        let mut maximum = None;
+        let mut any_result = false;
+        let mut all_result = true;
+
+        for value in Value::range_values(start, end, step) {
+            let mut current = Some(value);
+            for step in transforms {
+                let Some(item) = current.take() else {
+                    break;
+                };
+                match step {
+                    PipelineStep::Where(expression) => {
+                        match self.evaluate_scalar_pipeline_expression(expression, &item)? {
+                            Value::Bool(true) => current = Some(item),
+                            Value::Bool(false) => {}
+                            _ => {
+                                return Err(self.runtime_error(
+                                    "pipeline `where` condition must return a boolean".into(),
+                                ));
+                            }
+                        }
+                    }
+                    PipelineStep::Derive(expression) => {
+                        current =
+                            Some(self.evaluate_scalar_pipeline_expression(expression, &item)?);
+                    }
+                    _ => unreachable!("range fast path accepts only pure scalar transforms"),
+                }
+            }
+            let Some(value) = current else {
+                continue;
+            };
+            match terminal {
+                PipelineStep::Count => count += 1,
+                PipelineStep::Sum => sum.add(value, self.current_span.as_ref())?,
+                PipelineStep::Average => {
+                    total = operations::binary(
+                        total,
+                        &BinaryOperator::Add,
+                        value,
+                        self.current_span.as_ref(),
+                    )?;
+                    count += 1;
+                }
+                PipelineStep::Min => {
+                    update_extreme(&mut minimum, value, false, self.current_span.as_ref())?;
+                }
+                PipelineStep::Max => {
+                    update_extreme(&mut maximum, value, true, self.current_span.as_ref())?;
+                }
+                PipelineStep::Any => match value {
+                    Value::Bool(true) => return Ok(Value::Bool(true)),
+                    Value::Bool(false) => any_result = false,
+                    _ => {
+                        return Err(self.runtime_error(
+                            "`any` pipeline terminal requires boolean items".into(),
+                        ));
+                    }
+                },
+                PipelineStep::All => match value {
+                    Value::Bool(false) => return Ok(Value::Bool(false)),
+                    Value::Bool(true) => all_result = true,
+                    _ => {
+                        return Err(self.runtime_error(
+                            "`all` pipeline terminal requires boolean items".into(),
+                        ));
+                    }
+                },
+                _ => unreachable!("range fast path accepts only aggregate terminals"),
+            }
+        }
+
+        match terminal {
+            PipelineStep::Count => Ok(Value::Int(count)),
+            PipelineStep::Sum => Ok(sum.finish()),
+            PipelineStep::Average if count == 0 => {
+                Err(self.runtime_error("average requires at least one numeric value".into()))
+            }
+            PipelineStep::Average => Ok(Value::Float(
+                total_to_f64(total, self.current_span.as_ref())? / count as f64,
+            )),
+            PipelineStep::Min => minimum.ok_or_else(|| {
+                self.runtime_error("min requires at least one numeric value".into())
+            }),
+            PipelineStep::Max => maximum.ok_or_else(|| {
+                self.runtime_error("max requires at least one numeric value".into())
+            }),
+            PipelineStep::Any => Ok(Value::Bool(any_result)),
+            PipelineStep::All => Ok(Value::Bool(all_result)),
+            _ => unreachable!("range fast path accepts only aggregate terminals"),
+        }
+    }
+
+    fn evaluate_scalar_pipeline_expression(
+        &self,
+        expression: &Expr,
+        item: &Value,
+    ) -> Result<Value, SimplyError> {
+        match expression {
+            Expr::Literal(Literal::String(value)) => Ok(Value::String(value.clone())),
+            Expr::Literal(Literal::Int(value)) => Ok(Value::Int(*value)),
+            Expr::Literal(Literal::Float(value)) => Ok(Value::Float(*value)),
+            Expr::Literal(Literal::Bool(value)) => Ok(Value::Bool(*value)),
+            Expr::Identifier(name) if name == "item" => Ok(item.clone()),
+            Expr::Unary { operator, operand } => operations::unary(
+                self.evaluate_scalar_pipeline_expression(operand, item)?,
+                operator,
+                self.current_span.as_ref(),
+            ),
+            Expr::Binary {
+                left,
+                operator,
+                right,
+            } => {
+                let left = self.evaluate_scalar_pipeline_expression(left, item)?;
+                if matches!(operator, BinaryOperator::And | BinaryOperator::Or)
+                    && let Value::Bool(value) = left
+                    && ((*operator == BinaryOperator::And && !value)
+                        || (*operator == BinaryOperator::Or && value))
+                {
+                    return Ok(Value::Bool(value));
+                }
+                operations::binary(
+                    left,
+                    operator,
+                    self.evaluate_scalar_pipeline_expression(right, item)?,
+                    self.current_span.as_ref(),
+                )
+            }
+            _ => Err(SimplyError::Runtime {
+                span: self.current_span.clone().unwrap_or_else(|| Span::new(0, 0)),
+                code: DiagnosticCode::RuntimeGeneral,
+                message: "expression is outside the scalar pipeline fast path".into(),
+            }),
+        }
     }
 
     fn evaluate_csv_pipeline(
@@ -2952,6 +3834,7 @@ impl Evaluator {
         start_offset: u64,
         source_version: Option<&CsvStreamVersion>,
         steps: &[PipelineStep],
+        sum_type: Type,
     ) -> Result<Value, SimplyError> {
         if steps
             .iter()
@@ -2970,6 +3853,25 @@ impl Evaluator {
                 "`parallel` does not support CSV row collections or output terminals".into(),
             ));
         }
+        if steps.iter().any(|step| {
+            matches!(
+                step,
+                PipelineStep::Take(_)
+                    | PipelineStep::Skip(_)
+                    | PipelineStep::StepBy(_)
+                    | PipelineStep::TakeWhile(_)
+                    | PipelineStep::DropWhile(_)
+                    | PipelineStep::Distinct
+            )
+        }) && steps
+            .iter()
+            .any(|step| matches!(step, PipelineStep::Checkpoint(_)))
+        {
+            return Err(self.runtime_error(
+                "`take`, `skip`, `step_by`, `take_while`, `drop_while`, and `distinct` cannot be combined with `checkpoint`"
+                    .into(),
+            ));
+        }
         let terminal = steps.last().ok_or_else(|| {
             self.runtime_error("csv_rows pipeline requires a terminal step".into())
         })?;
@@ -2986,6 +3888,8 @@ impl Evaluator {
             | PipelineStep::Average
             | PipelineStep::Min
             | PipelineStep::Max
+            | PipelineStep::Any
+            | PipelineStep::All
             | PipelineStep::Partition { .. } => None,
             _ => {
                 return Err(self.runtime_error(
@@ -3116,9 +4020,12 @@ impl Evaluator {
             }
             let interval = chunk_size.unwrap_or(1).max(1);
             let mut total = Value::Int(0);
+            let mut sum = SumAccumulator::new(sum_type.clone());
             let mut count = 0i64;
             let mut minimum: Option<Value> = None;
             let mut maximum: Option<Value> = None;
+            let mut any_result = false;
+            let mut all_result = true;
             let mut partitioned = match terminal {
                 PipelineStep::Partition { rules, .. } => Some(empty_partition_categories(rules)),
                 _ => None,
@@ -3135,9 +4042,23 @@ impl Evaluator {
                 self,
             )?;
             let mut index = start_record;
-            while let Some(record) = csv::read_record(&mut reader)
-                .map_err(|error| self.file_error(Path::new(input_path), error))?
-            {
+            let mut take_counts = vec![0i64; steps.len() - 1];
+            let mut skip_counts = vec![0i64; steps.len() - 1];
+            let mut step_by_counts = vec![0i64; steps.len() - 1];
+            let mut seen_values = vec![Vec::new(); steps.len() - 1];
+            let mut drop_while_done = vec![false; steps.len() - 1];
+            loop {
+                if steps[..steps.len() - 1]
+                    .iter()
+                    .any(|step| matches!(step, PipelineStep::Take(0)))
+                {
+                    break;
+                }
+                let Some(record) = csv::read_record(&mut reader)
+                    .map_err(|error| self.file_error(Path::new(input_path), error))?
+                else {
+                    break;
+                };
                 if index < resume_at {
                     index += 1;
                     continue;
@@ -3148,7 +4069,9 @@ impl Evaluator {
                     self.runtime_error(format!("invalid CSV row in `{input_path}`: {message}"))
                 })?;
                 let mut current = Some(Value::List(shared_values(row)));
-                for step in &steps[..steps.len() - 1] {
+                let mut stop_after_record = false;
+                let mut stop_source = false;
+                for (step_index, step) in steps[..steps.len() - 1].iter().enumerate() {
                     match step {
                         PipelineStep::Where(expression) => {
                             let item = current.take().ok_or_else(|| {
@@ -3165,11 +4088,85 @@ impl Evaluator {
                             })?;
                             current = Some(self.evaluate_pipeline_item(item, expression)?);
                         }
+                        PipelineStep::Take(limit) => {
+                            take_counts[step_index] += 1;
+                            stop_after_record |= take_counts[step_index] >= *limit;
+                        }
+                        PipelineStep::Skip(limit) => {
+                            if skip_counts[step_index] < *limit {
+                                skip_counts[step_index] += 1;
+                                current = None;
+                                break;
+                            }
+                        }
+                        PipelineStep::StepBy(interval) => {
+                            if step_by_counts[step_index] > 0 {
+                                step_by_counts[step_index] -= 1;
+                                current = None;
+                                break;
+                            }
+                            step_by_counts[step_index] = interval - 1;
+                        }
+                        PipelineStep::TakeWhile(expression) => {
+                            let item = current.take().ok_or_else(|| {
+                                self.runtime_error("pipeline item was lost".into())
+                            })?;
+                            match self.evaluate_pipeline_item(item.clone(), expression)? {
+                                Value::Bool(true) => current = Some(item),
+                                Value::Bool(false) => {
+                                    current = None;
+                                    stop_source = true;
+                                    break;
+                                }
+                                _ => {
+                                    return Err(self.runtime_error(
+                                        "pipeline `take_while` condition must return a boolean"
+                                            .into(),
+                                    ));
+                                }
+                            }
+                        }
+                        PipelineStep::DropWhile(expression) => {
+                            if !drop_while_done[step_index] {
+                                let item = current.take().ok_or_else(|| {
+                                    self.runtime_error("pipeline item was lost".into())
+                                })?;
+                                match self.evaluate_pipeline_item(item.clone(), expression)? {
+                                    Value::Bool(true) => {
+                                        current = None;
+                                        break;
+                                    }
+                                    Value::Bool(false) => {
+                                        drop_while_done[step_index] = true;
+                                        current = Some(item);
+                                    }
+                                    _ => {
+                                        return Err(self.runtime_error(
+                                            "pipeline `drop_while` condition must return a boolean"
+                                                .into(),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        PipelineStep::Distinct => {
+                            let item = current.take().ok_or_else(|| {
+                                self.runtime_error("pipeline item was lost".into())
+                            })?;
+                            if seen_values[step_index].contains(&item) {
+                                current = None;
+                                break;
+                            }
+                            seen_values[step_index].push(item.clone());
+                            current = Some(item);
+                        }
                         PipelineStep::Sum
                         | PipelineStep::Count
                         | PipelineStep::Average
                         | PipelineStep::Min
                         | PipelineStep::Max
+                        | PipelineStep::Any
+                        | PipelineStep::All
                         | PipelineStep::Partition { .. }
                         | PipelineStep::WriteCsv(_) => {
                             unreachable!("terminal step is excluded from transforms")
@@ -3180,6 +4177,9 @@ impl Evaluator {
                     }
                 }
                 let Some(value) = current else {
+                    if stop_source {
+                        break;
+                    }
                     index += 1;
                     checkpoint::checkpoint_progress(
                         checkpoint_path.as_deref(),
@@ -3190,6 +4190,9 @@ impl Evaluator {
                         output_path.as_deref(),
                     )
                     .map_err(|message| self.runtime_error(message))?;
+                    if stop_after_record {
+                        break;
+                    }
                     continue;
                 };
                 if let PipelineStep::Partition { item, rules } = terminal {
@@ -3216,16 +4219,14 @@ impl Evaluator {
                         output_path.as_deref(),
                     )
                     .map_err(|message| self.runtime_error(message))?;
+                    if stop_after_record {
+                        break;
+                    }
                     continue;
                 }
                 match terminal {
                     PipelineStep::Sum => {
-                        total = operations::binary(
-                            total,
-                            &BinaryOperator::Add,
-                            value,
-                            self.current_span.as_ref(),
-                        )?;
+                        sum.add(value, self.current_span.as_ref())?;
                     }
                     PipelineStep::Count => count += 1,
                     PipelineStep::Average => {
@@ -3243,6 +4244,22 @@ impl Evaluator {
                     PipelineStep::Max => {
                         update_extreme(&mut maximum, value, true, self.current_span.as_ref())?
                     }
+                    PipelineStep::Any => match value {
+                        Value::Bool(value) => any_result |= value,
+                        _ => {
+                            return Err(self.runtime_error(
+                                "`any` pipeline terminal requires boolean items".into(),
+                            ));
+                        }
+                    },
+                    PipelineStep::All => match value {
+                        Value::Bool(value) => all_result &= value,
+                        _ => {
+                            return Err(self.runtime_error(
+                                "`all` pipeline terminal requires boolean items".into(),
+                            ));
+                        }
+                    },
                     PipelineStep::WriteCsv(_) => {
                         let values = match value {
                             Value::Array(values) | Value::List(values) | Value::Tuple(values) => {
@@ -3261,8 +4278,16 @@ impl Evaluator {
                             values.as_slice(),
                         )
                         .map_err(|message| self.runtime_error(message))?;
+                        if stop_after_record {
+                            break;
+                        }
                     }
                     _ => unreachable!(),
+                }
+                if (matches!(terminal, PipelineStep::Any) && any_result)
+                    || (matches!(terminal, PipelineStep::All) && !all_result)
+                {
+                    break;
                 }
                 index += 1;
                 checkpoint::checkpoint_progress(
@@ -3298,11 +4323,17 @@ impl Evaluator {
                 maximum.ok_or_else(|| {
                     self.runtime_error("max requires at least one numeric value".into())
                 })
+            } else if matches!(terminal, PipelineStep::Any) {
+                Ok(Value::Bool(any_result))
+            } else if matches!(terminal, PipelineStep::All) {
+                Ok(Value::Bool(all_result))
             } else if let PipelineStep::Partition { .. } = terminal {
                 match partitioned.take() {
                     Some(categories) => Ok(partition_result(categories)),
                     None => Err(self.runtime_error("partition result was not initialized".into())),
                 }
+            } else if matches!(terminal, PipelineStep::Sum) {
+                Ok(sum.finish())
             } else {
                 Ok(total)
             };
@@ -3322,15 +4353,32 @@ impl Evaluator {
         &mut self,
         values: &mut Vec<Value>,
         steps: &[PipelineStep],
+        sum_type: Type,
     ) -> Result<Value, SimplyError> {
-        if steps
-            .iter()
-            .any(|step| matches!(step, PipelineStep::Chunk(_) | PipelineStep::Checkpoint(_)))
-        {
-            return self.evaluate_streaming_pipeline(std::mem::take(values), steps);
+        if steps.iter().any(|step| {
+            matches!(
+                step,
+                PipelineStep::Chunk(_)
+                    | PipelineStep::Checkpoint(_)
+                    | PipelineStep::Take(_)
+                    | PipelineStep::Skip(_)
+                    | PipelineStep::StepBy(_)
+                    | PipelineStep::TakeWhile(_)
+                    | PipelineStep::Distinct
+            )
+        }) {
+            return self.evaluate_streaming_pipeline_with_sum_type(
+                std::mem::take(values),
+                steps,
+                sum_type,
+            );
         }
         if matches!(steps.last(), Some(PipelineStep::Partition { .. })) {
-            return self.evaluate_streaming_pipeline(std::mem::take(values), steps);
+            return self.evaluate_streaming_pipeline_with_sum_type(
+                std::mem::take(values),
+                steps,
+                sum_type,
+            );
         }
         if !matches!(
             steps.last(),
@@ -3340,10 +4388,16 @@ impl Evaluator {
                     | PipelineStep::Average
                     | PipelineStep::Min
                     | PipelineStep::Max
+                    | PipelineStep::Any
+                    | PipelineStep::All
                     | PipelineStep::Partition { .. }
             )
         ) {
-            return self.evaluate_streaming_pipeline(std::mem::take(values), steps);
+            return self.evaluate_streaming_pipeline_with_sum_type(
+                std::mem::take(values),
+                steps,
+                sum_type,
+            );
         }
         if steps.len() >= 2
             && matches!(
@@ -3360,7 +4414,12 @@ impl Evaluator {
                 .iter()
                 .all(|step| matches!(step, PipelineStep::Where(_) | PipelineStep::Derive(_)))
         {
-            return self.evaluate_fused_pipeline(values, &steps[..steps.len() - 1], steps.last());
+            return self.evaluate_fused_pipeline(
+                values,
+                &steps[..steps.len() - 1],
+                steps.last(),
+                sum_type,
+            );
         }
         if steps.len() == 2 {
             match (&steps[0], &steps[1]) {
@@ -3388,17 +4447,12 @@ impl Evaluator {
                     return Ok(Value::Int(count));
                 }
                 (PipelineStep::Derive(expression), PipelineStep::Sum) => {
-                    let mut total = Value::Int(0);
+                    let mut total = SumAccumulator::new(sum_type.clone());
                     for value in values.drain(..) {
                         let mapped = self.evaluate_pipeline_item(value, expression)?;
-                        total = operations::binary(
-                            total,
-                            &BinaryOperator::Add,
-                            mapped,
-                            self.current_span.as_ref(),
-                        )?;
+                        total.add(mapped, self.current_span.as_ref())?;
                     }
-                    return Ok(total);
+                    return Ok(total.finish());
                 }
                 _ => {}
             }
@@ -3422,23 +4476,33 @@ impl Evaluator {
                     *values = mapped;
                 }
                 PipelineStep::Sum => {
-                    let mut total = Value::Int(0);
+                    let mut total = SumAccumulator::new(sum_type.clone());
                     for value in values.drain(..) {
-                        total = operations::binary(
-                            total,
-                            &BinaryOperator::Add,
-                            value,
-                            self.current_span.as_ref(),
-                        )?;
+                        total.add(value, self.current_span.as_ref())?;
                     }
-                    return Ok(total);
+                    return Ok(total.finish());
                 }
                 PipelineStep::Count => return Ok(Value::Int(values.len() as i64)),
                 PipelineStep::Average | PipelineStep::Min | PipelineStep::Max => {
-                    return self.evaluate_streaming_pipeline(std::mem::take(values), steps);
+                    return self.evaluate_streaming_pipeline_with_sum_type(
+                        std::mem::take(values),
+                        steps,
+                        sum_type.clone(),
+                    );
+                }
+                PipelineStep::Any | PipelineStep::All => {
+                    return self.evaluate_streaming_pipeline_with_sum_type(
+                        std::mem::take(values),
+                        steps,
+                        sum_type.clone(),
+                    );
                 }
                 PipelineStep::Partition { .. } => {
-                    return self.evaluate_streaming_pipeline(std::mem::take(values), steps);
+                    return self.evaluate_streaming_pipeline_with_sum_type(
+                        std::mem::take(values),
+                        steps,
+                        sum_type.clone(),
+                    );
                 }
                 PipelineStep::WriteCsv(_) => {
                     return Err(self.runtime_error(
@@ -3447,7 +4511,13 @@ impl Evaluator {
                 }
                 PipelineStep::Chunk(_)
                 | PipelineStep::Parallel(_)
-                | PipelineStep::Checkpoint(_) => {
+                | PipelineStep::Checkpoint(_)
+                | PipelineStep::Take(_)
+                | PipelineStep::Skip(_)
+                | PipelineStep::StepBy(_)
+                | PipelineStep::TakeWhile(_)
+                | PipelineStep::DropWhile(_)
+                | PipelineStep::Distinct => {
                     // These controls are consumed by the streaming path.
                 }
             }
@@ -3455,10 +4525,23 @@ impl Evaluator {
         Ok(Value::List(shared_values(std::mem::take(values))))
     }
 
+    #[cfg(test)]
     fn evaluate_streaming_pipeline<I>(
         &mut self,
         values: I,
         steps: &[PipelineStep],
+    ) -> Result<Value, SimplyError>
+    where
+        I: IntoIterator<Item = Value>,
+    {
+        self.evaluate_streaming_pipeline_with_sum_type(values, steps, Type::Unknown)
+    }
+
+    fn evaluate_streaming_pipeline_with_sum_type<I>(
+        &mut self,
+        values: I,
+        steps: &[PipelineStep],
+        sum_type: Type,
     ) -> Result<Value, SimplyError>
     where
         I: IntoIterator<Item = Value>,
@@ -3477,6 +4560,8 @@ impl Evaluator {
             Some(PipelineStep::Average) => Some(PipelineStep::Average),
             Some(PipelineStep::Min) => Some(PipelineStep::Min),
             Some(PipelineStep::Max) => Some(PipelineStep::Max),
+            Some(PipelineStep::Any) => Some(PipelineStep::Any),
+            Some(PipelineStep::All) => Some(PipelineStep::All),
             Some(PipelineStep::Partition { item, rules }) => Some(PipelineStep::Partition {
                 item: item.clone(),
                 rules: rules.clone(),
@@ -3582,7 +4667,11 @@ impl Evaluator {
                         .cloned()
                         .into_iter()
                         .collect();
-                    return self.evaluate_streaming_pipeline(output, &sequential_steps);
+                    return self.evaluate_streaming_pipeline_with_sum_type(
+                        output,
+                        &sequential_steps,
+                        sum_type,
+                    );
                 }
                 Err(message) => return Err(self.runtime_error(message)),
             }
@@ -3594,8 +4683,11 @@ impl Evaluator {
         };
         let mut count = 0i64;
         let mut total = Value::Int(0);
+        let mut sum = SumAccumulator::new(sum_type);
         let mut minimum = None;
         let mut maximum = None;
+        let mut any_result = false;
+        let mut all_result = true;
         let mut output_file = match terminal {
             Some(PipelineStep::WriteCsv(ref path_expression)) => {
                 let path = match self.evaluate(path_expression)? {
@@ -3610,9 +4702,25 @@ impl Evaluator {
             _ => None,
         };
 
-        for value in values {
+        let mut take_counts = vec![0i64; transforms.len()];
+        let mut skip_counts = vec![0i64; transforms.len()];
+        let mut step_by_counts = vec![0i64; transforms.len()];
+        let mut seen_values = vec![Vec::new(); transforms.len()];
+        let mut drop_while_done = vec![false; transforms.len()];
+        let mut values = values.into_iter();
+        loop {
+            if transforms
+                .iter()
+                .any(|step| matches!(step, PipelineStep::Take(0)))
+            {
+                break;
+            }
+            let Some(value) = values.next() else {
+                break;
+            };
             let mut current = Some(value);
-            for step in transforms {
+            let mut stop_after_item = false;
+            for (step_index, step) in transforms.iter().enumerate() {
                 match step {
                     PipelineStep::Where(expression) => {
                         let item = current
@@ -3629,11 +4737,84 @@ impl Evaluator {
                             .ok_or_else(|| self.runtime_error("pipeline item was lost".into()))?;
                         current = Some(self.evaluate_pipeline_item(item, expression)?);
                     }
+                    PipelineStep::Take(limit) => {
+                        take_counts[step_index] += 1;
+                        stop_after_item |= take_counts[step_index] >= *limit;
+                    }
+                    PipelineStep::Skip(limit) => {
+                        if skip_counts[step_index] < *limit {
+                            skip_counts[step_index] += 1;
+                            current = None;
+                            break;
+                        }
+                    }
+                    PipelineStep::StepBy(interval) => {
+                        if step_by_counts[step_index] > 0 {
+                            step_by_counts[step_index] -= 1;
+                            current = None;
+                            break;
+                        }
+                        step_by_counts[step_index] = interval - 1;
+                    }
+                    PipelineStep::TakeWhile(expression) => {
+                        let item = current
+                            .take()
+                            .ok_or_else(|| self.runtime_error("pipeline item was lost".into()))?;
+                        match self.evaluate_pipeline_item(item.clone(), expression)? {
+                            Value::Bool(true) => current = Some(item),
+                            Value::Bool(false) => {
+                                current = None;
+                                stop_after_item = true;
+                                break;
+                            }
+                            _ => {
+                                return Err(self.runtime_error(
+                                    "pipeline `take_while` condition must return a boolean".into(),
+                                ));
+                            }
+                        }
+                    }
+                    PipelineStep::DropWhile(expression) => {
+                        if !drop_while_done[step_index] {
+                            let item = current.take().ok_or_else(|| {
+                                self.runtime_error("pipeline item was lost".into())
+                            })?;
+                            match self.evaluate_pipeline_item(item.clone(), expression)? {
+                                Value::Bool(true) => {
+                                    current = None;
+                                    break;
+                                }
+                                Value::Bool(false) => {
+                                    drop_while_done[step_index] = true;
+                                    current = Some(item);
+                                }
+                                _ => {
+                                    return Err(self.runtime_error(
+                                        "pipeline `drop_while` condition must return a boolean"
+                                            .into(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    PipelineStep::Distinct => {
+                        let item = current
+                            .take()
+                            .ok_or_else(|| self.runtime_error("pipeline item was lost".into()))?;
+                        if seen_values[step_index].contains(&item) {
+                            current = None;
+                            break;
+                        }
+                        seen_values[step_index].push(item.clone());
+                        current = Some(item);
+                    }
                     PipelineStep::Sum
                     | PipelineStep::Count
                     | PipelineStep::Average
                     | PipelineStep::Min
                     | PipelineStep::Max
+                    | PipelineStep::Any
+                    | PipelineStep::All
                     | PipelineStep::Partition { .. }
                     | PipelineStep::WriteCsv(_) => {
                         unreachable!()
@@ -3644,6 +4825,9 @@ impl Evaluator {
                 }
             }
             let Some(value) = current else {
+                if stop_after_item {
+                    break;
+                }
                 continue;
             };
             if let Some(PipelineStep::Partition { item, rules }) = &terminal {
@@ -3658,17 +4842,15 @@ impl Evaluator {
                         })?;
                     values.push(value);
                 }
+                if stop_after_item {
+                    break;
+                }
                 continue;
             }
             match terminal {
                 Some(PipelineStep::Count) => count += 1,
                 Some(PipelineStep::Sum) => {
-                    total = operations::binary(
-                        total,
-                        &BinaryOperator::Add,
-                        value,
-                        self.current_span.as_ref(),
-                    )?;
+                    sum.add(value, self.current_span.as_ref())?;
                 }
                 Some(PipelineStep::Average) => {
                     total = operations::binary(
@@ -3685,6 +4867,22 @@ impl Evaluator {
                 Some(PipelineStep::Max) => {
                     update_extreme(&mut maximum, value, true, self.current_span.as_ref())?;
                 }
+                Some(PipelineStep::Any) => match value {
+                    Value::Bool(value) => any_result |= value,
+                    _ => {
+                        return Err(self.runtime_error(
+                            "`any` pipeline terminal requires boolean items".into(),
+                        ));
+                    }
+                },
+                Some(PipelineStep::All) => match value {
+                    Value::Bool(value) => all_result &= value,
+                    _ => {
+                        return Err(self.runtime_error(
+                            "`all` pipeline terminal requires boolean items".into(),
+                        ));
+                    }
+                },
                 Some(PipelineStep::WriteCsv(_)) => {
                     let values = match value {
                         Value::Array(values) | Value::List(values) | Value::Tuple(values) => values,
@@ -3706,18 +4904,32 @@ impl Evaluator {
                 Some(PipelineStep::Where(_)) | Some(PipelineStep::Derive(_)) => unreachable!(),
                 Some(PipelineStep::Chunk(_))
                 | Some(PipelineStep::Parallel(_))
-                | Some(PipelineStep::Checkpoint(_)) => {
+                | Some(PipelineStep::Checkpoint(_))
+                | Some(PipelineStep::Take(_))
+                | Some(PipelineStep::Skip(_))
+                | Some(PipelineStep::StepBy(_))
+                | Some(PipelineStep::DropWhile(_))
+                | Some(PipelineStep::TakeWhile(_))
+                | Some(PipelineStep::Distinct) => {
                     unreachable!()
                 }
                 Some(PipelineStep::Partition { .. }) => {
                     unreachable!("partition is handled before the terminal match")
                 }
             }
+            if (matches!(terminal, Some(PipelineStep::Any)) && any_result)
+                || (matches!(terminal, Some(PipelineStep::All)) && !all_result)
+            {
+                break;
+            }
+            if stop_after_item {
+                break;
+            }
         }
 
         match terminal {
             Some(PipelineStep::Count) => Ok(Value::Int(count)),
-            Some(PipelineStep::Sum) => Ok(total),
+            Some(PipelineStep::Sum) => Ok(sum.finish()),
             Some(PipelineStep::Average) => {
                 if count == 0 {
                     Err(self.runtime_error("average requires at least one numeric value".into()))
@@ -3733,6 +4945,8 @@ impl Evaluator {
             Some(PipelineStep::Max) => maximum.ok_or_else(|| {
                 self.runtime_error("max requires at least one numeric value".into())
             }),
+            Some(PipelineStep::Any) => Ok(Value::Bool(any_result)),
+            Some(PipelineStep::All) => Ok(Value::Bool(all_result)),
             Some(PipelineStep::Partition { .. }) => match partitioned {
                 Some(categories) => Ok(partition_result(categories)),
                 None => Err(self.runtime_error("partition result was not initialized".into())),
@@ -3751,7 +4965,13 @@ impl Evaluator {
             }
             Some(PipelineStep::Chunk(_))
             | Some(PipelineStep::Parallel(_))
-            | Some(PipelineStep::Checkpoint(_)) => {
+            | Some(PipelineStep::Checkpoint(_))
+            | Some(PipelineStep::Take(_))
+            | Some(PipelineStep::Skip(_))
+            | Some(PipelineStep::StepBy(_))
+            | Some(PipelineStep::DropWhile(_))
+            | Some(PipelineStep::TakeWhile(_))
+            | Some(PipelineStep::Distinct) => {
                 unreachable!("control steps are not terminals")
             }
         }
@@ -3762,8 +4982,10 @@ impl Evaluator {
         values: &mut Vec<Value>,
         transforms: &[PipelineStep],
         terminal: Option<&PipelineStep>,
+        sum_type: Type,
     ) -> Result<Value, SimplyError> {
         let mut total = Value::Int(0);
+        let mut sum = SumAccumulator::new(sum_type);
         let mut count = 0i64;
         let mut minimum = None;
         let mut maximum = None;
@@ -3792,13 +5014,21 @@ impl Evaluator {
                     | PipelineStep::Average
                     | PipelineStep::Min
                     | PipelineStep::Max
+                    | PipelineStep::Any
+                    | PipelineStep::All
                     | PipelineStep::WriteCsv(_)
                     | PipelineStep::Partition { .. } => {
                         unreachable!()
                     }
                     PipelineStep::Chunk(_)
                     | PipelineStep::Parallel(_)
-                    | PipelineStep::Checkpoint(_) => {}
+                    | PipelineStep::Checkpoint(_)
+                    | PipelineStep::Take(_)
+                    | PipelineStep::Skip(_)
+                    | PipelineStep::StepBy(_)
+                    | PipelineStep::DropWhile(_)
+                    | PipelineStep::TakeWhile(_)
+                    | PipelineStep::Distinct => {}
                 }
             }
 
@@ -3808,12 +5038,7 @@ impl Evaluator {
             match terminal {
                 Some(PipelineStep::Count) => count += 1,
                 Some(PipelineStep::Sum) => {
-                    total = operations::binary(
-                        total,
-                        &BinaryOperator::Add,
-                        value,
-                        self.current_span.as_ref(),
-                    )?;
+                    sum.add(value, self.current_span.as_ref())?;
                 }
                 Some(PipelineStep::Average) => {
                     total = operations::binary(
@@ -3836,7 +5061,7 @@ impl Evaluator {
 
         match terminal {
             Some(PipelineStep::Count) => Ok(Value::Int(count)),
-            Some(PipelineStep::Sum) => Ok(total),
+            Some(PipelineStep::Sum) => Ok(sum.finish()),
             Some(PipelineStep::Average) => {
                 if count == 0 {
                     Err(self.runtime_error("average requires at least one numeric value".into()))
@@ -3944,6 +5169,172 @@ impl Evaluator {
         }
     }
 
+    fn evaluate_enumerate(&mut self, arguments: &[Expr]) -> Result<Value, SimplyError> {
+        if arguments.len() != 1 {
+            return Err(self.runtime_error("`enumerate` expects one argument".into()));
+        }
+        let sequence = self.evaluate(&arguments[0])?;
+        let pairs = match sequence {
+            Value::Array(values) | Value::List(values) | Value::Tuple(values) => {
+                enumerate_values(values.iter().cloned())
+            }
+            Value::Range { start, end, step } => {
+                enumerate_values(Value::range_values(start, end, step))
+            }
+            Value::String(text) => enumerate_values(
+                text.chars()
+                    .map(|character| Value::String(character.to_string())),
+            ),
+            _ => {
+                return Err(self.runtime_error(
+                    "`enumerate` requires an array, list, tuple, range, or string".into(),
+                ));
+            }
+        }
+        .map_err(|message| self.runtime_error(message))?;
+        Ok(Value::Array(shared_values(pairs)))
+    }
+
+    fn evaluate_zip(&mut self, arguments: &[Expr]) -> Result<Value, SimplyError> {
+        if arguments.len() != 2 {
+            return Err(self.runtime_error("`zip` expects two arguments".into()));
+        }
+        let left = self.evaluate(&arguments[0])?;
+        let right = self.evaluate(&arguments[1])?;
+        let left = sequence_values(left).map_err(|message| self.runtime_error(message))?;
+        let right = sequence_values(right).map_err(|message| self.runtime_error(message))?;
+        let pairs = zip_values(left, right).map_err(|message| self.runtime_error(message))?;
+        Ok(Value::Array(shared_values(pairs)))
+    }
+
+    fn evaluate_map_keys_or_values(
+        &mut self,
+        name: &str,
+        arguments: &[Expr],
+    ) -> Result<Value, SimplyError> {
+        if name == "select_keys" {
+            if arguments.len() != 2 {
+                return Err(
+                    self.runtime_error("`select_keys` expects a map and key sequence".into())
+                );
+            }
+            let collection = self.evaluate(&arguments[0])?;
+            let keys = match self.evaluate(&arguments[1])? {
+                Value::Array(keys) | Value::List(keys) | Value::Tuple(keys) => keys,
+                _ => {
+                    return Err(self.runtime_error(
+                        "`select_keys` expects an array, list, or tuple of strings".into(),
+                    ));
+                }
+            };
+            let mut selected = std::collections::HashSet::with_capacity(keys.len());
+            for key in keys.iter() {
+                let Value::String(key) = key else {
+                    return Err(self.runtime_error("`select_keys` keys must be strings".into()));
+                };
+                selected.insert(key.as_str());
+            }
+            return match collection {
+                Value::Hash(entries) => Ok(Value::Hash(shared_map(
+                    entries
+                        .iter()
+                        .filter(|(key, _)| selected.contains(key.as_str()))
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                ))),
+                Value::Tree(entries) => Ok(Value::Tree(shared_map(
+                    entries
+                        .iter()
+                        .filter(|(key, _)| selected.contains(key.as_str()))
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                ))),
+                _ => Err(self.runtime_error("`select_keys` requires a Hash or Tree".into())),
+            };
+        }
+        if name == "without_key" {
+            if arguments.len() != 2 {
+                return Err(self.runtime_error("`without_key` expects a map and key".into()));
+            }
+            let collection = self.evaluate(&arguments[0])?;
+            let key = match self.evaluate(&arguments[1])? {
+                Value::String(key) => key,
+                _ => return Err(self.runtime_error("`without_key` key must be a string".into())),
+            };
+            return match collection {
+                Value::Hash(entries) => {
+                    let mut entries = (*entries).clone();
+                    entries.remove(&key);
+                    Ok(Value::Hash(shared_map(entries)))
+                }
+                Value::Tree(entries) => {
+                    let mut entries = (*entries).clone();
+                    entries.remove(&key);
+                    Ok(Value::Tree(shared_map(entries)))
+                }
+                _ => Err(self.runtime_error("`without_key` requires a Hash or Tree".into())),
+            };
+        }
+        if name == "get" {
+            if arguments.len() != 3 {
+                return Err(
+                    self.runtime_error("`get` expects a map, key, and default value".into())
+                );
+            }
+            let collection = self.evaluate(&arguments[0])?;
+            let key = match self.evaluate(&arguments[1])? {
+                Value::String(key) => key,
+                _ => return Err(self.runtime_error("`get` key must be a string".into())),
+            };
+            let entries = match collection {
+                Value::Hash(entries) | Value::Tree(entries) => entries,
+                _ => return Err(self.runtime_error("`get` requires a Hash or Tree".into())),
+            };
+            if let Some(value) = entries.get(&key) {
+                return Ok(value.clone());
+            }
+            return self.evaluate(&arguments[2]);
+        }
+        if name == "has_key" {
+            if arguments.len() != 2 {
+                return Err(self.runtime_error("`has_key` expects two arguments".into()));
+            }
+            let collection = self.evaluate(&arguments[0])?;
+            let key = match self.evaluate(&arguments[1])? {
+                Value::String(key) => key,
+                _ => return Err(self.runtime_error("`has_key` key must be a string".into())),
+            };
+            let result = match collection {
+                Value::Hash(entries) | Value::Tree(entries) => entries.contains_key(&key),
+                _ => return Err(self.runtime_error("`has_key` requires a Hash or Tree".into())),
+            };
+            return Ok(Value::Bool(result));
+        }
+        if arguments.len() != 1 {
+            return Err(self.runtime_error(format!("`{name}` expects one argument")));
+        }
+        let collection = self.evaluate(&arguments[0])?;
+        let result = match collection {
+            Value::Hash(entries) | Value::Tree(entries) if name == "keys" => {
+                entries.keys().cloned().map(Value::String).collect()
+            }
+            Value::Hash(entries) | Value::Tree(entries) if name == "entries" => entries
+                .iter()
+                .map(|(key, value)| {
+                    Value::Tuple(shared_values(vec![
+                        Value::String(key.clone()),
+                        value.clone(),
+                    ]))
+                })
+                .collect(),
+            Value::Hash(entries) | Value::Tree(entries) => entries.values().cloned().collect(),
+            _ => {
+                return Err(self.runtime_error(format!("`{name}` requires a Hash or Tree")));
+            }
+        };
+        Ok(Value::Array(shared_values(result)))
+    }
+
     fn runtime_error_with_code(
         &self,
         code: DiagnosticCode,
@@ -4045,8 +5436,8 @@ impl Evaluator {
             | (Value::Tree(_), Type::Tree)
             | (Value::Matrix(_), Type::Matrix)
             | (Value::Function(_), Type::Function { .. }) => true,
-            (Value::Struct(instance), Type::Struct(expected)) => &instance.type_name == expected,
-            (Value::Enum(value), Type::Enum(expected)) => &value.enum_name == expected,
+            (Value::Struct(instance), Type::Struct(expected)) => &instance.identity == expected,
+            (Value::Enum(value), Type::Enum(expected)) => &value.identity == expected,
             (Value::Range { .. }, Type::Range) => true,
             (Value::CsvStream { .. }, Type::CsvStream) => true,
             (Value::Array(_), Type::Array(element)) | (Value::List(_), Type::List(element))
@@ -4113,8 +5504,8 @@ impl Evaluator {
                 }
             }
             Value::Matrix(_) => Type::Matrix,
-            Value::Struct(instance) => Type::Struct(instance.type_name.clone()),
-            Value::Enum(value) => Type::Enum(value.enum_name.clone()),
+            Value::Struct(instance) => Type::Struct(instance.identity.clone()),
+            Value::Enum(value) => Type::Enum(value.identity.clone()),
             Value::Function(function) => Type::Function {
                 parameters: function
                     .parameters
@@ -4126,12 +5517,220 @@ impl Evaluator {
             Value::Unit => Type::Unit,
         }
     }
+
+    fn sequence_sum_type(&self, expression: &Expr) -> Type {
+        self.sequence_sum_type_from_type(&self.runtime_expression_type(expression, None))
+    }
+
+    fn pipeline_sum_type(&self, source: &Expr, steps: &[PipelineStep]) -> Type {
+        if !matches!(steps.last(), Some(PipelineStep::Sum)) {
+            return Type::Unknown;
+        }
+        let mut item_type = self.sequence_item_type(&self.runtime_expression_type(source, None));
+        for step in &steps[..steps.len() - 1] {
+            if let PipelineStep::Derive(expression) = step {
+                item_type = self.runtime_expression_type(expression, Some(&item_type));
+            }
+        }
+        item_type
+    }
+
+    fn sequence_item_type(&self, typ: &Type) -> Type {
+        match typ {
+            Type::Array(element) | Type::List(element) => (**element).clone(),
+            Type::Tuple(elements) => {
+                if elements.contains(&Type::Float) {
+                    Type::Float
+                } else if elements.contains(&Type::Unknown) {
+                    Type::Unknown
+                } else {
+                    Type::Int
+                }
+            }
+            Type::Range => Type::Int,
+            Type::CsvStream => Type::List(Box::new(Type::String)),
+            _ => Type::Unknown,
+        }
+    }
+
+    fn sequence_sum_type_from_type(&self, typ: &Type) -> Type {
+        match self.sequence_item_type(typ) {
+            Type::Float => Type::Float,
+            Type::Int => Type::Int,
+            _ => Type::Unknown,
+        }
+    }
+
+    fn runtime_expression_type(&self, expression: &Expr, item_type: Option<&Type>) -> Type {
+        match expression {
+            Expr::Literal(literal) => match literal {
+                Literal::String(_) => Type::String,
+                Literal::Int(_) => Type::Int,
+                Literal::Float(_) => Type::Float,
+                Literal::Bool(_) => Type::Bool,
+            },
+            Expr::Identifier(name) if name == "item" => item_type.cloned().unwrap_or(Type::Unknown),
+            Expr::Identifier(name) => self
+                .variable_types
+                .lookup(name)
+                .cloned()
+                .unwrap_or(Type::Unknown),
+            Expr::Unary { operator, operand } => match operator {
+                UnaryOperator::Negate => self.runtime_expression_type(operand, item_type),
+                UnaryOperator::Not => Type::Bool,
+                UnaryOperator::Transpose => Type::Matrix,
+            },
+            Expr::Binary {
+                left,
+                operator,
+                right,
+            } => {
+                use BinaryOperator::{
+                    Add, And, Divide, Equal, Greater, GreaterEqual, Less, LessEqual,
+                    MatrixMultiply, Multiply, NotEqual, Or, Remainder, Subtract,
+                };
+                let left = self.runtime_expression_type(left, item_type);
+                let right = self.runtime_expression_type(right, item_type);
+                match operator {
+                    Greater | GreaterEqual | Less | LessEqual | Equal | NotEqual | And | Or => {
+                        Type::Bool
+                    }
+                    MatrixMultiply => Type::Matrix,
+                    Add if left == Type::String && right == Type::String => Type::String,
+                    Add | Divide | Multiply | Remainder | Subtract
+                        if matches!(left, Type::Int | Type::Float)
+                            && matches!(right, Type::Int | Type::Float) =>
+                    {
+                        if left == Type::Float || right == Type::Float {
+                            Type::Float
+                        } else {
+                            Type::Int
+                        }
+                    }
+                    _ => Type::Unknown,
+                }
+            }
+            Expr::Call { name, arguments } => {
+                if let Some(Type::Function {
+                    return_type: Some(return_type),
+                    ..
+                }) = self.variable_types.lookup(name)
+                {
+                    return (**return_type).clone();
+                }
+                match name.as_str() {
+                    "to_float" | "sqrt" | "exp" | "log" | "log10" | "sin" | "cos" | "tan"
+                    | "floor" | "ceil" | "pow" | "norm" | "distance" | "mean" => Type::Float,
+                    "to_int" | "sign" | "length" | "count" => Type::Int,
+                    "type_of" | "read_file" | "trim" | "substring" | "replace" | "join" => {
+                        Type::String
+                    }
+                    "range" => Type::Range,
+                    "csv_rows" => Type::CsvStream,
+                    "total" if arguments.len() == 1 => self.sequence_sum_type(&arguments[0]),
+                    "abs" | "round" if !arguments.is_empty() => {
+                        self.runtime_expression_type(&arguments[0], item_type)
+                    }
+                    _ => Type::Unknown,
+                }
+            }
+            Expr::Array(values) => {
+                Type::Array(Box::new(self.collection_element_type(values, item_type)))
+            }
+            Expr::List(values) => {
+                Type::List(Box::new(self.collection_element_type(values, item_type)))
+            }
+            Expr::Tuple(values) => Type::Tuple(
+                values
+                    .iter()
+                    .map(|value| self.runtime_expression_type(value, item_type))
+                    .collect(),
+            ),
+            Expr::Index { target, .. } => match self.runtime_expression_type(target, item_type) {
+                Type::Array(element) | Type::List(element) => *element,
+                Type::Tuple(elements) if !elements.is_empty() => {
+                    if elements.iter().all(|typ| typ == &elements[0]) {
+                        elements[0].clone()
+                    } else {
+                        Type::Unknown
+                    }
+                }
+                _ => Type::Unknown,
+            },
+            Expr::Pipeline { .. }
+            | Expr::MessageDispatch { .. }
+            | Expr::EnumVariant { .. }
+            | Expr::Match { .. }
+            | Expr::Field { .. }
+            | Expr::Hash(_)
+            | Expr::Tree(_)
+            | Expr::Matrix(_) => Type::Unknown,
+        }
+    }
+
+    fn collection_element_type(&self, values: &[Expr], item_type: Option<&Type>) -> Type {
+        let mut element_type = Type::Unknown;
+        for value in values {
+            let value_type = self.runtime_expression_type(value, item_type);
+            if element_type == Type::Unknown {
+                element_type = value_type;
+            } else if value_type == Type::Float && matches!(element_type, Type::Int | Type::Float) {
+                element_type = Type::Float;
+            } else if value_type != element_type {
+                return Type::Unknown;
+            }
+        }
+        element_type
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime::value::shared_values;
+    use crate::semantic::SemanticAnalyzer;
+    use crate::types::DeclarationKind;
+
+    #[test]
+    fn in_memory_declarations_have_deterministic_module_identity() {
+        let program = Parser::new(
+            Lexer::new(
+                "type Item:\n    value as Int\nend\n\
+                 enum State:\n    Ready\nend\n\
+                 item is Item(1)\nstate is State::Ready\n",
+            )
+            .tokenize()
+            .expect("valid source should tokenize"),
+        )
+        .parse()
+        .expect("valid source should parse");
+        SemanticAnalyzer::new()
+            .analyze(&program)
+            .expect("in-memory declarations should type check");
+
+        for _ in 0..2 {
+            let mut evaluator = Evaluator::new();
+            evaluator
+                .run(&program)
+                .expect("in-memory declarations should execute");
+            let Value::Struct(item) = evaluator.lookup("item").expect("item should be bound")
+            else {
+                panic!("item should be a struct value");
+            };
+            let Value::Enum(state) = evaluator.lookup("state").expect("state should be bound")
+            else {
+                panic!("state should be an enum value");
+            };
+            assert_eq!(
+                item.identity,
+                DeclarationIdentity::new("memory://root", "Item", DeclarationKind::Struct)
+            );
+            assert_eq!(
+                state.identity,
+                DeclarationIdentity::new("memory://root", "State", DeclarationKind::Enum)
+            );
+        }
+    }
 
     #[test]
     fn runtime_checks_enum_payload_types_without_semantic_analysis() {

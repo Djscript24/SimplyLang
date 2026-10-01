@@ -1,0 +1,26 @@
+base is 40
+prefix is "Hello "
+
+fn add(left as Int, right as Int) gives Int:
+    return left + right
+end
+
+fn plus_base(value as Int) gives Int:
+    return base + value
+end
+
+type Person:
+    name as String
+end
+
+on Person receive greeting:
+    return prefix + name
+end
+
+enum State:
+    Ready as Int
+    Failed as Int
+end
+
+export add, plus_base, base, Person, State
+return add

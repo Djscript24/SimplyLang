@@ -103,7 +103,7 @@ pub fn run() -> i32 {
         Command::Tokens => debug_tokens(&source),
         Command::Ast => debug_ast(&source),
         Command::Format => {
-            validate_source(&source).map(|_| print!("{}", formatter::format(&source)))
+            validate_source(&source, &path).map(|_| print!("{}", formatter::format(&source)))
         }
         Command::Check => {
             println!(
@@ -262,7 +262,7 @@ struct ExplainStats {
 fn explain_source(source: &str, path: &Path) -> Result<(), SimplyError> {
     let tokens = Lexer::new(source).tokenize()?;
     let program = Parser::new(tokens).parse()?;
-    SemanticAnalyzer::new().analyze(&program)?;
+    SemanticAnalyzer::new().analyze_file_program(path, &program)?;
 
     let mut stats = ExplainStats::default();
     collect_statement_stats(&program.statements, &mut stats, false);
@@ -293,7 +293,7 @@ fn explain_source(source: &str, path: &Path) -> Result<(), SimplyError> {
 fn explain_flow_source(source: &str, path: &Path) -> Result<(), SimplyError> {
     let tokens = Lexer::new(source).tokenize()?;
     let program = Parser::new(tokens).parse()?;
-    SemanticAnalyzer::new().analyze(&program)?;
+    SemanticAnalyzer::new().analyze_file_program(path, &program)?;
 
     let flows: Vec<_> = program
         .statements
@@ -393,12 +393,20 @@ fn flow_step_name(step: &PipelineStep) -> &'static str {
     match step {
         PipelineStep::Where(_) => "where",
         PipelineStep::Derive(_) => "derive",
+        PipelineStep::Take(_) => "take",
+        PipelineStep::Skip(_) => "skip",
+        PipelineStep::StepBy(_) => "step_by",
+        PipelineStep::TakeWhile(_) => "take_while",
+        PipelineStep::DropWhile(_) => "drop_while",
+        PipelineStep::Distinct => "distinct",
         PipelineStep::Partition { .. } => "partition",
         PipelineStep::Sum => "sum",
         PipelineStep::Count => "count",
         PipelineStep::Average => "average",
         PipelineStep::Min => "min",
         PipelineStep::Max => "max",
+        PipelineStep::Any => "any",
+        PipelineStep::All => "all",
         PipelineStep::WriteCsv(_) => "write_csv",
         PipelineStep::Chunk(_) => "chunk",
         PipelineStep::Parallel(_) => "parallel (validated scalar workers)",
@@ -413,6 +421,8 @@ fn flow_terminal_name(step: &PipelineStep) -> Option<&'static str> {
         PipelineStep::Average => Some("average"),
         PipelineStep::Min => Some("min"),
         PipelineStep::Max => Some("max"),
+        PipelineStep::Any => Some("any"),
+        PipelineStep::All => Some("all"),
         PipelineStep::Partition { .. } => Some("partition"),
         PipelineStep::WriteCsv(_) => Some("write_csv"),
         _ => None,
@@ -444,6 +454,8 @@ fn collect_statement_stats(statements: &[Stmt], stats: &mut ExplainStats, inside
                     match step {
                         PipelineStep::Where(expression)
                         | PipelineStep::Derive(expression)
+                        | PipelineStep::TakeWhile(expression)
+                        | PipelineStep::DropWhile(expression)
                         | PipelineStep::WriteCsv(expression)
                         | PipelineStep::Checkpoint(expression) => {
                             collect_expression_stats(expression, stats)
@@ -521,6 +533,7 @@ fn collect_statement_stats(statements: &[Stmt], stats: &mut ExplainStats, inside
                 collect_expression_stats(value, stats);
             }
             Stmt::Import { .. }
+            | Stmt::Export { .. }
             | Stmt::Struct { .. }
             | Stmt::Enum { .. }
             | Stmt::Break
@@ -618,7 +631,7 @@ fn benchmark_source(source: &str, path: &Path) -> Result<(), SimplyError> {
         parse_nanos += started.elapsed().as_nanos();
 
         let started = Instant::now();
-        SemanticAnalyzer::new().analyze(&program)?;
+        SemanticAnalyzer::new().analyze_file_program(path, &program)?;
         semantic_nanos += started.elapsed().as_nanos();
         parsed_program = Some(program);
     }
@@ -899,10 +912,20 @@ fn check_path(path: &Path) -> Result<(), SimplyError> {
     analyzer.analyze_file(path)
 }
 
-fn validate_source(source: &str) -> Result<(), SimplyError> {
+fn validate_source(source: &str, path: &Path) -> Result<(), SimplyError> {
     let tokens = Lexer::new(source).tokenize()?;
     let program = Parser::new(tokens).parse()?;
-    SemanticAnalyzer::new().analyze(&program)
+    let has_exports = program.statements.iter().any(|statement| match statement {
+        Stmt::Export { .. } => true,
+        Stmt::Located { statement, .. } => matches!(statement.as_ref(), Stmt::Export { .. }),
+        _ => false,
+    });
+    let mut analyzer = SemanticAnalyzer::new();
+    if has_exports {
+        analyzer.analyze_module_file_program(path, &program)
+    } else {
+        analyzer.analyze_file_program(path, &program)
+    }
 }
 
 fn cli_error(message: impl Into<String>) -> SimplyError {

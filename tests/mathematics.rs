@@ -176,7 +176,14 @@ fn computes_population_statistics_and_linear_percentiles() {
          Sayln percentile(values, 25)\n\
          Sayln covariance([1, 2, 3], [2, 4, 6])\n\
          Sayln correlation([1, 2, 3], [2, 4, 6])\n\
-         Sayln mean(range(1, 4))\n",
+         Sayln mean(range(1, 4))\n\
+         mean_value is mean(values)\n\
+         average_value is pipeline:\n\
+             values\n\
+             average\n\
+         end\n\
+         Sayln mean_value\n\
+         Sayln average_value\n",
     );
     assert!(success, "{stdout}");
     assert_eq!(
@@ -190,6 +197,8 @@ fn computes_population_statistics_and_linear_percentiles() {
             "1.3333333333333333",
             "1",
             "2",
+            "2.5",
+            "2.5",
         ]
     );
 }

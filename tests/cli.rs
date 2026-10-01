@@ -32,6 +32,26 @@ fn compiler_foundation_example_scans_its_source_file() {
 }
 
 #[test]
+fn module_fixture_paths_are_excluded_from_runnable_examples() {
+    for path in [
+        Path::new("17-modules/modules/math.si"),
+        Path::new("17-modules/modules/constants.si"),
+        Path::new("17-modules/modules/nested/config.si"),
+    ] {
+        let skipped = path.starts_with("99-bench")
+            || path.starts_with(Path::new("14-modules/modules"))
+            || path.starts_with(Path::new("17-modules/modules"))
+            || path == Path::new("08-standard-library/imported-values.si")
+            || path == Path::new("11-compiler-foundations/sample-source.si");
+        assert!(
+            skipped,
+            "module fixture should be excluded: {}",
+            path.display()
+        );
+    }
+}
+
+#[test]
 fn every_runnable_example_is_a_conformance_regression() {
     fn copy_tree(source: &Path, destination: &Path) {
         fs::create_dir_all(destination).expect("failed to create copied examples directory");
@@ -59,6 +79,8 @@ fn every_runnable_example_is_a_conformance_regression() {
                     .strip_prefix(examples)
                     .expect("example source should be under examples");
                 if relative.starts_with("99-bench")
+                    || relative.starts_with(Path::new("14-modules/modules"))
+                    || relative.starts_with(Path::new("17-modules/modules"))
                     || relative == Path::new("08-standard-library/imported-values.si")
                     || relative == Path::new("11-compiler-foundations/sample-source.si")
                 {
@@ -156,6 +178,234 @@ fn check_recursively_analyzes_imported_modules_and_their_returned_types() {
 }
 
 #[test]
+fn module_declarations_are_not_implicitly_exported() {
+    let id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("simply-module-visibility-{id}"));
+    fs::create_dir_all(&root).expect("failed to create module visibility directory");
+    fs::write(
+        root.join("person.si"),
+        "type Person:\n\
+             name as String\n\
+         end\n\
+         on Person receive greet:\n\
+             return name\n\
+         end\n\
+         return Person(\"Ada\")\n",
+    )
+    .expect("failed to write struct module");
+    let main = root.join("main.si");
+    fs::write(&main, "open \"person.si\" as person\nPerson(\"Grace\")\n")
+        .expect("failed to write importer");
+    let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["check", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to check module declaration visibility");
+    let error = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(error.contains("unknown struct type `Person`"), "{error}");
+    fs::remove_dir_all(root).expect("failed to remove module visibility directory");
+}
+
+#[test]
+fn imports_select_explicit_named_module_exports() {
+    let id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("simply-named-exports-{id}"));
+    fs::create_dir_all(&root).expect("failed to create named export directory");
+    fs::write(
+        root.join("math.si"),
+        "base is 40\n\
+         hidden is 100\n\
+         fn add(left as Int, right as Int) gives Int:\n\
+             return left + right\n\
+         end\n\
+         fn plus_base(value as Int) gives Int:\n\
+             return base + value\n\
+         end\n\
+         export add, plus_base, base\n\
+         return add\n",
+    )
+    .expect("failed to write module with named exports");
+    let main = root.join("main.si");
+    fs::write(
+        &main,
+        "open \"math.si\" exposing add as add_numbers, plus_base, base\n\
+         Sayln add_numbers(2, 3)\n\
+         Sayln plus_base(2)\n\
+         Sayln base\n",
+    )
+    .expect("failed to write named importer");
+
+    let checked = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["check", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to check named exports");
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["run", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to run named exports");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "5\n42\n40");
+
+    let formatted = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["fmt", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to format named importer");
+    assert!(
+        formatted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&formatted.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&formatted.stdout)
+            .contains("open \"math.si\" exposing add as add_numbers, plus_base, base"),
+        "{}",
+        String::from_utf8_lossy(&formatted.stdout)
+    );
+
+    let formatted_module = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args([
+            "fmt",
+            root.join("math.si")
+                .to_str()
+                .expect("test path was not UTF-8"),
+        ])
+        .output()
+        .expect("failed to format exporting module");
+    assert!(
+        formatted_module.status.success(),
+        "{}",
+        String::from_utf8_lossy(&formatted_module.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&formatted_module.stdout).contains("export add, plus_base, base"),
+        "{}",
+        String::from_utf8_lossy(&formatted_module.stdout)
+    );
+
+    fs::write(&main, "open \"math.si\" exposing hidden\nSayln hidden\n")
+        .expect("failed to write private-name importer");
+    let private_name = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["check", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to check private export");
+    assert!(!private_name.status.success());
+    assert!(
+        String::from_utf8_lossy(&private_name.stderr).contains("module does not export `hidden`"),
+        "{}",
+        String::from_utf8_lossy(&private_name.stderr)
+    );
+
+    fs::write(root.join("invalid.si"), "export missing\nreturn 1\n")
+        .expect("failed to write invalid export module");
+    fs::write(&main, "open \"invalid.si\" exposing missing\n")
+        .expect("failed to write invalid exporter importer");
+    let invalid_export = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["check", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to check invalid export");
+    assert!(!invalid_export.status.success());
+    assert!(
+        String::from_utf8_lossy(&invalid_export.stderr)
+            .contains("cannot export unknown value `missing`"),
+        "{}",
+        String::from_utf8_lossy(&invalid_export.stderr)
+    );
+
+    fs::write(&main, "open \"invalid.si\" as invalid\n")
+        .expect("failed to write runtime invalid exporter importer");
+    let runtime_invalid_export = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["run", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to run invalid exporter");
+    assert!(!runtime_invalid_export.status.success());
+    assert!(
+        String::from_utf8_lossy(&runtime_invalid_export.stderr)
+            .contains("cannot export unknown value `missing`"),
+        "{}",
+        String::from_utf8_lossy(&runtime_invalid_export.stderr)
+    );
+
+    fs::remove_dir_all(root).expect("failed to remove named export directory");
+}
+
+#[test]
+fn imports_named_structs_enums_and_struct_messages_with_aliases() {
+    let id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("simply-named-type-exports-{id}"));
+    fs::create_dir_all(&root).expect("failed to create named type export directory");
+    fs::write(
+        root.join("types.si"),
+        "prefix is \"Hello \"\n\
+         type Person:\n\
+             name as String\n\
+         end\n\
+         on Person receive greeting:\n\
+             return prefix + name\n\
+         end\n\
+         enum State:\n\
+             Ready as Int\n\
+             Failed as String\n\
+         end\n\
+         export Person, State\n\
+         return 0\n",
+    )
+    .expect("failed to write module with exported types");
+    let main = root.join("main.si");
+    fs::write(
+        &main,
+        "open \"types.si\" exposing Person as ImportedPerson, State as ImportedState\n\
+         person is ImportedPerson(\"Ada\")\n\
+         Sayln person :: greeting\n\
+         state is ImportedState::Ready(42)\n\
+         message is match state:\n\
+             ImportedState::Ready(value):\n\
+                 \"ready\"\n\
+             ImportedState::Failed(error):\n\
+                 error\n\
+         end\n\
+         Sayln message\n",
+    )
+    .expect("failed to write named type importer");
+
+    let checked = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["check", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to check imported types");
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["run", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to run imported types");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "Hello Ada\nready"
+    );
+
+    fs::remove_dir_all(root).expect("failed to remove named type export directory");
+}
+
+#[test]
 fn check_propagates_semantic_errors_from_imported_modules() {
     let root = std::env::temp_dir().join(format!(
         "simply-check-invalid-import-{}-{}",
@@ -229,7 +479,7 @@ fn check_parses_imported_sources_without_executing_them() {
         "static checking executed the imported module"
     );
 
-    fs::write(root.join("invalid.si"), "return (1 +\n")
+    fs::write(root.join("invalid.si"), "# module header\nreturn (1 + )\n")
         .expect("failed to write syntactically invalid module");
     fs::write(&main, "open \"invalid.si\" as value\n")
         .expect("failed to write invalid import entry point");
@@ -241,8 +491,116 @@ fn check_parses_imported_sources_without_executing_them() {
     assert!(!invalid.status.success());
     assert!(error.contains("invalid.si"), "{error}");
     assert!(error.contains("Parse error"), "{error}");
+    assert!(error.contains("2 | return (1 + )"), "{error}");
+
+    fs::create_dir_all(root.join("nested")).expect("failed to create nested import directory");
+    fs::write(root.join("nested/inner.si"), "return 1 + \"bad\"\n")
+        .expect("failed to write nested invalid module");
+    fs::write(
+        root.join("outer.si"),
+        "open \"nested/inner.si\" as inner\nreturn inner\n",
+    )
+    .expect("failed to write outer imported module");
+    fs::write(&main, "open \"outer.si\" as outer\n")
+        .expect("failed to write nested import entry point");
+    let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["check", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to check nested invalid import");
+    let nested_error = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(nested_error.contains("inner.si"), "{nested_error}");
+    assert!(nested_error.contains("error[E0003]"), "{nested_error}");
 
     fs::remove_dir_all(root).expect("failed to remove import test directory");
+}
+
+#[test]
+fn imported_module_failures_render_the_originating_source() {
+    let root = std::env::temp_dir().join(format!(
+        "simply-import-diagnostic-source-{}-{}",
+        std::process::id(),
+        TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&root).expect("failed to create imported diagnostic fixture");
+    let main = root.join("main.si");
+    let imported = root.join("module.si");
+    fs::write(
+        &main,
+        "open \"module.si\" as module\n\
+         Sayln \"root line two\"\n\
+         Sayln \"root line three\"\n",
+    )
+    .expect("failed to write importer source");
+    fs::write(
+        &imported,
+        "# module header\n\
+         # second module line\n\
+         return 1 + \"bad\"\n",
+    )
+    .expect("failed to write imported source");
+
+    let checked = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["check", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to check imported semantic failure");
+    let check_error = String::from_utf8_lossy(&checked.stderr);
+    assert!(!checked.status.success());
+    assert!(check_error.contains("module.si:3:1"), "{check_error}");
+    assert!(
+        check_error.contains("3 | return 1 + \"bad\""),
+        "{check_error}"
+    );
+    assert!(
+        !check_error.contains("3 | Sayln \"root line three\""),
+        "{check_error}"
+    );
+
+    fs::write(
+        &imported,
+        "# module header\n# second module line\nreturn 1 / 0\n",
+    )
+    .expect("failed to write imported runtime failure");
+    let executed = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["run", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to run imported runtime failure");
+    let runtime_error = String::from_utf8_lossy(&executed.stderr);
+    assert!(!executed.status.success());
+    assert!(runtime_error.contains("module.si:3:1"), "{runtime_error}");
+    assert!(
+        runtime_error.contains("3 | return 1 / 0"),
+        "{runtime_error}"
+    );
+    assert!(
+        !runtime_error.contains("3 | Sayln \"root line three\""),
+        "{runtime_error}"
+    );
+
+    fs::write(
+        &imported,
+        "# module header\n\
+         fn fail():\n\
+             return 1 / 0\n\
+         end\n\
+         return fail\n",
+    )
+    .expect("failed to write imported function failure");
+    fs::write(&main, "open \"module.si\" as fail\nSayln fail()\n")
+        .expect("failed to write imported function caller");
+    let invoked = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["run", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to invoke imported function failure");
+    let function_error = String::from_utf8_lossy(&invoked.stderr);
+    assert!(!invoked.status.success());
+    assert!(function_error.contains("module.si:3:1"), "{function_error}");
+    assert!(
+        function_error.contains("3 | return 1 / 0"),
+        "{function_error}"
+    );
+
+    fs::remove_dir_all(root).expect("failed to remove imported diagnostic fixture");
 }
 
 #[test]
@@ -254,11 +612,17 @@ fn check_reports_import_cycles_and_missing_modules() {
     ));
     fs::create_dir_all(&root).expect("failed to create import test directory");
     let main = root.join("main.si");
+    fs::create_dir_all(root.join("nested")).expect("failed to create nested cycle directory");
     fs::write(
         root.join("cycle.si"),
-        "open \"main.si\" as main\nreturn main\n",
+        "open \"nested/./third.si\" as third\nreturn third\n",
     )
     .expect("failed to write cyclic module");
+    fs::write(
+        root.join("nested/third.si"),
+        "open \"../main.si\" as main\nreturn main\n",
+    )
+    .expect("failed to write nested cyclic module");
     fs::write(&main, "open \"cycle.si\" as cycle\n").expect("failed to write cycle entry point");
     let cycle = Command::new(env!("CARGO_BIN_EXE_simply"))
         .args(["check", main.to_str().expect("test path was not UTF-8")])
@@ -267,6 +631,17 @@ fn check_reports_import_cycles_and_missing_modules() {
     let cycle_error = String::from_utf8_lossy(&cycle.stderr);
     assert!(!cycle.status.success());
     assert!(cycle_error.contains("cyclic import"), "{cycle_error}");
+    assert!(
+        cycle_error.contains("main.si")
+            && cycle_error.contains("cycle.si")
+            && cycle_error.contains("third.si"),
+        "{cycle_error}"
+    );
+    assert!(cycle_error.contains("third.si:1:1"), "{cycle_error}");
+    assert!(
+        cycle_error.contains("1 | open \"../main.si\" as main"),
+        "{cycle_error}"
+    );
 
     fs::write(&main, "open \"missing.si\" as missing\n")
         .expect("failed to write missing import entry point");
@@ -278,6 +653,11 @@ fn check_reports_import_cycles_and_missing_modules() {
     let _ = fs::remove_dir_all(root);
     assert!(!missing.status.success());
     assert!(missing_error.contains("could not open"), "{missing_error}");
+    assert!(missing_error.contains("main.si:1:1"), "{missing_error}");
+    assert!(
+        missing_error.contains("1 | open \"missing.si\" as missing"),
+        "{missing_error}"
+    );
 }
 
 #[test]
@@ -428,6 +808,116 @@ fn cli_commands_use_expected_exit_codes_and_streams() {
 }
 
 #[test]
+fn deeply_nested_expression_returns_a_located_parser_diagnostic() {
+    let source = format!("Sayln {}1{}\n", "(".repeat(1024), ")".repeat(1024));
+    let path = std::env::temp_dir().join(format!(
+        "simply-deep-expression-{}-{}.si",
+        std::process::id(),
+        TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, source).expect("failed to write deeply nested source");
+    let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["check", path.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to check deeply nested source");
+    let _ = fs::remove_file(path);
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("error[E0103] (Parse error)"), "{stderr}");
+    assert!(stderr.contains("  --> "), "{stderr}");
+    assert!(
+        stderr.contains("maximum expression nesting depth"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("overflowed its stack"), "{stderr}");
+}
+
+#[test]
+fn deeply_nested_blocks_return_a_located_parser_diagnostic() {
+    let source = format!(
+        "{}Sayln 1\n{}",
+        "if true:\n".repeat(1024),
+        "end\n".repeat(1024)
+    );
+    let path = std::env::temp_dir().join(format!(
+        "simply-deep-blocks-{}-{}.si",
+        std::process::id(),
+        TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, source).expect("failed to write deeply nested source");
+    let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["check", path.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to check deeply nested source");
+    let _ = fs::remove_file(path);
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("error[E0103] (Parse error)"), "{stderr}");
+    assert!(stderr.contains("  --> "), "{stderr}");
+    assert!(stderr.contains("maximum parser nesting depth"), "{stderr}");
+    assert!(!stderr.contains("overflowed its stack"), "{stderr}");
+}
+
+#[test]
+fn deeply_nested_types_and_patterns_return_parser_diagnostics() {
+    let sources = [
+        format!(
+            "fn accept(value as {}Int{}):\n    return 1\nend\n",
+            "List[".repeat(1024),
+            "]".repeat(1024)
+        ),
+        format!(
+            "Sayln match 0:\n{}:\n    1\n_:\n    0\nend\n",
+            "(".repeat(1024) + "value" + &")".repeat(1024)
+        ),
+    ];
+
+    for (index, source) in sources.into_iter().enumerate() {
+        let path = std::env::temp_dir().join(format!(
+            "simply-deep-type-or-pattern-{}-{index}.si",
+            std::process::id(),
+        ));
+        fs::write(&path, source).expect("failed to write deeply nested source");
+        let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+            .args(["check", path.to_str().expect("test path was not UTF-8")])
+            .output()
+            .expect("failed to check deeply nested source");
+        let _ = fs::remove_file(path);
+
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("error[E0103] (Parse error)"), "{stderr}");
+        assert!(stderr.contains("  --> "), "{stderr}");
+        assert!(stderr.contains("nesting depth"), "{stderr}");
+        assert!(!stderr.contains("overflowed its stack"), "{stderr}");
+    }
+}
+
+#[test]
+fn long_flat_operator_chain_is_not_rejected_by_nesting_limit() {
+    let source = format!("Sayln {}\n", vec!["1"; 512].join(" + "));
+    let path = std::env::temp_dir().join(format!(
+        "simply-flat-expression-{}-{}.si",
+        std::process::id(),
+        TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, source).expect("failed to write flat expression");
+    let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["check", path.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to check long flat expression");
+    let _ = fs::remove_file(path);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn test_command_discovers_only_direct_si_files_in_tests() {
     let (success, stdout, stderr) = run_test_project(&[
         ("tests/01-basic.si", "Sayln \"basic\"\n"),
@@ -493,6 +983,73 @@ fn repl_preserves_state_prints_expressions_and_recovers_from_errors() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unknown variable `missing`"));
     assert!(stderr.contains("error[E0206]"));
+}
+
+#[test]
+fn repl_imports_exported_names_and_main_file_still_rejects_export() {
+    let root = std::env::temp_dir().join(format!(
+        "simply-repl-export-{}-{}",
+        std::process::id(),
+        TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&root).expect("failed to create REPL export test directory");
+    fs::write(
+        root.join("math.si"),
+        "fn add(left as Int, right as Int) gives Int:\n\
+             return left + right\n\
+         end\n\
+         export add\n\
+         return add\n",
+    )
+    .expect("failed to write exporting module");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .arg("repl")
+        .current_dir(&root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start REPL");
+    child
+        .stdin
+        .as_mut()
+        .expect("REPL stdin was unavailable")
+        .write_all(b"open \"math.si\" exposing add as plus\nSayln plus(2, 3)\n")
+        .expect("failed to write REPL input");
+    drop(child.stdin.take());
+    let output = child
+        .wait_with_output()
+        .expect("failed to read REPL output");
+
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line == "5"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let main = root.join("main.si");
+    fs::write(&main, "export add\nreturn 1\n").expect("failed to write main file");
+    let main_output = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["run", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to run main-file export test");
+    let diagnostic = String::from_utf8_lossy(&main_output.stderr);
+    assert!(!main_output.status.success(), "{diagnostic}");
+    assert!(
+        diagnostic.contains("`export` is only allowed at the top level of an imported module"),
+        "{diagnostic}"
+    );
+
+    fs::remove_dir_all(root).expect("failed to clean up REPL export test directory");
 }
 
 #[test]

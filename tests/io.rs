@@ -151,6 +151,303 @@ fn streams_csv_rows_through_where_derive_and_writer() {
 }
 
 #[test]
+fn take_short_circuits_csv_before_writing_more_rows() {
+    let id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("simply-csv-take-{id}"));
+    fs::create_dir_all(&root).expect("failed to create CSV take test directory");
+    let input = root.join("input.csv");
+    let output = root.join("output.csv");
+    let source = root.join("main.si");
+    fs::write(&input, "Ada,keep\nLin,skip\nMira,keep\nbad\"quote,row\n")
+        .expect("failed to write CSV input");
+    fs::write(
+        &source,
+        format!(
+            "cleaned is pipeline:\n\
+                 csv_rows(\"{}\")\n\
+                 where item[1] == \"keep\"\n\
+                 take 2\n\
+                 derive item\n\
+                 write_csv(\"{}\")\n\
+             end\n",
+            input.display(),
+            output.display()
+        ),
+    )
+    .expect("failed to write CSV source");
+
+    let result = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args([
+            "run",
+            source.to_str().expect("CSV source path was not UTF-8"),
+        ])
+        .output()
+        .expect("failed to run CSV take pipeline");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&output).expect("failed to read CSV output"),
+        "Ada,keep\nMira,keep\n"
+    );
+    fs::remove_dir_all(root).expect("failed to clean up CSV take test directory");
+}
+
+#[test]
+fn skip_and_take_stream_csv_rows_in_order() {
+    let id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("simply-csv-skip-{id}"));
+    fs::create_dir_all(&root).expect("failed to create CSV skip test directory");
+    let input = root.join("input.csv");
+    let output = root.join("output.csv");
+    let source = root.join("main.si");
+    fs::write(&input, "Ada,10\nLin,20\nMira,30\nNia,10\n").expect("failed to write CSV input");
+    fs::write(
+        &source,
+        format!(
+            "flow selected from csv_rows(\"{}\"):\n\
+                 skip 1\n\
+                 take 2\n\
+                 derive item\n\
+                 write_csv(\"{}\")\n\
+             end\n",
+            input.display(),
+            output.display()
+        ),
+    )
+    .expect("failed to write CSV source");
+
+    let result = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args([
+            "run",
+            source.to_str().expect("CSV source path was not UTF-8"),
+        ])
+        .output()
+        .expect("failed to run CSV skip pipeline");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&output).expect("failed to read CSV output"),
+        "Lin,20\nMira,30\n"
+    );
+    fs::remove_dir_all(root).expect("failed to clean up CSV skip test directory");
+}
+
+#[test]
+fn step_by_streams_every_nth_csv_row_to_the_writer() {
+    let id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("simply-csv-step-by-{id}"));
+    fs::create_dir_all(&root).expect("failed to create CSV step_by test directory");
+    let input = root.join("input.csv");
+    let output = root.join("output.csv");
+    let source = root.join("main.si");
+    fs::write(&input, "Ada,10\nLin,20\nMira,30\nNia,40\nOmar,50\n")
+        .expect("failed to write CSV input");
+    fs::write(
+        &source,
+        format!(
+            "flow selected from csv_rows(\"{}\"):\n\
+                 step_by 2\n\
+                 derive item\n\
+                 write_csv(\"{}\")\n\
+             end\n",
+            input.display(),
+            output.display()
+        ),
+    )
+    .expect("failed to write CSV source");
+
+    let result = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args([
+            "run",
+            source.to_str().expect("CSV source path was not UTF-8"),
+        ])
+        .output()
+        .expect("failed to run CSV step_by pipeline");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&output).expect("failed to read CSV output"),
+        "Ada,10\nMira,30\nOmar,50\n"
+    );
+    fs::remove_dir_all(root).expect("failed to clean up CSV step_by test directory");
+}
+
+#[test]
+fn take_while_stops_reading_csv_after_the_first_nonmatching_row() {
+    let id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("simply-csv-take-while-{id}"));
+    fs::create_dir_all(&root).expect("failed to create CSV take_while test directory");
+    let input = root.join("input.csv");
+    let output = root.join("output.csv");
+    let source = root.join("main.si");
+    fs::write(&input, "Ada,10\nLin,20\nMira,30\nbad\"quote,row\n")
+        .expect("failed to write CSV input");
+    fs::write(
+        &source,
+        format!(
+            "flow selected from csv_rows(\"{}\"):\n\
+                 take_while to_int(item[1]) < 30\n\
+                 derive item\n\
+                 write_csv(\"{}\")\n\
+             end\n",
+            input.display(),
+            output.display()
+        ),
+    )
+    .expect("failed to write CSV source");
+
+    let result = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args([
+            "run",
+            source.to_str().expect("CSV source path was not UTF-8"),
+        ])
+        .output()
+        .expect("failed to run CSV take_while pipeline");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&output).expect("failed to read CSV output"),
+        "Ada,10\nLin,20\n"
+    );
+    fs::remove_dir_all(root).expect("failed to clean up CSV take_while test directory");
+}
+
+#[test]
+fn any_terminal_stops_reading_csv_after_the_first_true_item() {
+    let id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("simply-csv-any-{id}"));
+    fs::create_dir_all(&root).expect("failed to create CSV any test directory");
+    let input = root.join("input.csv");
+    let source = root.join("main.si");
+    fs::write(&input, "true\nbad\"quote,row\n").expect("failed to write CSV input");
+    fs::write(
+        &source,
+        format!(
+            "result is pipeline:\n\
+                 csv_rows(\"{}\")\n\
+                 derive item[0] == \"true\"\n\
+                 any\n\
+             end\n\
+             Sayln result\n",
+            input.display()
+        ),
+    )
+    .expect("failed to write CSV source");
+
+    let result = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args([
+            "run",
+            source.to_str().expect("CSV source path was not UTF-8"),
+        ])
+        .output()
+        .expect("failed to run CSV any pipeline");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "true");
+    fs::remove_dir_all(root).expect("failed to clean up CSV any test directory");
+}
+
+#[test]
+fn drop_while_skips_only_the_csv_prefix_that_matches() {
+    let id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("simply-csv-drop-while-{id}"));
+    fs::create_dir_all(&root).expect("failed to create CSV drop_while test directory");
+    let input = root.join("input.csv");
+    let output = root.join("output.csv");
+    let source = root.join("main.si");
+    fs::write(&input, "Ada,10\nLin,20\nMira,30\nNia,10\n").expect("failed to write CSV input");
+    fs::write(
+        &source,
+        format!(
+            "flow remaining_rows from csv_rows(\"{}\"):\n\
+                 drop_while to_int(item[1]) < 30\n\
+                 derive item\n\
+                 write_csv(\"{}\")\n\
+             end\n",
+            input.display(),
+            output.display()
+        ),
+    )
+    .expect("failed to write CSV source");
+
+    let result = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args([
+            "run",
+            source.to_str().expect("CSV source path was not UTF-8"),
+        ])
+        .output()
+        .expect("failed to run CSV drop_while pipeline");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&output).expect("failed to read CSV output"),
+        "Mira,30\nNia,10\n"
+    );
+    fs::remove_dir_all(root).expect("failed to clean up CSV drop_while test directory");
+}
+
+#[test]
+fn distinct_keeps_first_duplicate_csv_row_in_output_order() {
+    let id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("simply-csv-distinct-{id}"));
+    fs::create_dir_all(&root).expect("failed to create CSV distinct test directory");
+    let input = root.join("input.csv");
+    let output = root.join("output.csv");
+    let source = root.join("main.si");
+    fs::write(&input, "Ada,10\nLin,20\nAda,10\nMira,30\nLin,20\n")
+        .expect("failed to write CSV input");
+    fs::write(
+        &source,
+        format!(
+            "flow unique_rows from csv_rows(\"{}\"):\n\
+                 distinct\n\
+                 derive item\n\
+                 write_csv(\"{}\")\n\
+             end\n",
+            input.display(),
+            output.display()
+        ),
+    )
+    .expect("failed to write CSV source");
+
+    let result = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args([
+            "run",
+            source.to_str().expect("CSV source path was not UTF-8"),
+        ])
+        .output()
+        .expect("failed to run CSV distinct pipeline");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&output).expect("failed to read CSV output"),
+        "Ada,10\nLin,20\nMira,30\n"
+    );
+    fs::remove_dir_all(root).expect("failed to clean up CSV distinct test directory");
+}
+
+#[test]
 fn partitions_csv_rows_without_materializing_them() {
     let id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
     let root = std::env::temp_dir().join(format!("simply-csv-progress-{id}"));
@@ -433,6 +730,303 @@ fn imports_a_returned_value_relative_to_the_source_file() {
 }
 
 #[test]
+fn imported_modules_and_checker_reject_forward_function_calls_consistently() {
+    let id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("simply-module-function-order-{id}"));
+    fs::create_dir_all(&root).expect("failed to create module function-order directory");
+    let module = root.join("module.si");
+    let main = root.join("main.si");
+    fs::write(
+        &module,
+        "Sayln first()\n\
+         fn first() gives Int:\n\
+             return 1\n\
+         end\n\
+         return 0\n",
+    )
+    .expect("failed to write module function-order fixture");
+    fs::write(&main, "open \"module.si\" as imported\nSayln imported\n")
+        .expect("failed to write function-order entrypoint");
+
+    let checked = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["check", main.to_str().expect("path was not UTF-8")])
+        .output()
+        .expect("failed to check module function-order fixture");
+    assert!(!checked.status.success());
+    assert!(
+        String::from_utf8_lossy(&checked.stderr).contains("function `first` is declared later"),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    let executed = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["run", main.to_str().expect("path was not UTF-8")])
+        .output()
+        .expect("failed to run module function-order fixture");
+    assert!(!executed.status.success());
+    assert!(
+        String::from_utf8_lossy(&executed.stderr).contains("unknown function `first`"),
+        "{}",
+        String::from_utf8_lossy(&executed.stderr)
+    );
+    fs::remove_dir_all(root).expect("failed to clean module function-order directory");
+}
+
+#[test]
+fn imported_function_values_run_and_are_checked_against_their_signature() {
+    let id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("simply-import-function-{id}"));
+    fs::create_dir_all(root.join("nested")).expect("failed to create function import directory");
+    fs::write(
+        root.join("math.si"),
+        "fn add(left as Int, right as Int) gives Int:\n\
+             return left + right\n\
+         end\n\
+         return add\n",
+    )
+    .expect("failed to write imported function module");
+    let main = root.join("main.si");
+    fs::write(
+        &main,
+        "open \"math.si\" as add\n\
+         open \"nested/../math.si\" as add_again\n\
+         Sayln add(2, 3)\n\
+         Sayln add_again(4, 5)\n",
+    )
+    .expect("failed to write function importer");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["run", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to run imported function");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "5\n9");
+
+    fs::write(&main, "open \"math.si\" as add\nadd(\"wrong\", 3)\n")
+        .expect("failed to write invalid function importer");
+    let checked = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["check", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to check imported function arguments");
+    assert!(!checked.status.success());
+    assert!(
+        String::from_utf8_lossy(&checked.stderr).contains("expected Int, found String"),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    fs::write(&main, "open \"math.si\" as add\nadd(2)\n")
+        .expect("failed to write invalid-arity function importer");
+    let checked = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["check", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to check imported function arity");
+    assert!(!checked.status.success());
+    assert!(
+        String::from_utf8_lossy(&checked.stderr).contains("expects 2 arguments, got 1"),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    fs::remove_dir_all(root).expect("failed to remove function import directory");
+}
+
+#[test]
+fn imported_function_values_capture_module_bindings() {
+    let id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("simply-import-function-capture-{id}"));
+    fs::create_dir_all(&root).expect("failed to create function capture directory");
+    fs::write(
+        root.join("module.si"),
+        "base is 40\n\
+         fn add(value as Int) gives Int:\n\
+             return base + value\n\
+         end\n\
+         return add\n",
+    )
+    .expect("failed to write closure module");
+    let main = root.join("main.si");
+    fs::write(&main, "open \"module.si\" as add\nSayln add(2)\n")
+        .expect("failed to write closure importer");
+
+    let checked = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["check", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to check imported closure");
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["run", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to run imported closure");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
+
+    fs::remove_dir_all(root).expect("failed to remove function capture directory");
+}
+
+#[test]
+fn returned_recursive_module_functions_keep_their_definition_scope() {
+    let id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("simply-import-recursive-function-{id}"));
+    fs::create_dir_all(&root).expect("failed to create recursive function directory");
+    fs::write(
+        root.join("module.si"),
+        "fn countdown(value as Int) gives Int:\n\
+             if value == 0:\n\
+                 return 0\n\
+             else:\n\
+                 return countdown(value - 1)\n\
+             end\n\
+         end\n\
+         return countdown\n",
+    )
+    .expect("failed to write recursive function module");
+    let main = root.join("main.si");
+    fs::write(
+        &main,
+        "open \"module.si\" as run_countdown\nSayln run_countdown(3)\n",
+    )
+    .expect("failed to write recursive function importer");
+
+    let checked = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["check", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to check imported recursive function");
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["run", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to run imported recursive function");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "0");
+
+    fs::remove_dir_all(root).expect("failed to remove recursive function directory");
+}
+
+#[test]
+fn check_requires_a_module_return_outside_a_discarded_match_expression() {
+    let id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("simply-check-match-module-return-{id}"));
+    fs::create_dir_all(&root).expect("failed to create match module directory");
+    fs::write(
+        root.join("module.si"),
+        "match true:\n\
+             true:\n\
+                 return 1\n\
+             false:\n\
+                 return 2\n\
+         end\n",
+    )
+    .expect("failed to write match module");
+    let main = root.join("main.si");
+    fs::write(&main, "open \"module.si\" as value\n")
+        .expect("failed to write match module importer");
+
+    let checked = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["check", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to check match module");
+    assert!(!checked.status.success());
+    assert!(
+        String::from_utf8_lossy(&checked.stderr).contains("imported module must return a value"),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["run", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to run match module");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("must return a value"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(root).expect("failed to remove match module directory");
+}
+
+#[test]
+fn imported_struct_and_enum_values_keep_their_runtime_type_identity() {
+    let id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("simply-import-types-{id}"));
+    fs::create_dir_all(&root).expect("failed to create typed import directory");
+    fs::write(
+        root.join("person.si"),
+        "type Person:\n\
+             name as String\n\
+         end\n\
+         return Person(\"Ada\")\n",
+    )
+    .expect("failed to write struct module");
+    fs::write(
+        root.join("state.si"),
+        "enum State:\n\
+             Ready\n\
+         end\n\
+         return State::Ready\n",
+    )
+    .expect("failed to write enum module");
+    let main = root.join("main.si");
+    fs::write(
+        &main,
+        "open \"person.si\" as person\n\
+         open \"state.si\" as state\n\
+         Sayln type_of(person)\n\
+         Sayln type_of(state)\n",
+    )
+    .expect("failed to write typed importer");
+
+    let checked = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["check", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to check typed imports");
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["run", main.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to run typed imports");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "Person\nState"
+    );
+
+    fs::remove_dir_all(root).expect("failed to remove typed import directory");
+}
+
+#[test]
 fn resolves_nested_and_absolute_imports_without_using_the_working_directory() {
     let root = std::env::temp_dir().join(format!("simply-nested-import-{}", std::process::id()));
     let nested = root.join("nested");
@@ -465,6 +1059,98 @@ fn resolves_nested_and_absolute_imports_without_using_the_working_directory() {
 }
 
 #[test]
+fn canonical_import_paths_reuse_parsing_but_execute_each_import() {
+    let id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("simply-import-identity-{id}"));
+    fs::create_dir_all(root.join("nested")).expect("failed to create import identity directory");
+    fs::write(
+        root.join("value.si"),
+        "value is Ask(\"value\", Int)\nreturn value\n",
+    )
+    .expect("failed to write interactive imported module");
+    let main = root.join("main.si");
+    fs::write(
+        &main,
+        "open \"value.si\" as first\n\
+         open \"nested/../value.si\" as second\n\
+         Sayln first + second\n",
+    )
+    .expect("failed to write canonical-path importer");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["run", main.to_str().expect("test path was not UTF-8")])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start canonical-path importer");
+    child
+        .stdin
+        .take()
+        .expect("import stdin should be piped")
+        .write_all(b"1\n2\n")
+        .expect("failed to provide import input");
+    let output = child
+        .wait_with_output()
+        .expect("failed to run canonical-path importer");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .ends_with('3'),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    fs::remove_dir_all(root).expect("failed to remove import identity directory");
+}
+
+#[test]
+fn directory_and_malformed_import_paths_fail_with_runtime_diagnostics() {
+    let id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("simply-invalid-import-path-{id}"));
+    fs::create_dir_all(root.join("folder")).expect("failed to create import path directory");
+    let main = root.join("main.si");
+
+    for (source, runtime_error, check_error) in [
+        (
+            "open \"folder\" as value\n",
+            "could not open",
+            "could not read",
+        ),
+        (
+            "open \"bad\0path.si\" as value\n",
+            "could not open",
+            "could not open",
+        ),
+    ] {
+        fs::write(&main, source).expect("failed to write invalid import source");
+        let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+            .args(["run", main.to_str().expect("test path was not UTF-8")])
+            .output()
+            .expect("failed to run invalid import source");
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success());
+        assert!(error.contains(runtime_error), "{error}");
+        assert!(error.contains("Runtime error"), "{error}");
+
+        let checked = Command::new(env!("CARGO_BIN_EXE_simply"))
+            .args(["check", main.to_str().expect("test path was not UTF-8")])
+            .output()
+            .expect("failed to check invalid import source");
+        let error = String::from_utf8_lossy(&checked.stderr);
+        assert!(!checked.status.success());
+        assert!(error.contains(check_error), "{error}");
+    }
+
+    fs::remove_dir_all(root).expect("failed to remove invalid import directory");
+}
+
+#[test]
 fn reports_missing_imports_with_structured_diagnostics() {
     let root = std::env::temp_dir().join(format!("simply-missing-import-{}", std::process::id()));
     let main = root.join("main.si");
@@ -487,14 +1173,18 @@ fn reports_missing_imports_with_structured_diagnostics() {
 
 #[test]
 fn reports_circular_imports_without_recursing_forever() {
-    let root = std::env::temp_dir().join(format!("simply-circular-import-{}", std::process::id()));
+    let id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("simply-circular-import-{id}"));
     let first = root.join("a.si");
     let second = root.join("b.si");
+    let third = root.join("c.si");
     fs::create_dir_all(&root).expect("failed to create circular import directory");
     fs::write(&first, "open \"b.si\" as b\nreturn b\n")
         .expect("failed to write first circular source");
-    fs::write(&second, "open \"a.si\" as a\nreturn a\n")
+    fs::write(&second, "open \"c.si\" as c\nreturn c\n")
         .expect("failed to write second circular source");
+    fs::write(&third, "open \"a.si\" as a\nreturn a\n")
+        .expect("failed to write third circular source");
 
     let output = Command::new(env!("CARGO_BIN_EXE_simply"))
         .args(["run", first.to_str().expect("temporary path was not UTF-8")])
@@ -505,7 +1195,34 @@ fn reports_circular_imports_without_recursing_forever() {
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
     assert!(error.contains("cyclic import"));
+    assert!(error.contains("a.si") && error.contains("b.si") && error.contains("c.si"));
     assert!(error.contains("error[E0204]"));
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_imports_share_canonical_cycle_identity() {
+    use std::os::unix::fs::symlink;
+
+    let id = TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("simply-symlink-import-cycle-{id}"));
+    fs::create_dir_all(&root).expect("failed to create symlink import directory");
+    let module = root.join("module.si");
+    let alias = root.join("alias.si");
+    fs::write(&module, "open \"alias.si\" as again\nreturn 1\n")
+        .expect("failed to write symlink cycle source");
+    symlink(&module, &alias).expect("failed to create module symlink");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["run", module.to_str().expect("test path was not UTF-8")])
+        .output()
+        .expect("failed to run symlink import cycle");
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(error.contains("cyclic import"), "{error}");
+    assert!(error.contains("module.si"), "{error}");
+
+    fs::remove_dir_all(root).expect("failed to remove symlink import directory");
 }
 
 #[test]

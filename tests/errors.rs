@@ -130,6 +130,12 @@ fn reports_structured_diagnostics_for_all_malformed_input_shapes() {
         ("Sayln ?\n", "Lex error", "error[E0101]", "1:7"),
         ("Sayln 1e\n", "Lex error", "error[E0106]", "1:7"),
         ("Sayln\n", "Parse error", "error[E0104]", "1:6"),
+        (
+            "open \"m.si\" as 42\n",
+            "Parse error",
+            "error[E0103]",
+            "1:16",
+        ),
         ("values is array [1\n", "Parse error", "error[E0103]", "2:1"),
         ("Sayln \"unterminated\n", "Lex error", "error[E0102]", "1:7"),
         (
