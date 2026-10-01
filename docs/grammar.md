@@ -61,6 +61,7 @@ return         = "return" expression ;
 import         = "open" string ( "as" name
                | "exposing" imported_name { "," imported_name } ) ;
 imported_name  = name [ "as" name ] ;
+diagnostic_code = name { "." name { "-" name } } ;
 export         = "export" name { "," name } ;
 collection_op  = name ( "add" | "remove" ) expression ;
 parameters     = [ "mut" ] name [ "as" type ] { "," [ "mut" ] name [ "as" type ] } ;

@@ -24,7 +24,7 @@ fn direct_and_mutual_recursion_stop_at_the_call_depth_limit() {
             error.contains("function call depth exceeds the limit"),
             "{error}"
         );
-        assert!(error.contains("error[E0206]"), "{error}");
+        assert!(error.contains("error[E.runtime.limit.exceeded]"), "{error}");
     }
 }
 
@@ -452,7 +452,7 @@ fn locates_duplicate_function_errors_at_the_duplicate_declaration() {
         check_source("fn greet():\n    return 1\nend\nfn greet():\n    return 2\nend\n");
     assert!(!success);
     assert!(error.contains("4:1"), "duplicate location missing: {error}");
-    assert!(error.contains("error[E0017]"));
+    assert!(error.contains("error[E.semantic.declaration.duplicate]"));
 }
 
 #[test]

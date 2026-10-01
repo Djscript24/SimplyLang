@@ -1611,7 +1611,16 @@ impl SemanticAnalyzer {
                 self.saw_return = true;
             }
             Stmt::Throw(expression) => {
-                self.analyze_expression(expression)?;
+                let thrown_type = self.analyze_expression(expression)?;
+                if !matches!(thrown_type, Type::Enum(_) | Type::Unknown) {
+                    return Err(self.error(
+                        DiagnosticCode::TypeMismatch,
+                        format!(
+                            "`throw` requires an enum value, found {}",
+                            thrown_type.name()
+                        ),
+                    ));
+                }
             }
             Stmt::If {
                 condition,
@@ -1664,11 +1673,19 @@ impl SemanticAnalyzer {
                 let try_returns = self.analyze_scoped_block(try_body)?;
                 let mut catch_returns = true;
                 for catch in catches {
+                    if let Some(code) = catch.code.as_deref()
+                        && DiagnosticCode::from_code(code).is_none()
+                    {
+                        return Err(self.error(
+                            DiagnosticCode::InvalidCatchCode,
+                            format!("unknown diagnostic code `{code}` in catch clause"),
+                        ));
+                    }
                     let frame_start = self.variables.scopes.len();
                     self.variables.push();
                     self.function_scopes.push(HashMap::new());
                     if let Some(name) = &catch.binding {
-                        self.define_variable(name.clone(), Type::Tree, false)?;
+                        self.define_variable(name.clone(), Type::Unknown, false)?;
                     }
                     self.saw_return = false;
                     let result = self

@@ -2,8 +2,31 @@ use std::sync::Arc;
 
 use crate::{
     ast::{BinaryOperator, Expr, Literal, PipelineStep},
+    error::{DiagnosticCode, SimplyError},
     runtime::{limits, operations, value::Value},
 };
+
+#[derive(Debug)]
+pub(super) struct ParallelError {
+    pub(super) code: DiagnosticCode,
+    pub(super) message: String,
+}
+
+type ParallelResult<T> = Result<T, ParallelError>;
+
+fn runtime_error(code: DiagnosticCode, message: impl Into<String>) -> ParallelError {
+    ParallelError {
+        code,
+        message: message.into(),
+    }
+}
+
+fn operation_error(error: SimplyError) -> ParallelError {
+    ParallelError {
+        code: error.code(),
+        message: error.message().to_owned(),
+    }
+}
 
 #[derive(Clone)]
 enum ParallelValue {
@@ -43,7 +66,7 @@ impl ParallelValue {
     }
 }
 
-fn evaluate_expression(expression: &Expr, item: &ParallelValue) -> Result<ParallelValue, String> {
+fn evaluate_expression(expression: &Expr, item: &ParallelValue) -> ParallelResult<ParallelValue> {
     let value = match expression {
         Expr::Literal(Literal::String(value)) => Value::String(value.clone()),
         Expr::Literal(Literal::Int(value)) => Value::Int(*value),
@@ -52,7 +75,7 @@ fn evaluate_expression(expression: &Expr, item: &ParallelValue) -> Result<Parall
         Expr::Identifier(name) if name == "item" => item.as_value(),
         Expr::Unary { operator, operand } => {
             let operand = evaluate_expression(operand, item)?.into_value();
-            operations::unary(operand, operator, None).map_err(|error| error.to_string())?
+            operations::unary(operand, operator, None).map_err(operation_error)?
         }
         Expr::Binary {
             left,
@@ -68,18 +91,27 @@ fn evaluate_expression(expression: &Expr, item: &ParallelValue) -> Result<Parall
                 return Ok(ParallelValue::Bool(value));
             }
             let right = evaluate_expression(right, item)?.into_value();
-            operations::binary(left, operator, right, None).map_err(|error| error.to_string())?
+            operations::binary(left, operator, right, None).map_err(operation_error)?
         }
-        _ => return Err("expression is outside the parallel-safe subset".into()),
+        _ => {
+            return Err(runtime_error(
+                DiagnosticCode::RuntimeArgument,
+                "expression is outside the parallel-safe subset",
+            ));
+        }
     };
-    ParallelValue::from_value(&value)
-        .ok_or_else(|| "parallel expressions must produce scalar values".into())
+    ParallelValue::from_value(&value).ok_or_else(|| {
+        runtime_error(
+            DiagnosticCode::RuntimeTypeMismatch,
+            "parallel expressions must produce scalar values",
+        )
+    })
 }
 
 fn evaluate_chunk(
     input: &[ParallelValue],
     transforms: &[PipelineStep],
-) -> Result<Vec<ParallelValue>, String> {
+) -> ParallelResult<Vec<ParallelValue>> {
     let mut output = Vec::with_capacity(input.len());
     for input in input {
         let mut current = Some(input.clone());
@@ -89,20 +121,25 @@ fn evaluate_chunk(
             }
             match step {
                 PipelineStep::Where(expression) => {
-                    let item = current
-                        .as_ref()
-                        .ok_or_else(|| "pipeline item was lost".to_string())?;
+                    let item = current.as_ref().ok_or_else(|| {
+                        runtime_error(DiagnosticCode::RuntimeGeneral, "pipeline item was lost")
+                    })?;
                     let result = evaluate_expression(expression, item)?;
                     match result {
                         ParallelValue::Bool(true) => {}
                         ParallelValue::Bool(false) => current = None,
-                        _ => return Err("pipeline `where` condition must return a boolean".into()),
+                        _ => {
+                            return Err(runtime_error(
+                                DiagnosticCode::RuntimeTypeMismatch,
+                                "pipeline `where` condition must return a boolean",
+                            ));
+                        }
                     }
                 }
                 PipelineStep::Derive(expression) => {
-                    let item = current
-                        .as_ref()
-                        .ok_or_else(|| "pipeline item was lost".to_string())?;
+                    let item = current.as_ref().ok_or_else(|| {
+                        runtime_error(DiagnosticCode::RuntimeGeneral, "pipeline item was lost")
+                    })?;
                     current = Some(evaluate_expression(expression, item)?);
                 }
                 _ => {}
@@ -120,34 +157,46 @@ pub(super) fn evaluate_parallel(
     transforms: &[PipelineStep],
     requested_workers: usize,
     requested_chunk_size: Option<usize>,
-) -> Result<Vec<Value>, String> {
+) -> ParallelResult<Vec<Value>> {
     if requested_workers == 0 || requested_workers > limits::MAX_PARALLEL_WORKERS {
-        return Err(format!(
-            "parallel worker count must be between 1 and {}",
-            limits::MAX_PARALLEL_WORKERS
+        return Err(runtime_error(
+            DiagnosticCode::RuntimeArgument,
+            format!(
+                "parallel worker count must be between 1 and {}",
+                limits::MAX_PARALLEL_WORKERS
+            ),
         ));
     }
     let input: Vec<ParallelValue> = values
         .iter()
         .map(|value| {
             ParallelValue::from_value(value).ok_or_else(|| {
-                "values or expressions are outside the parallel-safe subset".to_string()
+                runtime_error(
+                    DiagnosticCode::RuntimeTypeMismatch,
+                    "values or expressions are outside the parallel-safe subset",
+                )
             })
         })
         .collect::<Result<_, _>>()?;
     let chunk_size =
         requested_chunk_size.unwrap_or_else(|| input.len().div_ceil(requested_workers).max(1));
     if chunk_size == 0 || chunk_size > limits::MAX_CHUNK_SIZE {
-        return Err(format!(
-            "chunk size must be between 1 and {}",
-            limits::MAX_CHUNK_SIZE
+        return Err(runtime_error(
+            DiagnosticCode::RuntimeArgument,
+            format!(
+                "chunk size must be between 1 and {}",
+                limits::MAX_CHUNK_SIZE
+            ),
         ));
     }
     let chunk_count = input.len().div_ceil(chunk_size);
     if chunk_count > limits::MAX_PARALLEL_CHUNKS {
-        return Err(format!(
-            "parallel chunk count exceeds the limit of {}",
-            limits::MAX_PARALLEL_CHUNKS
+        return Err(runtime_error(
+            DiagnosticCode::RuntimeLimit,
+            format!(
+                "parallel chunk count exceeds the limit of {}",
+                limits::MAX_PARALLEL_CHUNKS
+            ),
         ));
     }
     if chunk_count == 0 {
@@ -175,15 +224,17 @@ pub(super) fn evaluate_parallel(
                     let result = evaluate_chunk(&chunks[index], transforms)?;
                     completed.push((index, result));
                 }
-                Ok::<_, String>(completed)
+                Ok::<_, ParallelError>(completed)
             }));
         }
         for handle in handles {
-            for (index, result) in handle.join().map_err(|_| "parallel worker panicked")?? {
+            for (index, result) in handle.join().map_err(|_| {
+                runtime_error(DiagnosticCode::RuntimeGeneral, "parallel worker panicked")
+            })?? {
                 results[index] = Some(result);
             }
         }
-        Ok::<_, String>(())
+        Ok::<_, ParallelError>(())
     })?;
     Ok(results
         .into_iter()

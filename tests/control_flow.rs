@@ -34,36 +34,116 @@ fn catches_runtime_errors_and_always_runs_finally() {
 #[test]
 fn supports_throw_structured_errors_and_code_filtered_catches() {
     let (success, output) = run_source_stdout(
-        "try:\n\
-             throw \"custom failure\"\n\
-         catch ignored as E0202:\n\
+        "enum Failure:\n\
+             Custom as String\n\
+         end\n\
+         try:\n\
+             throw Failure::Custom(\"custom failure\")\n\
+         catch ignored as E.runtime.numeric.division-by-zero:\n\
              Sayln \"wrong handler\"\n\
          catch error:\n\
-             Sayln error.code + \": \" + error.message\n\
+             match error:\n\
+                 Failure::Custom(message):\n\
+                     Sayln \"custom failure: \" + message\n\
+                 _:\n\
+                     Sayln \"other error\"\n\
+             end\n\
          end\n",
     );
 
     assert!(success);
-    assert_eq!(output, "E0206: custom failure\n");
+    assert_eq!(output, "custom failure: custom failure\n");
+}
+
+#[test]
+fn throw_requires_a_tagged_enum_value() {
+    let source = "throw \"not an enum\"\n";
+    let (checked, _, diagnostic) = check_source(source);
+    assert!(!checked, "check accepted a non-enum throw value");
+    assert!(
+        diagnostic.contains("`throw` requires an enum value, found String"),
+        "{diagnostic}"
+    );
+
+    let (ran, diagnostic) = run_source(source);
+    assert!(!ran, "runtime accepted a non-enum throw value");
+    assert!(
+        diagnostic.contains("`throw` requires an enum value, found String"),
+        "{diagnostic}"
+    );
+}
+
+#[test]
+fn check_rejects_unknown_catch_diagnostic_codes() {
+    let source = "enum Failure:\n\
+                      Missing\n\
+                  end\n\
+                  try:\n\
+                      throw Failure::Missing\n\
+                 catch error as E9999:\n\
+                     Sayln \"unreachable\"\n\
+                 end\n";
+    let (success, _, error) = check_source(source);
+
+    assert!(!success, "check accepted an unknown diagnostic code");
+    assert!(
+        error.contains("unknown diagnostic code `E9999` in catch clause"),
+        "{error}"
+    );
+
+    let valid_source = "enum Failure:\n\
+                            Missing\n\
+                        end\n\
+                        try:\n\
+                            throw Failure::Missing\n\
+                        catch error as E.runtime.numeric.division-by-zero:\n\
+                            Sayln \"caught\"\n\
+                        end\n";
+    let (success, _, error) = check_source(valid_source);
+    assert!(success, "check rejected a known diagnostic code: {error}");
+}
+
+#[test]
+fn catch_filters_accept_canonical_paths_and_legacy_aliases() {
+    for code in ["E.runtime.numeric.division-by-zero", "E0202"] {
+        let source = format!(
+            "try:\n\
+                 Sayln 1 / 0\n\
+             catch error as {code}:\n\
+                 Sayln error.code\n\
+             end\n"
+        );
+        let (success, output) = run_source_stdout(&source);
+        assert!(success, "catch filter `{code}` failed: {output}");
+        assert_eq!(output, "E.runtime.numeric.division-by-zero\n");
+    }
 }
 
 #[test]
 fn supports_nested_try_blocks_and_propagates_to_outer_catch() {
     let (success, output) = run_source_stdout(
-        "try:\n\
+        "enum Failure:\n\
+             Inner as String\n\
+         end\n\
+         try:\n\
              try:\n\
-                 throw \"inner failure\"\n\
+                 throw Failure::Inner(\"inner failure\")\n\
              finally:\n\
                  Sayln \"inner cleanup\"\n\
              end\n\
          catch error:\n\
-             Sayln \"outer caught: \" + error.message\n\
+             match error:\n\
+                 Failure::Inner(message):\n\
+                     Sayln \"outer caught: \" + message\n\
+                 _:\n\
+                     Sayln \"another runtime error\"\n\
+             end\n\
          finally:\n\
              Sayln \"outer cleanup\"\n\
          end\n",
     );
 
-    assert!(success);
+    assert!(success, "{output}");
     assert_eq!(
         output,
         "inner cleanup\nouter caught: inner failure\nouter cleanup\n"
@@ -111,10 +191,13 @@ fn keeps_branch_bindings_local_at_runtime() {
 
 #[test]
 fn for_loop_scope_is_restored_when_an_error_escapes_the_loop() {
-    let source = "try:\n\
+    let source = "enum Failure:\n\
+                      Stop\n\
+                  end\n\
+                  try:\n\
                       hidden is 9\n\
                       for item in [1]:\n\
-                          throw \"stop\"\n\
+                          throw Failure::Stop\n\
                       end\n\
                   catch error:\n\
                       Sayln \"caught\"\n\
@@ -181,7 +264,7 @@ fn check_requires_every_handled_catch_path_to_return() {
     let source = "fn value() gives Int:\n\
                       try:\n\
                           return 1\n\
-                      catch arithmetic as E0202:\n\
+                      catch arithmetic as E.runtime.numeric.division-by-zero:\n\
                           return 2\n\
                       catch other:\n\
                           Sayln \"handled without returning\"\n\

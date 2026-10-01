@@ -624,7 +624,7 @@ mod tests {
     fn rejects_unterminated_strings_as_lex_errors() {
         let error = Lexer::new("Say \"unterminated").tokenize().unwrap_err();
         assert!(matches!(error, SimplyError::Lex { .. }));
-        assert!(error.to_string().contains("E0102"));
+        assert!(error.to_string().contains("E.lex.string.unterminated"));
     }
 
     #[test]
@@ -634,7 +634,10 @@ mod tests {
 
             assert_eq!(error.code(), DiagnosticCode::InvalidNumber, "{source}");
             assert_eq!(error.category(), crate::error::DiagnosticCategory::Lex);
-            assert!(error.to_string().contains("E0106"), "{source}");
+            assert!(
+                error.to_string().contains("E.lex.number.invalid"),
+                "{source}"
+            );
             assert!(
                 error
                     .to_string()
@@ -649,7 +652,7 @@ mod tests {
         let error = Lexer::new("Say 1e\n").tokenize().unwrap_err();
         let rendered = error.render("number.si", "Say 1e\n");
 
-        assert!(rendered.starts_with("error[E0106] (Lex error)"));
+        assert!(rendered.starts_with("error[E.lex.number.invalid] (Lex error)"));
         assert!(rendered.contains("= What happened: This number literal is not valid."));
         assert!(rendered.contains("= Try this: Check the number's digits"));
         assert!(rendered.contains("= Details: expected digits after exponent"));

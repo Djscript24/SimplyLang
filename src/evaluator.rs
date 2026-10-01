@@ -126,7 +126,7 @@ fn clamp_numeric(
                 _ => {
                     return Err(SimplyError::Runtime {
                         span: span.cloned().unwrap_or_else(|| Span::new(0, 0)),
-                        code: DiagnosticCode::RuntimeGeneral,
+                        code: DiagnosticCode::RuntimeTypeMismatch,
                         message: "`clamp` requires compatible numeric bounds".into(),
                     });
                 }
@@ -138,7 +138,7 @@ fn clamp_numeric(
             {
                 return Err(SimplyError::Runtime {
                     span: span.cloned().unwrap_or_else(|| Span::new(0, 0)),
-                    code: DiagnosticCode::RuntimeGeneral,
+                    code: DiagnosticCode::RuntimeArithmetic,
                     message: "`clamp` requires finite values and minimum <= maximum".into(),
                 });
             }
@@ -158,7 +158,7 @@ fn evaluate_math_builtin(
         } else {
             Err(SimplyError::Runtime {
                 span: span.cloned().unwrap_or_else(|| Span::new(0, 0)),
-                code: DiagnosticCode::RuntimeGeneral,
+                code: DiagnosticCode::RuntimeArgument,
                 message: format!("`{name}` expects {expected} arguments"),
             })
         }
@@ -256,14 +256,14 @@ fn evaluate_math_builtin(
                 Value::Int(size) if size > 0 => {
                     usize::try_from(size).map_err(|_| SimplyError::Runtime {
                         span: span.cloned().unwrap_or_else(|| Span::new(0, 0)),
-                        code: DiagnosticCode::RuntimeGeneral,
+                        code: DiagnosticCode::RuntimeLimit,
                         message: "identity matrix size is out of bounds".into(),
                     })?
                 }
                 _ => {
                     return Err(SimplyError::Runtime {
                         span: span.cloned().unwrap_or_else(|| Span::new(0, 0)),
-                        code: DiagnosticCode::RuntimeGeneral,
+                        code: DiagnosticCode::RuntimeArgument,
                         message: "identity matrix size must be a positive integer".into(),
                     });
                 }
@@ -280,7 +280,7 @@ fn evaluate_math_builtin(
                     _ => {
                         return Err(SimplyError::Runtime {
                             span: span.cloned().unwrap_or_else(|| Span::new(0, 0)),
-                            code: DiagnosticCode::RuntimeGeneral,
+                            code: DiagnosticCode::RuntimeTypeMismatch,
                             message: "`percentile` requires a finite numeric percentile".into(),
                         });
                     }
@@ -347,7 +347,7 @@ fn total_to_f64(value: Value, span: Option<&Span>) -> Result<f64, SimplyError> {
         Value::Float(value) if value.is_finite() => Ok(value),
         _ => Err(SimplyError::Runtime {
             span: span.cloned().unwrap_or_else(|| Span::new(0, 0)),
-            code: DiagnosticCode::RuntimeGeneral,
+            code: DiagnosticCode::RuntimeTypeMismatch,
             message: "aggregate result must be numeric".into(),
         }),
     }
@@ -417,7 +417,7 @@ fn update_extreme(
             if !left.is_finite() || !right.is_finite() {
                 return Err(SimplyError::Runtime {
                     span: span.cloned().unwrap_or_else(|| Span::new(0, 0)),
-                    code: DiagnosticCode::RuntimeGeneral,
+                    code: DiagnosticCode::RuntimeArithmetic,
                     message: "aggregate values must be finite".into(),
                 });
             }
@@ -440,7 +440,7 @@ fn update_extreme(
         _ => {
             return Err(SimplyError::Runtime {
                 span: span.cloned().unwrap_or_else(|| Span::new(0, 0)),
-                code: DiagnosticCode::RuntimeGeneral,
+                code: DiagnosticCode::RuntimeTypeMismatch,
                 message: "aggregate values must be numeric".into(),
             });
         }
@@ -1036,7 +1036,7 @@ impl Evaluator {
         for (name, value) in bindings {
             let scope_index = self.scopes.binding_scope(&name).ok_or_else(|| {
                 self.runtime_error_with_code(
-                    DiagnosticCode::InvalidReassignment,
+                    DiagnosticCode::RuntimeName,
                     format!("cannot reassign unknown variable `{name}`"),
                 )
             })?;
@@ -1377,7 +1377,10 @@ impl Evaluator {
         self.register_top_level_functions(&program.statements)?;
         match self.execute_statements(&program.statements)? {
             Flow::None => Ok(()),
-            _ => Err(self.runtime_error("control statement is outside its valid context".into())),
+            _ => Err(self.runtime_error_with_code(
+                DiagnosticCode::RuntimeControl,
+                "control statement is outside its valid context",
+            )),
         }
     }
 
@@ -1399,9 +1402,10 @@ impl Evaluator {
             match self.execute_statements(std::slice::from_ref(statement))? {
                 Flow::None => {}
                 _ => {
-                    return Err(
-                        self.runtime_error("control statement is outside its valid context".into())
-                    );
+                    return Err(self.runtime_error_with_code(
+                        DiagnosticCode::RuntimeControl,
+                        "control statement is outside its valid context",
+                    ));
                 }
             }
         }
@@ -1697,7 +1701,7 @@ impl Evaluator {
                     }
                     if !self.contains(name) {
                         return Err(self.runtime_error_with_code(
-                            DiagnosticCode::InvalidReassignment,
+                            DiagnosticCode::RuntimeName,
                             format!("cannot reassign unknown variable `{name}`"),
                         ));
                     }
@@ -1706,15 +1710,17 @@ impl Evaluator {
                         self.ensure_reassignment_type(&value, &expected, name)?;
                     }
                     if !self.assign(name, value) {
-                        return Err(self
-                            .runtime_error(format!("cannot reassign unknown variable `{name}`")));
+                        return Err(self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeName,
+                            format!("cannot reassign unknown variable `{name}`"),
+                        ));
                     }
                 }
                 Stmt::DestructureReassign { pattern, value } => {
                     let value = self.evaluate(value)?;
                     let Some(bindings) = self.match_value_pattern(pattern, &value)? else {
-                        return Err(self.runtime_error(
-                            "destructuring assignment target does not match the value".into(),
+                        return Err(self.runtime_collection_error(
+                            "destructuring assignment target does not match the value",
                         ));
                     };
                     self.assign_many(bindings)?;
@@ -1726,7 +1732,7 @@ impl Evaluator {
                 } => {
                     if !self.scopes.is_mutable(name) {
                         return Err(self.runtime_error_with_code(
-                            DiagnosticCode::RuntimeCollection,
+                            DiagnosticCode::RuntimeMutability,
                             format!(
                                 "cannot mutate immutable variable `{name}`; declare it with `mut`"
                             ),
@@ -1759,7 +1765,7 @@ impl Evaluator {
                 Stmt::SetIndex { name, index, value } => {
                     if !self.scopes.is_mutable(name) {
                         return Err(self.runtime_error_with_code(
-                            DiagnosticCode::RuntimeCollection,
+                            DiagnosticCode::RuntimeMutability,
                             format!(
                                 "cannot mutate immutable variable `{name}`; declare it with `mut`"
                             ),
@@ -1779,9 +1785,9 @@ impl Evaluator {
                     let target = match self.lookup_mut(name) {
                         Some(target) => target,
                         None => {
-                            return Err(
-                                self.runtime_error(format!("`{name}` is not a mutable collection"))
-                            );
+                            return Err(self.runtime_collection_error(format!(
+                                "`{name}` is not a mutable collection"
+                            )));
                         }
                     };
                     collections::set_index(target, index_value, value, span.as_ref())?;
@@ -1794,8 +1800,8 @@ impl Evaluator {
                 } => {
                     let value = self.evaluate(value)?;
                     let Some(bindings) = self.match_value_pattern(pattern, &value)? else {
-                        return Err(self.runtime_error(
-                            "destructuring target does not match the value".into(),
+                        return Err(self.runtime_collection_error(
+                            "destructuring target does not match the value",
                         ));
                     };
                     let typed_bindings = bindings
@@ -1906,11 +1912,7 @@ impl Evaluator {
                 }
                 Stmt::Struct { .. } | Stmt::Enum { .. } | Stmt::Message { .. } => {}
                 Stmt::Return(expr) => return Ok(Flow::Return(self.evaluate(expr)?)),
-                Stmt::Throw(expr) => {
-                    let value = self.evaluate(expr)?;
-                    return Err(self
-                        .runtime_error_with_code(DiagnosticCode::RuntimeGeneral, value.display()));
-                }
+                Stmt::Throw(expr) => return self.evaluate_throw(expr),
                 Stmt::Break => return Ok(Flow::Break),
                 Stmt::Continue => return Ok(Flow::Continue),
                 Stmt::For {
@@ -1929,7 +1931,9 @@ impl Evaluator {
                         Value::Hash(values) | Value::Tree(values) => {
                             Box::new(owned_map_values(values).into_iter())
                         }
-                        _ => return Err(self.runtime_error("for requires a collection".into())),
+                        _ => {
+                            return Err(self.runtime_collection_error("for requires a collection"));
+                        }
                     };
                     self.push_scope();
                     let result = (|| {
@@ -1964,7 +1968,7 @@ impl Evaluator {
                         Value::Bool(value) => value,
                         _ => {
                             return Err(
-                                self.runtime_error("while condition must be a boolean".into())
+                                self.runtime_type_error("while condition must be a boolean")
                             );
                         }
                     } {
@@ -1984,7 +1988,7 @@ impl Evaluator {
                         Value::Bool(true) => then_branch,
                         Value::Bool(false) => else_branch,
                         _ => {
-                            return Err(self.runtime_error("if condition must be a boolean".into()));
+                            return Err(self.runtime_type_error("if condition must be a boolean"));
                         }
                     };
                     self.push_scope();
@@ -2004,15 +2008,18 @@ impl Evaluator {
                         Ok(flow) => Ok(flow),
                         Err(error) => {
                             let catch = catches.iter().find(|catch| {
-                                catch
-                                    .code
-                                    .as_deref()
-                                    .is_none_or(|code| code == error.code().as_str())
+                                catch.code.as_deref().is_none_or(|code| {
+                                    DiagnosticCode::from_code(code) == Some(error.code())
+                                })
                             });
                             if let Some(catch) = catch {
                                 self.push_scope();
                                 let result = if let Some(name) = &catch.binding {
-                                    self.variable_types.define(name.clone(), Type::Tree, false);
+                                    let error_type = error
+                                        .thrown_value()
+                                        .map(Self::type_of_value)
+                                        .unwrap_or(Type::Tree);
+                                    self.variable_types.define(name.clone(), error_type, false);
                                     self.scopes
                                         .define(name.clone(), self.error_value(&error), false)
                                         .map_err(|definition_error| {
@@ -2052,6 +2059,25 @@ impl Evaluator {
         Ok(Flow::None)
     }
 
+    fn evaluate_throw(&mut self, expression: &Expr) -> Result<Flow, SimplyError> {
+        let value = self.evaluate(expression)?;
+        if !matches!(value, Value::Enum(_)) {
+            return Err(self.runtime_error_with_code(
+                DiagnosticCode::RuntimeTypeMismatch,
+                format!(
+                    "`throw` requires an enum value, found {}",
+                    Self::value_type_name(&value)
+                ),
+            ));
+        }
+        let message = value.display();
+        Err(SimplyError::Thrown {
+            span: self.current_span.clone().unwrap_or_else(|| Span::new(0, 0)),
+            value: Box::new(value),
+            message,
+        })
+    }
+
     fn execute_scoped(&mut self, statements: &[Stmt]) -> Result<Flow, SimplyError> {
         if statements.is_empty() {
             return Ok(Flow::None);
@@ -2063,6 +2089,9 @@ impl Evaluator {
     }
 
     fn error_value(&self, error: &SimplyError) -> Value {
+        if let Some(value) = error.thrown_value() {
+            return value.clone();
+        }
         let mut fields = BTreeMap::new();
         fields.insert("message".into(), Value::String(error.message().into()));
         fields.insert("code".into(), Value::String(error.code().as_str().into()));
@@ -2160,13 +2189,16 @@ impl Evaluator {
             let returned_value = match module.execute_statements(&program.statements)? {
                 Flow::Return(value) => value,
                 Flow::None => {
-                    return Err(
-                        module.runtime_error(format!("imported file `{path}` must return a value"))
-                    );
+                    return Err(module.runtime_error_with_code(
+                        DiagnosticCode::RuntimeImport,
+                        format!("imported file `{path}` must return a value"),
+                    ));
                 }
                 Flow::Break | Flow::Continue => {
-                    return Err(module
-                        .runtime_error("control statement is outside its valid context".into()));
+                    return Err(module.runtime_error_with_code(
+                        DiagnosticCode::RuntimeControl,
+                        "control statement is outside its valid context",
+                    ));
                 }
             };
             let mut exports = HashMap::new();
@@ -2303,17 +2335,18 @@ impl Evaluator {
                         self.evaluate_pipeline(owned_values(values), steps, sum_type.clone())?
                     }
                     _ => {
-                        return Err(
-                            self.runtime_error("pipeline source must be an array or list".into())
-                        );
+                        return Err(self
+                            .runtime_collection_error("pipeline source must be an array or list"));
                     }
                 };
                 Ok(result)
             }
-            Expr::Identifier(name) => self
-                .lookup(name)
-                .cloned()
-                .ok_or_else(|| self.runtime_error(format!("unknown variable `{name}`"))),
+            Expr::Identifier(name) => self.lookup(name).cloned().ok_or_else(|| {
+                self.runtime_error_with_code(
+                    DiagnosticCode::RuntimeName,
+                    format!("unknown variable `{name}`"),
+                )
+            }),
             Expr::Unary { operator, operand } => {
                 let value = self.evaluate(operand)?;
                 operations::unary(value, operator, self.current_span.as_ref())
@@ -2341,13 +2374,18 @@ impl Evaluator {
                 }
                 if name == "Ask" {
                     if !(1..=2).contains(&arguments.len()) {
-                        return Err(self
-                            .runtime_error("`Ask` expects a prompt and an optional type".into()));
+                        return Err(self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeArgument,
+                            "`Ask` expects a prompt and an optional type",
+                        ));
                     }
                     let prompt = match self.evaluate(&arguments[0])? {
                         Value::String(prompt) => prompt,
                         _ => {
-                            return Err(self.runtime_error("`Ask` prompt must be a string".into()));
+                            return Err(self.runtime_error_with_code(
+                                DiagnosticCode::RuntimeTypeMismatch,
+                                "`Ask` prompt must be a string",
+                            ));
                         }
                     };
                     let target_type = match arguments.get(1) {
@@ -2358,14 +2396,16 @@ impl Evaluator {
                             "Float" => Type::Float,
                             "Bool" => Type::Bool,
                             _ => {
-                                return Err(self.runtime_error(format!(
-                                    "unsupported `Ask` type `{type_name}`"
-                                )));
+                                return Err(self.runtime_error_with_code(
+                                    DiagnosticCode::RuntimeArgument,
+                                    format!("unsupported `Ask` type `{type_name}`"),
+                                ));
                             }
                         },
                         Some(_) => {
-                            return Err(self.runtime_error(
-                                "`Ask` type must be `Int`, `Float`, `String`, or `Bool`".into(),
+                            return Err(self.runtime_error_with_code(
+                                DiagnosticCode::RuntimeArgument,
+                                "`Ask` type must be `Int`, `Float`, `String`, or `Bool`",
                             ));
                         }
                     };
@@ -2375,15 +2415,24 @@ impl Evaluator {
                             .write_all(prompt.as_bytes())
                             .and_then(|()| stdout.flush())
                             .map_err(|error| {
-                                self.runtime_error(format!("could not write `Ask` prompt: {error}"))
+                                self.runtime_error_with_code(
+                                    DiagnosticCode::RuntimeIo,
+                                    format!("could not write `Ask` prompt: {error}"),
+                                )
                             })?;
                     }
                     let mut input = String::new();
                     let bytes_read = io::stdin().lock().read_line(&mut input).map_err(|error| {
-                        self.runtime_error(format!("could not read `Ask` input: {error}"))
+                        self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeIo,
+                            format!("could not read `Ask` input: {error}"),
+                        )
                     })?;
                     if bytes_read == 0 {
-                        return Err(self.runtime_error("no input received for `Ask`".into()));
+                        return Err(self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeIo,
+                            "no input received for `Ask`",
+                        ));
                     }
                     let input = input.trim_end_matches(['\r', '\n']);
                     return match target_type {
@@ -2426,7 +2475,10 @@ impl Evaluator {
                 }
                 if name == "print" {
                     if arguments.len() != 1 {
-                        return Err(self.runtime_error("`print` expects one argument".into()));
+                        return Err(self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeArgument,
+                            "`print` expects one argument",
+                        ));
                     }
                     let value = self.evaluate(&arguments[0])?;
                     if self.output_enabled {
@@ -2436,13 +2488,17 @@ impl Evaluator {
                 }
                 if name == "assert" {
                     if !(1..=2).contains(&arguments.len()) {
-                        return Err(self.runtime_error(
-                            "`assert` expects a condition and an optional message".into(),
+                        return Err(self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeArgument,
+                            "`assert` expects a condition and an optional message",
                         ));
                     }
                     let condition = self.evaluate(&arguments[0])?;
                     let Value::Bool(condition) = condition else {
-                        return Err(self.runtime_error("`assert` condition must be Bool".into()));
+                        return Err(self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeTypeMismatch,
+                            "`assert` condition must be Bool",
+                        ));
                     };
                     if condition {
                         return Ok(Value::Unit);
@@ -2451,20 +2507,24 @@ impl Evaluator {
                         Some(expression) => match self.evaluate(expression)? {
                             Value::String(message) => message,
                             _ => {
-                                return Err(
-                                    self.runtime_error("`assert` message must be a string".into())
-                                );
+                                return Err(self.runtime_error_with_code(
+                                    DiagnosticCode::RuntimeTypeMismatch,
+                                    "`assert` message must be a string",
+                                ));
                             }
                         },
                         None => "assertion failed".into(),
                     };
                     return Err(
-                        self.runtime_error_with_code(DiagnosticCode::RuntimeGeneral, message)
+                        self.runtime_error_with_code(DiagnosticCode::RuntimeAssertion, message)
                     );
                 }
                 if name == "type_of" {
                     if arguments.len() != 1 {
-                        return Err(self.runtime_error("`type_of` expects one argument".into()));
+                        return Err(self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeArgument,
+                            "`type_of` expects one argument",
+                        ));
                     }
                     let value = self.evaluate(&arguments[0])?;
                     let type_name = match value {
@@ -2493,86 +2553,105 @@ impl Evaluator {
                 }
                 if name == "read_file" {
                     if arguments.len() != 1 {
-                        return Err(self.runtime_error("`read_file` expects one path".into()));
+                        return Err(self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeArgument,
+                            "`read_file` expects one path",
+                        ));
                     }
                     let path = match self.evaluate(&arguments[0])? {
                         Value::String(path) => path,
                         _ => {
-                            return Err(
-                                self.runtime_error("`read_file` path must be a string".into())
-                            );
+                            return Err(self.runtime_error_with_code(
+                                DiagnosticCode::RuntimeTypeMismatch,
+                                "`read_file` path must be a string",
+                            ));
                         }
                     };
                     return fs::read_to_string(&path)
                         .map(Value::String)
                         .map_err(|error| {
-                            self.runtime_error(format!("could not read file `{path}`: {error}"))
+                            self.runtime_error_with_code(
+                                DiagnosticCode::RuntimeIo,
+                                format!("could not read file `{path}`: {error}"),
+                            )
                         });
                 }
                 if name == "write_file" {
                     if arguments.len() != 2 {
-                        return Err(self.runtime_error(
-                            "`write_file` expects a path and string content".into(),
+                        return Err(self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeArgument,
+                            "`write_file` expects a path and string content",
                         ));
                     }
                     let path = match self.evaluate(&arguments[0])? {
                         Value::String(path) => path,
                         _ => {
-                            return Err(
-                                self.runtime_error("`write_file` path must be a string".into())
-                            );
+                            return Err(self.runtime_error_with_code(
+                                DiagnosticCode::RuntimeTypeMismatch,
+                                "`write_file` path must be a string",
+                            ));
                         }
                     };
                     let content = match self.evaluate(&arguments[1])? {
                         Value::String(content) => content,
                         _ => {
-                            return Err(
-                                self.runtime_error("`write_file` content must be a string".into())
-                            );
+                            return Err(self.runtime_error_with_code(
+                                DiagnosticCode::RuntimeTypeMismatch,
+                                "`write_file` content must be a string",
+                            ));
                         }
                     };
                     files::atomic_write(Path::new(&path), content.as_bytes()).map_err(|error| {
-                        self.runtime_error(format!("could not write file `{path}`: {error}"))
+                        self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeIo,
+                            format!("could not write file `{path}`: {error}"),
+                        )
                     })?;
                     return Ok(Value::Unit);
                 }
                 if name == "substring" {
                     if arguments.len() != 3 {
-                        return Err(self.runtime_error(
-                            "`substring` expects a string, start index, and length".into(),
+                        return Err(self.runtime_argument_error(
+                            "`substring` expects a string, start index, and length",
                         ));
                     }
                     let value = match self.evaluate(&arguments[0])? {
                         Value::String(value) => value,
-                        _ => return Err(self.runtime_error("`substring` expects a string".into())),
+                        _ => return Err(self.runtime_type_error("`substring` expects a string")),
                     };
                     let start = match self.evaluate(&arguments[1])? {
                         Value::Int(start) if start >= 0 => {
                             usize::try_from(start).map_err(|_| {
-                                self.runtime_error("`substring` start is out of bounds".into())
+                                self.runtime_error_with_code(
+                                    DiagnosticCode::RuntimeLimit,
+                                    "`substring` start is out of bounds",
+                                )
                             })?
                         }
                         _ => {
-                            return Err(self.runtime_error(
-                                "`substring` start must be a non-negative integer".into(),
+                            return Err(self.runtime_argument_error(
+                                "`substring` start must be a non-negative integer",
                             ));
                         }
                     };
                     let length = match self.evaluate(&arguments[2])? {
                         Value::Int(length) if length >= 0 => {
                             usize::try_from(length).map_err(|_| {
-                                self.runtime_error("`substring` length is out of bounds".into())
+                                self.runtime_error_with_code(
+                                    DiagnosticCode::RuntimeLimit,
+                                    "`substring` length is out of bounds",
+                                )
                             })?
                         }
                         _ => {
-                            return Err(self.runtime_error(
-                                "`substring` length must be a non-negative integer".into(),
+                            return Err(self.runtime_argument_error(
+                                "`substring` length must be a non-negative integer",
                             ));
                         }
                     };
                     let character_count = value.chars().count();
                     if start > character_count || length > character_count - start {
-                        return Err(self.runtime_error("substring is out of bounds".into()));
+                        return Err(self.runtime_argument_error("substring is out of bounds"));
                     }
                     return Ok(Value::String(
                         value.chars().skip(start).take(length).collect(),
@@ -2580,12 +2659,12 @@ impl Evaluator {
                 }
                 if name == "characters" {
                     if arguments.len() != 1 {
-                        return Err(self.runtime_error("`characters` expects one string".into()));
+                        return Err(self.runtime_argument_error("`characters` expects one string"));
                     }
                     let value = match self.evaluate(&arguments[0])? {
                         Value::String(value) => value,
                         _ => {
-                            return Err(self.runtime_error("`characters` expects a string".into()));
+                            return Err(self.runtime_type_error("`characters` expects a string"));
                         }
                     };
                     return Ok(Value::Array(shared_values(
@@ -2600,7 +2679,9 @@ impl Evaluator {
                     "is_ascii_alpha" | "is_ascii_digit" | "is_whitespace"
                 ) {
                     if arguments.len() != 1 {
-                        return Err(self.runtime_error(format!("`{name}` expects one character")));
+                        return Err(
+                            self.runtime_argument_error(format!("`{name}` expects one character"))
+                        );
                     }
                     let character = self.evaluate(&arguments[0])?;
                     let character = self.single_character(character, name)?;
@@ -2612,7 +2693,7 @@ impl Evaluator {
                 }
                 if name == "contains" {
                     if arguments.len() != 2 {
-                        return Err(self.runtime_error("`contains` expects two arguments".into()));
+                        return Err(self.runtime_argument_error("`contains` expects two arguments"));
                     }
                     let collection = self.evaluate(&arguments[0])?;
                     let searched = self.evaluate(&arguments[1])?;
@@ -2636,8 +2717,8 @@ impl Evaluator {
                             values.values().any(|value| value == &searched)
                         }
                         _ => {
-                            return Err(self.runtime_error(
-                                "`contains` requires a collection or string".into(),
+                            return Err(self.runtime_collection_error(
+                                "`contains` requires a collection or string",
                             ));
                         }
                     };
@@ -2656,7 +2737,9 @@ impl Evaluator {
                 }
                 if name == "any" || name == "all" {
                     if arguments.len() != 1 {
-                        return Err(self.runtime_error(format!("`{name}` expects one argument")));
+                        return Err(
+                            self.runtime_argument_error(format!("`{name}` expects one argument"))
+                        );
                     }
                     let collection = self.evaluate(&arguments[0])?;
                     let values = match collection {
@@ -2665,15 +2748,15 @@ impl Evaluator {
                             shared_values(values.values().cloned().collect())
                         }
                         _ => {
-                            return Err(
-                                self.runtime_error(format!("`{name}` requires a collection"))
-                            );
+                            return Err(self.runtime_collection_error(format!(
+                                "`{name}` requires a collection"
+                            )));
                         }
                     };
                     let mut result = name == "all";
                     for value in values.iter() {
                         let Value::Bool(value) = value else {
-                            return Err(self.runtime_error(format!(
+                            return Err(self.runtime_type_error(format!(
                                 "`{name}` requires a collection of booleans"
                             )));
                         };
@@ -2686,14 +2769,14 @@ impl Evaluator {
                 }
                 if name == "join" {
                     if arguments.len() != 2 {
-                        return Err(self.runtime_error("`join` expects two arguments".into()));
+                        return Err(self.runtime_argument_error("`join` expects two arguments"));
                     }
                     let collection = self.evaluate(&arguments[0])?;
                     let separator = match self.evaluate(&arguments[1])? {
                         Value::String(value) => value,
                         _ => {
                             return Err(
-                                self.runtime_error("`join` separator must be a string".into())
+                                self.runtime_type_error("`join` separator must be a string")
                             );
                         }
                     };
@@ -2703,15 +2786,17 @@ impl Evaluator {
                             shared_values(values.values().cloned().collect())
                         }
                         _ => {
-                            return Err(self
-                                .runtime_error("`join` requires an array, list, or tuple".into()));
+                            return Err(self.runtime_collection_error(
+                                "`join` requires an array, list, or tuple",
+                            ));
                         }
                     };
                     let mut parts = Vec::with_capacity(values.len());
                     for value in values.iter() {
                         let Value::String(value) = value else {
-                            return Err(self
-                                .runtime_error("`join` requires a collection of strings".into()));
+                            return Err(
+                                self.runtime_type_error("`join` requires a collection of strings")
+                            );
                         };
                         parts.push(value.as_str());
                     }
@@ -2719,7 +2804,7 @@ impl Evaluator {
                 }
                 if name == "total" {
                     if arguments.len() != 1 {
-                        return Err(self.runtime_error("`total` expects one argument".into()));
+                        return Err(self.runtime_argument_error("`total` expects one argument"));
                     }
                     let sum_type = self.sequence_sum_type(&arguments[0]);
                     let collection = self.evaluate(&arguments[0])?;
@@ -2739,8 +2824,8 @@ impl Evaluator {
                             }
                         }
                         _ => {
-                            return Err(self.runtime_error(
-                                "`total` requires an array, list, tuple, or range".into(),
+                            return Err(self.runtime_collection_error(
+                                "`total` requires an array, list, tuple, or range",
                             ));
                         }
                     }
@@ -2749,24 +2834,23 @@ impl Evaluator {
                 }
                 if name == "trim" {
                     if arguments.len() != 1 {
-                        return Err(self.runtime_error("`trim` expects one argument".into()));
+                        return Err(self.runtime_argument_error("`trim` expects one argument"));
                     }
                     let value = match self.evaluate(&arguments[0])? {
                         Value::String(value) => value,
-                        _ => return Err(self.runtime_error("`trim` expects a string".into())),
+                        _ => return Err(self.runtime_type_error("`trim` expects a string")),
                     };
                     return Ok(Value::String(value.trim().into()));
                 }
                 if name == "to_float" {
                     if arguments.len() != 1 {
-                        return Err(self.runtime_error("`to_float` expects one argument".into()));
+                        return Err(self.runtime_argument_error("`to_float` expects one argument"));
                     }
                     let value = match self.evaluate(&arguments[0])? {
                         Value::String(value) => value,
                         _ => {
-                            return Err(self.runtime_error_with_code(
-                                DiagnosticCode::RuntimeConversion,
-                                "`to_float` needs text containing a valid number",
+                            return Err(self.runtime_type_error(
+                                "`to_float` expects a string containing a number",
                             ));
                         }
                     };
@@ -2786,14 +2870,13 @@ impl Evaluator {
                 }
                 if name == "to_int" {
                     if arguments.len() != 1 {
-                        return Err(self.runtime_error("`to_int` expects one argument".into()));
+                        return Err(self.runtime_argument_error("`to_int` expects one argument"));
                     }
                     let value = match self.evaluate(&arguments[0])? {
                         Value::String(value) => value,
                         _ => {
-                            return Err(self.runtime_error_with_code(
-                                DiagnosticCode::RuntimeConversion,
-                                "`to_int` needs text containing a whole number",
+                            return Err(self.runtime_type_error(
+                                "`to_int` expects a string containing a whole number",
                             ));
                         }
                     };
@@ -2807,28 +2890,32 @@ impl Evaluator {
                 }
                 if name == "abs" {
                     if arguments.len() != 1 {
-                        return Err(self.runtime_error("`abs` expects one numeric argument".into()));
+                        return Err(
+                            self.runtime_argument_error("`abs` expects one numeric argument")
+                        );
                     }
                     return match self.evaluate(&arguments[0])? {
                         Value::Int(value) => value.checked_abs().map(Value::Int).ok_or_else(|| {
-                            self.runtime_error("integer absolute value overflow".into())
+                            self.runtime_error_with_code(
+                                DiagnosticCode::RuntimeArithmetic,
+                                "integer absolute value overflow",
+                            )
                         }),
                         Value::Float(value) if value.is_finite() => Ok(Value::Float(value.abs())),
-                        _ => Err(self.runtime_error("`abs` expects an integer or float".into())),
+                        _ => Err(self.runtime_type_error("`abs` expects an integer or float")),
                     };
                 }
                 if name == "round" {
                     if arguments.len() != 2 {
-                        return Err(
-                            self.runtime_error("`round` expects a number and decimal count".into())
-                        );
+                        return Err(self
+                            .runtime_argument_error("`round` expects a number and decimal count"));
                     }
                     let value = self.evaluate(&arguments[0])?;
                     let decimals = match self.evaluate(&arguments[1])? {
                         Value::Int(value) if (0..=15).contains(&value) => value as i32,
                         _ => {
-                            return Err(self.runtime_error(
-                                "`round` decimal count must be an integer from 0 to 15".into(),
+                            return Err(self.runtime_argument_error(
+                                "`round` decimal count must be an integer from 0 to 15",
                             ));
                         }
                     };
@@ -2840,21 +2927,23 @@ impl Evaluator {
                             if rounded.is_finite() {
                                 Ok(Value::Float(rounded))
                             } else {
-                                Err(self.runtime_error(
-                                    "`round` result is outside the finite Float range".into(),
+                                Err(self.runtime_error_with_code(
+                                    DiagnosticCode::RuntimeArithmetic,
+                                    "`round` result is outside the finite Float range",
                                 ))
                             }
                         }
                         _ => {
                             Err(self
-                                .runtime_error("`round` expects an integer or finite float".into()))
+                                .runtime_type_error("`round` expects an integer or finite float"))
                         }
                     };
                 }
                 if name == "clamp" {
                     if arguments.len() != 3 {
-                        return Err(self
-                            .runtime_error("`clamp` expects value, minimum, and maximum".into()));
+                        return Err(self.runtime_argument_error(
+                            "`clamp` expects value, minimum, and maximum",
+                        ));
                     }
                     let value = self.evaluate(&arguments[0])?;
                     let minimum = self.evaluate(&arguments[1])?;
@@ -2863,17 +2952,17 @@ impl Evaluator {
                 }
                 if name == "split" {
                     if arguments.len() != 2 {
-                        return Err(self.runtime_error("`split` expects two arguments".into()));
+                        return Err(self.runtime_argument_error("`split` expects two arguments"));
                     }
                     let value = match self.evaluate(&arguments[0])? {
                         Value::String(value) => value,
-                        _ => return Err(self.runtime_error("`split` expects a string".into())),
+                        _ => return Err(self.runtime_type_error("`split` expects a string")),
                     };
                     let separator = match self.evaluate(&arguments[1])? {
                         Value::String(separator) => separator,
                         _ => {
                             return Err(
-                                self.runtime_error("`split` separator must be a string".into())
+                                self.runtime_type_error("`split` separator must be a string")
                             );
                         }
                     };
@@ -2886,33 +2975,45 @@ impl Evaluator {
                 }
                 if name == "replace" {
                     if arguments.len() != 3 {
-                        return Err(self.runtime_error("`replace` expects three arguments".into()));
+                        return Err(
+                            self.runtime_argument_error("`replace` expects three arguments")
+                        );
                     }
                     let value = match self.evaluate(&arguments[0])? {
                         Value::String(value) => value,
-                        _ => return Err(self.runtime_error("`replace` expects strings".into())),
+                        _ => return Err(self.runtime_type_error("`replace` expects strings")),
                     };
                     let from = match self.evaluate(&arguments[1])? {
                         Value::String(from) => from,
-                        _ => return Err(self.runtime_error("`replace` expects strings".into())),
+                        _ => return Err(self.runtime_type_error("`replace` expects strings")),
                     };
                     let to = match self.evaluate(&arguments[2])? {
                         Value::String(to) => to,
-                        _ => return Err(self.runtime_error("`replace` expects strings".into())),
+                        _ => return Err(self.runtime_type_error("`replace` expects strings")),
                     };
                     return Ok(Value::String(value.replace(&from, &to)));
                 }
                 if name == "starts_with" || name == "ends_with" {
                     if arguments.len() != 2 {
-                        return Err(self.runtime_error(format!("`{name}` expects two arguments")));
+                        return Err(
+                            self.runtime_argument_error(format!("`{name}` expects two arguments"))
+                        );
                     }
                     let value = match self.evaluate(&arguments[0])? {
                         Value::String(value) => value,
-                        _ => return Err(self.runtime_error(format!("`{name}` expects strings"))),
+                        _ => {
+                            return Err(
+                                self.runtime_type_error(format!("`{name}` expects strings"))
+                            );
+                        }
                     };
                     let part = match self.evaluate(&arguments[1])? {
                         Value::String(part) => part,
-                        _ => return Err(self.runtime_error(format!("`{name}` expects strings"))),
+                        _ => {
+                            return Err(
+                                self.runtime_type_error(format!("`{name}` expects strings"))
+                            );
+                        }
                     };
                     let result = if name == "starts_with" {
                         value.starts_with(&part)
@@ -2923,7 +3024,7 @@ impl Evaluator {
                 }
                 if name == "is_empty" {
                     if arguments.len() != 1 {
-                        return Err(self.runtime_error("`is_empty` expects one argument".into()));
+                        return Err(self.runtime_argument_error("`is_empty` expects one argument"));
                     }
                     let value = self.evaluate(&arguments[0])?;
                     let result = match value {
@@ -2936,16 +3037,15 @@ impl Evaluator {
                         Value::Hash(values) | Value::Tree(values) => values.is_empty(),
                         Value::String(value) => value.is_empty(),
                         _ => {
-                            return Err(self.runtime_error(
-                                "`is_empty` requires a collection or string".into(),
-                            ));
+                            return Err(self
+                                .runtime_type_error("`is_empty` requires a collection or string"));
                         }
                     };
                     return Ok(Value::Bool(result));
                 }
                 if name == "reverse" {
                     if arguments.len() != 1 {
-                        return Err(self.runtime_error("`reverse` expects one argument".into()));
+                        return Err(self.runtime_argument_error("`reverse` expects one argument"));
                     }
                     let value = self.evaluate(&arguments[0])?;
                     return Ok(match value {
@@ -2968,19 +3068,25 @@ impl Evaluator {
                             let length = Value::range_len(start, end, step)
                                 .and_then(|length| usize::try_from(length).ok())
                                 .ok_or_else(|| {
-                                    self.runtime_error("range is too large to reverse".into())
+                                    self.runtime_error_with_code(
+                                        DiagnosticCode::RuntimeLimit,
+                                        "range is too large to reverse",
+                                    )
                                 })?;
                             let mut values = Vec::new();
                             values.try_reserve_exact(length).map_err(|_| {
-                                self.runtime_error("range is too large to reverse".into())
+                                self.runtime_error_with_code(
+                                    DiagnosticCode::RuntimeLimit,
+                                    "range is too large to reverse",
+                                )
                             })?;
                             values.extend(Value::range_values(start, end, step));
                             values.reverse();
                             Value::Array(shared_values(values))
                         }
                         _ => {
-                            return Err(self.runtime_error(
-                                "`reverse` requires an array, list, tuple, or range".into(),
+                            return Err(self.runtime_type_error(
+                                "`reverse` requires an array, list, tuple, or range",
                             ));
                         }
                     });
@@ -2993,7 +3099,9 @@ impl Evaluator {
                 }
                 if name == "length" || name == "count" {
                     if arguments.len() != 1 {
-                        return Err(self.runtime_error(format!("`{name}` expects one argument")));
+                        return Err(
+                            self.runtime_argument_error(format!("`{name}` expects one argument"))
+                        );
                     }
                     return match self.evaluate(&arguments[0])? {
                         Value::Array(values) | Value::List(values) | Value::Tuple(values) => {
@@ -3002,22 +3110,24 @@ impl Evaluator {
                         Value::Range { start, end, step } => Value::range_len(start, end, step)
                             .map(Value::Int)
                             .ok_or_else(|| {
-                                self.runtime_error("range length exceeds the Int range".into())
+                                self.runtime_error_with_code(
+                                    DiagnosticCode::RuntimeArithmetic,
+                                    "range length exceeds the Int range",
+                                )
                             }),
                         Value::Hash(values) | Value::Tree(values) => {
                             Ok(Value::Int(values.len() as i64))
                         }
                         Value::String(value) => Ok(Value::Int(value.chars().count() as i64)),
-                        _ => {
-                            Err(self
-                                .runtime_error(format!("`{name}` requires a collection or string")))
-                        }
+                        _ => Err(self.runtime_type_error(format!(
+                            "`{name}` requires a collection or string"
+                        ))),
                     };
                 }
                 if name == "range" {
                     if !(2..=3).contains(&arguments.len()) {
-                        return Err(self.runtime_error(
-                            "`range` expects start, end, and an optional step".into(),
+                        return Err(self.runtime_argument_error(
+                            "`range` expects start, end, and an optional step",
                         ));
                     }
                     let start = self.evaluate(&arguments[0])?;
@@ -3030,24 +3140,22 @@ impl Evaluator {
                         (start, end, step)
                     {
                         if step == 0 {
-                            return Err(self.runtime_error("`range` step cannot be zero".into()));
+                            return Err(self.runtime_argument_error("`range` step cannot be zero"));
                         }
                         return Ok(Value::Range { start, end, step });
                     }
-                    return Err(self.runtime_error(
-                        "`range` expects integer bounds and an optional integer step".into(),
+                    return Err(self.runtime_type_error(
+                        "`range` expects integer bounds and an optional integer step",
                     ));
                 }
                 if name == "csv_rows" {
                     if arguments.len() != 1 {
-                        return Err(self.runtime_error("`csv_rows` expects one path".into()));
+                        return Err(self.runtime_argument_error("`csv_rows` expects one path"));
                     }
                     let path = match self.evaluate(&arguments[0])? {
                         Value::String(path) => path,
                         _ => {
-                            return Err(
-                                self.runtime_error("`csv_rows` path must be a string".into())
-                            );
+                            return Err(self.runtime_type_error("`csv_rows` path must be a string"));
                         }
                     };
                     return Ok(Value::CsvStream {
@@ -3094,7 +3202,7 @@ impl Evaluator {
                         .find(|variant| variant.name == *variant_name)
                     else {
                         return Err(self.runtime_error_with_code(
-                            DiagnosticCode::RuntimeGeneral,
+                            DiagnosticCode::RuntimeEnumVariant,
                             format!("unknown variant `{enum_name}::{variant_name}`"),
                         ));
                     };
@@ -3146,11 +3254,12 @@ impl Evaluator {
                 collections::index(&target, &index_value, self.current_span.as_ref())
             }
             Expr::Field { target, name } => match self.evaluate(target)? {
-                Value::Hash(values) | Value::Tree(values) => values
-                    .get(name)
-                    .cloned()
-                    .ok_or_else(|| self.runtime_error(format!("unknown field `{name}`"))),
-                _ => Err(self.runtime_error("value has no fields".into())),
+                Value::Hash(values) | Value::Tree(values) => {
+                    values.get(name).cloned().ok_or_else(|| {
+                        self.runtime_collection_error(format!("unknown field `{name}`"))
+                    })
+                }
+                _ => Err(self.runtime_type_error("value has no fields")),
             },
         }
     }
@@ -3278,7 +3387,7 @@ impl Evaluator {
                         Value::Bool(true) => {}
                         Value::Bool(false) => return Ok(None),
                         other => {
-                            return Err(self.runtime_error(format!(
+                            return Err(self.runtime_type_error(format!(
                                 "match guard must evaluate to Bool, found {}",
                                 Self::value_type_name(&other)
                             )));
@@ -3293,9 +3402,10 @@ impl Evaluator {
                             .map(|result| self.evaluate(result))
                             .unwrap_or(Ok(Value::Unit)),
                         Flow::Return(value) => Ok(value),
-                        Flow::Break | Flow::Continue => {
-                            Err(self.runtime_error("break/continue used outside a loop".into()))
-                        }
+                        Flow::Break | Flow::Continue => Err(self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeControl,
+                            "break/continue used outside a loop",
+                        )),
                     })
                     .map(Some)
             })();
@@ -3407,7 +3517,7 @@ impl Evaluator {
                         } else {
                             format!("unknown function `{name}`")
                         };
-                        self.runtime_error_with_code(DiagnosticCode::RuntimeMessage, description)
+                        self.runtime_error_with_code(DiagnosticCode::RuntimeName, description)
                     })?;
                 self.track_function(Rc::new(FunctionValue {
                     name: Some(name.to_owned()),
@@ -3449,11 +3559,14 @@ impl Evaluator {
         message_instance: Option<Rc<StructInstance>>,
     ) -> Result<Value, SimplyError> {
         if function.parameters.len() != values.len() {
-            return Err(self.runtime_error(format!(
-                "function `{name}` expects {} arguments, got {}",
-                function.parameters.len(),
-                values.len()
-            )));
+            return Err(self.runtime_error_with_code(
+                DiagnosticCode::RuntimeArgument,
+                format!(
+                    "function `{name}` expects {} arguments, got {}",
+                    function.parameters.len(),
+                    values.len()
+                ),
+            ));
         }
         for ((parameter, expected, _), value) in function.parameters.iter().zip(&values) {
             if let Some(expected) = expected {
@@ -3462,7 +3575,7 @@ impl Evaluator {
         }
         if self.call_depth >= limits::MAX_CALL_DEPTH {
             return Err(self.runtime_error_with_code(
-                DiagnosticCode::RuntimeGeneral,
+                DiagnosticCode::RuntimeLimit,
                 format!(
                     "function call depth exceeds the limit of {}",
                     limits::MAX_CALL_DEPTH
@@ -3548,7 +3661,10 @@ impl Evaluator {
                     Flow::None => Value::Unit,
                     Flow::Return(value) => value,
                     Flow::Break | Flow::Continue => {
-                        return Err(self.runtime_error("break/continue used outside a loop".into()));
+                        return Err(self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeControl,
+                            "break/continue used outside a loop",
+                        ));
                     }
                 },
                 Err(error) => return Err(error),
@@ -3596,14 +3712,14 @@ impl Evaluator {
                 )
             })
         {
-            return Err(self.runtime_error("`chunk` requires `parallel` or `checkpoint`".into()));
+            return Err(self.runtime_argument_error("`chunk` requires `parallel` or `checkpoint`"));
         }
         if steps
             .iter()
             .any(|step| matches!(step, PipelineStep::Checkpoint(_)))
         {
-            return Err(self.runtime_error(
-                "`checkpoint` requires a `csv_rows` source and `write_csv` terminal".into(),
+            return Err(self.runtime_argument_error(
+                "`checkpoint` requires a `csv_rows` source and `write_csv` terminal",
             ));
         }
         self.push_scope();
@@ -3630,14 +3746,14 @@ impl Evaluator {
                 )
             })
         {
-            return Err(self.runtime_error("`chunk` requires `parallel` or `checkpoint`".into()));
+            return Err(self.runtime_argument_error("`chunk` requires `parallel` or `checkpoint`"));
         }
         if steps
             .iter()
             .any(|step| matches!(step, PipelineStep::Checkpoint(_)))
         {
-            return Err(self.runtime_error(
-                "`checkpoint` requires a `csv_rows` source and `write_csv` terminal".into(),
+            return Err(self.runtime_argument_error(
+                "`checkpoint` requires a `csv_rows` source and `write_csv` terminal",
             ));
         }
         if let Some(terminal) = steps.last()
@@ -3706,8 +3822,8 @@ impl Evaluator {
                             Value::Bool(true) => current = Some(item),
                             Value::Bool(false) => {}
                             _ => {
-                                return Err(self.runtime_error(
-                                    "pipeline `where` condition must return a boolean".into(),
+                                return Err(self.runtime_type_error(
+                                    "pipeline `where` condition must return a boolean",
                                 ));
                             }
                         }
@@ -3744,18 +3860,16 @@ impl Evaluator {
                     Value::Bool(true) => return Ok(Value::Bool(true)),
                     Value::Bool(false) => any_result = false,
                     _ => {
-                        return Err(self.runtime_error(
-                            "`any` pipeline terminal requires boolean items".into(),
-                        ));
+                        return Err(self
+                            .runtime_type_error("`any` pipeline terminal requires boolean items"));
                     }
                 },
                 PipelineStep::All => match value {
                     Value::Bool(false) => return Ok(Value::Bool(false)),
                     Value::Bool(true) => all_result = true,
                     _ => {
-                        return Err(self.runtime_error(
-                            "`all` pipeline terminal requires boolean items".into(),
-                        ));
+                        return Err(self
+                            .runtime_type_error("`all` pipeline terminal requires boolean items"));
                     }
                 },
                 _ => unreachable!("range fast path accepts only aggregate terminals"),
@@ -3766,16 +3880,16 @@ impl Evaluator {
             PipelineStep::Count => Ok(Value::Int(count)),
             PipelineStep::Sum => Ok(sum.finish()),
             PipelineStep::Average if count == 0 => {
-                Err(self.runtime_error("average requires at least one numeric value".into()))
+                Err(self.runtime_collection_error("average requires at least one numeric value"))
             }
             PipelineStep::Average => Ok(Value::Float(
                 total_to_f64(total, self.current_span.as_ref())? / count as f64,
             )),
             PipelineStep::Min => minimum.ok_or_else(|| {
-                self.runtime_error("min requires at least one numeric value".into())
+                self.runtime_collection_error("min requires at least one numeric value")
             }),
             PipelineStep::Max => maximum.ok_or_else(|| {
-                self.runtime_error("max requires at least one numeric value".into())
+                self.runtime_collection_error("max requires at least one numeric value")
             }),
             PipelineStep::Any => Ok(Value::Bool(any_result)),
             PipelineStep::All => Ok(Value::Bool(all_result)),
@@ -3843,14 +3957,14 @@ impl Evaluator {
                 .iter()
                 .any(|step| matches!(step, PipelineStep::Checkpoint(_)))
         {
-            return Err(self.runtime_error("`chunk` requires `parallel` or `checkpoint`".into()));
+            return Err(self.runtime_argument_error("`chunk` requires `parallel` or `checkpoint`"));
         }
         if steps
             .iter()
             .any(|step| matches!(step, PipelineStep::Parallel(_)))
         {
-            return Err(self.runtime_error(
-                "`parallel` does not support CSV row collections or output terminals".into(),
+            return Err(self.runtime_argument_error(
+                "`parallel` does not support CSV row collections or output terminals",
             ));
         }
         if steps.iter().any(|step| {
@@ -3867,19 +3981,18 @@ impl Evaluator {
             .iter()
             .any(|step| matches!(step, PipelineStep::Checkpoint(_)))
         {
-            return Err(self.runtime_error(
+            return Err(self.runtime_argument_error(
                 "`take`, `skip`, `step_by`, `take_while`, `drop_while`, and `distinct` cannot be combined with `checkpoint`"
-                    .into(),
             ));
         }
         let terminal = steps.last().ok_or_else(|| {
-            self.runtime_error("csv_rows pipeline requires a terminal step".into())
+            self.runtime_argument_error("csv_rows pipeline requires a terminal step")
         })?;
         let output_path = match terminal {
             PipelineStep::WriteCsv(path_expression) => {
                 let output_path = match self.evaluate(path_expression)? {
                     Value::String(path) => path,
-                    _ => return Err(self.runtime_error("write_csv path must be a string".into())),
+                    _ => return Err(self.runtime_type_error("write_csv path must be a string")),
                 };
                 Some(output_path)
             }
@@ -3892,9 +4005,8 @@ impl Evaluator {
             | PipelineStep::All
             | PipelineStep::Partition { .. } => None,
             _ => {
-                return Err(self.runtime_error(
-                    "csv_rows pipeline must end with an aggregate, partition, or write_csv(\"path\")"
-                        .into(),
+                return Err(self.runtime_argument_error(
+                    "csv_rows pipeline must end with an aggregate, partition, or write_csv(\"path\")",
                 ));
             }
         };
@@ -3907,13 +4019,13 @@ impl Evaluator {
         let chunk_size = chunk_size
             .map(|size| {
                 usize::try_from(size)
-                    .map_err(|_| self.runtime_error("chunk size is out of bounds".into()))
+                    .map_err(|_| self.runtime_argument_error("chunk size is out of bounds"))
             })
             .transpose()?;
         if let Some(size) = chunk_size
             && (size == 0 || size > limits::MAX_CHUNK_SIZE)
         {
-            return Err(self.runtime_error(format!(
+            return Err(self.runtime_argument_error(format!(
                 "chunk size must be between 1 and {}",
                 limits::MAX_CHUNK_SIZE
             )));
@@ -3927,16 +4039,16 @@ impl Evaluator {
             let checkpoint_path = match checkpoint_path {
                 Some(path) => match self.evaluate(path)? {
                     Value::String(path) => Some(path),
-                    _ => return Err(self.runtime_error("checkpoint path must be a string".into())),
+                    _ => return Err(self.runtime_type_error("checkpoint path must be a string")),
                 },
                 None => None,
             };
             if let Some(output_path) = output_path.as_deref()
                 && checkpoint::paths_are_same(input_path, output_path)
-                    .map_err(|message| self.runtime_error(message))?
+                    .map_err(|error| self.checkpoint_runtime_error(error))?
             {
-                return Err(self.runtime_error(
-                    "`csv_rows` input and `write_csv` output must be different files".into(),
+                return Err(self.runtime_argument_error(
+                    "`csv_rows` input and `write_csv` output must be different files",
                 ));
             }
             if let Some(checkpoint_path) = checkpoint_path.as_deref() {
@@ -3946,13 +4058,12 @@ impl Evaluator {
                     .flatten()
                 {
                     if checkpoint::paths_are_same(checkpoint_path, protected_path)
-                        .map_err(|message| self.runtime_error(message))?
+                        .map_err(|error| self.checkpoint_runtime_error(error))?
                         || checkpoint::paths_are_same(&temporary_checkpoint, protected_path)
-                            .map_err(|message| self.runtime_error(message))?
+                            .map_err(|error| self.checkpoint_runtime_error(error))?
                     {
-                        return Err(self.runtime_error(
+                        return Err(self.runtime_argument_error(
                             "`checkpoint` and its temporary file must not overlap the CSV input or output"
-                                .into(),
                         ));
                     }
                 }
@@ -3961,11 +4072,11 @@ impl Evaluator {
                 .as_deref()
                 .map(checkpoint::read_checkpoint)
                 .transpose()
-                .map_err(|message| self.runtime_error(message))?
+                .map_err(|error| self.checkpoint_runtime_error(error))?
                 .flatten();
             if checkpoint_path.is_some() && output_path.is_none() {
                 return Err(
-                    self.runtime_error("`checkpoint` requires a `write_csv` terminal".into())
+                    self.runtime_argument_error("`checkpoint` requires a `write_csv` terminal")
                 );
             }
             let resume_at = checkpoint_state
@@ -3973,17 +4084,16 @@ impl Evaluator {
                 .map_or(0, |checkpoint| checkpoint.position);
             if let Some(state) = checkpoint_state.as_ref() {
                 let output_path = output_path.as_deref().ok_or_else(|| {
-                    self.runtime_error("checkpoint output path is missing".into())
+                    self.runtime_argument_error("checkpoint output path is missing")
                 })?;
                 checkpoint::validate_checkpoint_source(state, input_path, output_path)
-                    .map_err(|message| self.runtime_error(message))?;
+                    .map_err(|error| self.checkpoint_runtime_error(error))?;
                 checkpoint::validate_checkpoint_output(state, output_path)
-                    .map_err(|message| self.runtime_error(message))?;
+                    .map_err(|error| self.checkpoint_runtime_error(error))?;
             }
             if resume_at > 0 && !matches!(terminal, PipelineStep::WriteCsv(_)) {
-                return Err(self.runtime_error(
-                    "checkpoint resume requires a `write_csv` terminal; aggregate state is not checkpointed yet"
-                        .into(),
+                return Err(self.runtime_argument_error(
+                    "checkpoint resume requires a `write_csv` terminal; aggregate state is not checkpointed yet",
                 ));
             }
             let mut output = match output_path.as_deref() {
@@ -4010,9 +4120,12 @@ impl Evaluator {
                     .metadata()
                     .map_err(|error| self.file_error(Path::new(path), error))?;
                 if output_len > output_metadata.len() {
-                    return Err(self.runtime_error(format!(
-                        "checkpoint output length exceeds the current output file `{path}`"
-                    )));
+                    return Err(self.runtime_error_with_code(
+                        DiagnosticCode::RuntimeGeneral,
+                        format!(
+                            "checkpoint output length exceeds the current output file `{path}`"
+                        ),
+                    ));
                 }
                 output
                     .set_len(output_len)
@@ -4119,9 +4232,8 @@ impl Evaluator {
                                     break;
                                 }
                                 _ => {
-                                    return Err(self.runtime_error(
-                                        "pipeline `take_while` condition must return a boolean"
-                                            .into(),
+                                    return Err(self.runtime_type_error(
+                                        "pipeline `take_while` condition must return a boolean",
                                     ));
                                 }
                             }
@@ -4141,9 +4253,8 @@ impl Evaluator {
                                         current = Some(item);
                                     }
                                     _ => {
-                                        return Err(self.runtime_error(
-                                            "pipeline `drop_while` condition must return a boolean"
-                                                .into(),
+                                        return Err(self.runtime_type_error(
+                                            "pipeline `drop_while` condition must return a boolean",
                                         ));
                                     }
                                 }
@@ -4189,7 +4300,7 @@ impl Evaluator {
                         input_path,
                         output_path.as_deref(),
                     )
-                    .map_err(|message| self.runtime_error(message))?;
+                    .map_err(|error| self.checkpoint_runtime_error(error))?;
                     if stop_after_record {
                         break;
                     }
@@ -4218,7 +4329,7 @@ impl Evaluator {
                         input_path,
                         output_path.as_deref(),
                     )
-                    .map_err(|message| self.runtime_error(message))?;
+                    .map_err(|error| self.checkpoint_runtime_error(error))?;
                     if stop_after_record {
                         break;
                     }
@@ -4247,16 +4358,16 @@ impl Evaluator {
                     PipelineStep::Any => match value {
                         Value::Bool(value) => any_result |= value,
                         _ => {
-                            return Err(self.runtime_error(
-                                "`any` pipeline terminal requires boolean items".into(),
+                            return Err(self.runtime_type_error(
+                                "`any` pipeline terminal requires boolean items",
                             ));
                         }
                     },
                     PipelineStep::All => match value {
                         Value::Bool(value) => all_result &= value,
                         _ => {
-                            return Err(self.runtime_error(
-                                "`all` pipeline terminal requires boolean items".into(),
+                            return Err(self.runtime_type_error(
+                                "`all` pipeline terminal requires boolean items",
                             ));
                         }
                     },
@@ -4266,8 +4377,8 @@ impl Evaluator {
                                 values
                             }
                             _ => {
-                                return Err(self.runtime_error(
-                                    "write_csv requires derive to produce a row collection".into(),
+                                return Err(self.runtime_type_error(
+                                    "write_csv requires derive to produce a row collection",
                                 ));
                             }
                         };
@@ -4277,7 +4388,9 @@ impl Evaluator {
                                 .expect("write_csv output should be initialized"),
                             values.as_slice(),
                         )
-                        .map_err(|message| self.runtime_error(message))?;
+                        .map_err(|message| {
+                            self.runtime_error_with_code(DiagnosticCode::RuntimeIo, message)
+                        })?;
                         if stop_after_record {
                             break;
                         }
@@ -4298,18 +4411,22 @@ impl Evaluator {
                     input_path,
                     output_path.as_deref(),
                 )
-                .map_err(|message| self.runtime_error(message))?;
+                .map_err(|error| self.checkpoint_runtime_error(error))?;
             }
             let terminal_result = if let Some(output) = output.as_mut() {
-                output
-                    .flush()
-                    .map_err(|error| self.runtime_error(format!("could not flush CSV: {error}")))?;
+                output.flush().map_err(|error| {
+                    self.runtime_error_with_code(
+                        DiagnosticCode::RuntimeIo,
+                        format!("could not flush CSV: {error}"),
+                    )
+                })?;
                 Ok(Value::Unit)
             } else if matches!(terminal, PipelineStep::Count) {
                 Ok(Value::Int(count))
             } else if matches!(terminal, PipelineStep::Average) {
                 if count == 0 {
-                    Err(self.runtime_error("average requires at least one numeric value".into()))
+                    Err(self
+                        .runtime_collection_error("average requires at least one numeric value"))
                 } else {
                     Ok(Value::Float(
                         total_to_f64(total, self.current_span.as_ref())? / count as f64,
@@ -4317,11 +4434,11 @@ impl Evaluator {
                 }
             } else if matches!(terminal, PipelineStep::Min) {
                 minimum.ok_or_else(|| {
-                    self.runtime_error("min requires at least one numeric value".into())
+                    self.runtime_collection_error("min requires at least one numeric value")
                 })
             } else if matches!(terminal, PipelineStep::Max) {
                 maximum.ok_or_else(|| {
-                    self.runtime_error("max requires at least one numeric value".into())
+                    self.runtime_collection_error("max requires at least one numeric value")
                 })
             } else if matches!(terminal, PipelineStep::Any) {
                 Ok(Value::Bool(any_result))
@@ -4341,7 +4458,7 @@ impl Evaluator {
                 && let Some(path) = checkpoint_path.as_deref()
             {
                 checkpoint::remove_checkpoint(path)
-                    .map_err(|message| self.runtime_error(message))?;
+                    .map_err(|error| self.checkpoint_runtime_error(error))?;
             }
             terminal_result
         })();
@@ -4430,8 +4547,8 @@ impl Evaluator {
                             Value::Bool(true) => count += 1,
                             Value::Bool(false) => {}
                             _ => {
-                                return Err(self.runtime_error(
-                                    "pipeline `where` condition must return a boolean".into(),
+                                return Err(self.runtime_type_error(
+                                    "pipeline `where` condition must return a boolean",
                                 ));
                             }
                         }
@@ -4505,8 +4622,8 @@ impl Evaluator {
                     );
                 }
                 PipelineStep::WriteCsv(_) => {
-                    return Err(self.runtime_error(
-                        "`write_csv` requires a `csv_rows` streaming source".into(),
+                    return Err(self.runtime_argument_error(
+                        "`write_csv` requires a `csv_rows` streaming source",
                     ));
                 }
                 PipelineStep::Chunk(_)
@@ -4550,8 +4667,8 @@ impl Evaluator {
             .iter()
             .any(|step| matches!(step, PipelineStep::Checkpoint(_)))
         {
-            return Err(self.runtime_error(
-                "`checkpoint` requires a `csv_rows` source and `write_csv` terminal".into(),
+            return Err(self.runtime_argument_error(
+                "`checkpoint` requires a `csv_rows` source and `write_csv` terminal",
             ));
         }
         let terminal = match steps.last() {
@@ -4582,7 +4699,7 @@ impl Evaluator {
             })
             .map(|workers| {
                 usize::try_from(workers).map_err(|_| {
-                    self.runtime_error("parallel worker count is out of bounds".into())
+                    self.runtime_argument_error("parallel worker count is out of bounds")
                 })
             })
             .transpose()?;
@@ -4594,15 +4711,15 @@ impl Evaluator {
             })
             .map(|size| {
                 usize::try_from(size)
-                    .map_err(|_| self.runtime_error("chunk size is out of bounds".into()))
+                    .map_err(|_| self.runtime_argument_error("chunk size is out of bounds"))
             })
             .transpose()?;
         if let Some(workers) = parallel_workers {
             if workers == 0 {
-                return Err(self.runtime_error("parallel worker count must be positive".into()));
+                return Err(self.runtime_argument_error("parallel worker count must be positive"));
             }
             if workers > limits::MAX_PARALLEL_WORKERS {
-                return Err(self.runtime_error(format!(
+                return Err(self.runtime_argument_error(format!(
                     "parallel worker count cannot exceed {}",
                     limits::MAX_PARALLEL_WORKERS
                 )));
@@ -4611,7 +4728,7 @@ impl Evaluator {
         if let Some(size) = chunk_size
             && (size == 0 || size > limits::MAX_CHUNK_SIZE)
         {
-            return Err(self.runtime_error(format!(
+            return Err(self.runtime_argument_error(format!(
                 "chunk size must be between 1 and {}",
                 limits::MAX_CHUNK_SIZE
             )));
@@ -4627,7 +4744,9 @@ impl Evaluator {
                         | PipelineStep::Max
                 )
             ) {
-                return Err(self.runtime_error("`parallel` requires an aggregate terminal".into()));
+                return Err(
+                    self.runtime_argument_error("`parallel` requires an aggregate terminal")
+                );
             }
             if !transforms.iter().all(|step| match step {
                 PipelineStep::Where(expression) | PipelineStep::Derive(expression) => {
@@ -4636,9 +4755,8 @@ impl Evaluator {
                 PipelineStep::Parallel(_) | PipelineStep::Chunk(_) => true,
                 _ => false,
             }) {
-                return Err(self.runtime_error(
-                    "`parallel` requires only parallel-safe `where` and `derive` expressions"
-                        .into(),
+                return Err(self.runtime_argument_error(
+                    "`parallel` requires only parallel-safe `where` and `derive` expressions",
                 ));
             }
             let input = values.into_iter().collect::<Vec<_>>();
@@ -4648,7 +4766,9 @@ impl Evaluator {
                     Value::String(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_)
                 )
             }) {
-                return Err(self.runtime_error("`parallel` requires scalar source items".into()));
+                return Err(
+                    self.runtime_collection_error("`parallel` requires scalar source items")
+                );
             }
             match parallel::evaluate_parallel(input, transforms, workers, chunk_size) {
                 Ok(output) => {
@@ -4673,7 +4793,9 @@ impl Evaluator {
                         sum_type,
                     );
                 }
-                Err(message) => return Err(self.runtime_error(message)),
+                Err(error) => {
+                    return Err(self.runtime_error_with_code(error.code, error.message));
+                }
             }
         }
         let mut output = Vec::new();
@@ -4692,7 +4814,7 @@ impl Evaluator {
             Some(PipelineStep::WriteCsv(ref path_expression)) => {
                 let path = match self.evaluate(path_expression)? {
                     Value::String(path) => path,
-                    _ => return Err(self.runtime_error("write_csv path must be a string".into())),
+                    _ => return Err(self.runtime_type_error("write_csv path must be a string")),
                 };
                 Some(
                     fs::File::create(&path)
@@ -4768,8 +4890,8 @@ impl Evaluator {
                                 break;
                             }
                             _ => {
-                                return Err(self.runtime_error(
-                                    "pipeline `take_while` condition must return a boolean".into(),
+                                return Err(self.runtime_type_error(
+                                    "pipeline `take_while` condition must return a boolean",
                                 ));
                             }
                         }
@@ -4789,9 +4911,8 @@ impl Evaluator {
                                     current = Some(item);
                                 }
                                 _ => {
-                                    return Err(self.runtime_error(
-                                        "pipeline `drop_while` condition must return a boolean"
-                                            .into(),
+                                    return Err(self.runtime_type_error(
+                                        "pipeline `drop_while` condition must return a boolean",
                                     ));
                                 }
                             }
@@ -4870,25 +4991,23 @@ impl Evaluator {
                 Some(PipelineStep::Any) => match value {
                     Value::Bool(value) => any_result |= value,
                     _ => {
-                        return Err(self.runtime_error(
-                            "`any` pipeline terminal requires boolean items".into(),
-                        ));
+                        return Err(self
+                            .runtime_type_error("`any` pipeline terminal requires boolean items"));
                     }
                 },
                 Some(PipelineStep::All) => match value {
                     Value::Bool(value) => all_result &= value,
                     _ => {
-                        return Err(self.runtime_error(
-                            "`all` pipeline terminal requires boolean items".into(),
-                        ));
+                        return Err(self
+                            .runtime_type_error("`all` pipeline terminal requires boolean items"));
                     }
                 },
                 Some(PipelineStep::WriteCsv(_)) => {
                     let values = match value {
                         Value::Array(values) | Value::List(values) | Value::Tuple(values) => values,
                         _ => {
-                            return Err(self.runtime_error(
-                                "write_csv requires derive to produce a row collection".into(),
+                            return Err(self.runtime_type_error(
+                                "write_csv requires derive to produce a row collection",
                             ));
                         }
                     };
@@ -4898,7 +5017,9 @@ impl Evaluator {
                             .expect("write_csv output should be initialized"),
                         values.as_slice(),
                     )
-                    .map_err(|message| self.runtime_error(message))?;
+                    .map_err(|message| {
+                        self.runtime_error_with_code(DiagnosticCode::RuntimeIo, message)
+                    })?;
                 }
                 None => output.push(value),
                 Some(PipelineStep::Where(_)) | Some(PipelineStep::Derive(_)) => unreachable!(),
@@ -4932,7 +5053,8 @@ impl Evaluator {
             Some(PipelineStep::Sum) => Ok(sum.finish()),
             Some(PipelineStep::Average) => {
                 if count == 0 {
-                    Err(self.runtime_error("average requires at least one numeric value".into()))
+                    Err(self
+                        .runtime_collection_error("average requires at least one numeric value"))
                 } else {
                     Ok(Value::Float(
                         total_to_f64(total, self.current_span.as_ref())? / count as f64,
@@ -4940,10 +5062,10 @@ impl Evaluator {
                 }
             }
             Some(PipelineStep::Min) => minimum.ok_or_else(|| {
-                self.runtime_error("min requires at least one numeric value".into())
+                self.runtime_collection_error("min requires at least one numeric value")
             }),
             Some(PipelineStep::Max) => maximum.ok_or_else(|| {
-                self.runtime_error("max requires at least one numeric value".into())
+                self.runtime_collection_error("max requires at least one numeric value")
             }),
             Some(PipelineStep::Any) => Ok(Value::Bool(any_result)),
             Some(PipelineStep::All) => Ok(Value::Bool(all_result)),
@@ -4954,7 +5076,10 @@ impl Evaluator {
             Some(PipelineStep::WriteCsv(_)) => {
                 if let Some(output_file) = output_file.as_mut() {
                     output_file.flush().map_err(|error| {
-                        self.runtime_error(format!("could not flush CSV: {error}"))
+                        self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeIo,
+                            format!("could not flush CSV: {error}"),
+                        )
                     })?;
                 }
                 Ok(Value::Unit)
@@ -5064,7 +5189,8 @@ impl Evaluator {
             Some(PipelineStep::Sum) => Ok(sum.finish()),
             Some(PipelineStep::Average) => {
                 if count == 0 {
-                    Err(self.runtime_error("average requires at least one numeric value".into()))
+                    Err(self
+                        .runtime_collection_error("average requires at least one numeric value"))
                 } else {
                     Ok(Value::Float(
                         total_to_f64(total, self.current_span.as_ref())? / count as f64,
@@ -5072,10 +5198,10 @@ impl Evaluator {
                 }
             }
             Some(PipelineStep::Min) => minimum.ok_or_else(|| {
-                self.runtime_error("min requires at least one numeric value".into())
+                self.runtime_collection_error("min requires at least one numeric value")
             }),
             Some(PipelineStep::Max) => maximum.ok_or_else(|| {
-                self.runtime_error("max requires at least one numeric value".into())
+                self.runtime_collection_error("max requires at least one numeric value")
             }),
             _ => unreachable!(),
         }
@@ -5096,7 +5222,7 @@ impl Evaluator {
         match (result?, item) {
             (Value::Bool(true), item) => Ok(Some(item)),
             (Value::Bool(false), _) => Ok(None),
-            _ => Err(self.runtime_error("pipeline `where` condition must return a boolean".into())),
+            _ => Err(self.runtime_type_error("pipeline `where` condition must return a boolean")),
         }
     }
 
@@ -5123,9 +5249,8 @@ impl Evaluator {
                     match result? {
                         Value::Bool(matches) => matches,
                         _ => {
-                            return Err(self.runtime_error(
-                                "partition condition must return a boolean".into(),
-                            ));
+                            return Err(self
+                                .runtime_type_error("partition condition must return a boolean"));
                         }
                     }
                 }
@@ -5156,14 +5281,32 @@ impl Evaluator {
         self.runtime_error_with_code(DiagnosticCode::RuntimeGeneral, message)
     }
 
+    fn runtime_argument_error(&self, message: impl Into<String>) -> SimplyError {
+        self.runtime_error_with_code(DiagnosticCode::RuntimeArgument, message)
+    }
+
+    fn runtime_type_error(&self, message: impl Into<String>) -> SimplyError {
+        self.runtime_error_with_code(DiagnosticCode::RuntimeTypeMismatch, message)
+    }
+
+    fn runtime_collection_error(&self, message: impl Into<String>) -> SimplyError {
+        self.runtime_error_with_code(DiagnosticCode::RuntimeCollection, message)
+    }
+
+    fn checkpoint_runtime_error(&self, error: checkpoint::CheckpointError) -> SimplyError {
+        self.runtime_error_with_code(error.code, error.message)
+    }
+
     fn single_character(&self, value: Value, operation: &str) -> Result<char, SimplyError> {
         let Value::String(value) = value else {
-            return Err(self.runtime_error(format!("`{operation}` expects a one-character string")));
+            return Err(
+                self.runtime_type_error(format!("`{operation}` expects a one-character string"))
+            );
         };
         let mut characters = value.chars();
         match (characters.next(), characters.next()) {
             (Some(character), None) => Ok(character),
-            _ => Err(self.runtime_error(format!(
+            _ => Err(self.runtime_type_error(format!(
                 "`{operation}` expects a string containing exactly one Unicode scalar value"
             ))),
         }
@@ -5171,7 +5314,7 @@ impl Evaluator {
 
     fn evaluate_enumerate(&mut self, arguments: &[Expr]) -> Result<Value, SimplyError> {
         if arguments.len() != 1 {
-            return Err(self.runtime_error("`enumerate` expects one argument".into()));
+            return Err(self.runtime_argument_error("`enumerate` expects one argument"));
         }
         let sequence = self.evaluate(&arguments[0])?;
         let pairs = match sequence {
@@ -5186,24 +5329,26 @@ impl Evaluator {
                     .map(|character| Value::String(character.to_string())),
             ),
             _ => {
-                return Err(self.runtime_error(
-                    "`enumerate` requires an array, list, tuple, range, or string".into(),
+                return Err(self.runtime_type_error(
+                    "`enumerate` requires an array, list, tuple, range, or string",
                 ));
             }
         }
-        .map_err(|message| self.runtime_error(message))?;
+        .map_err(|message| self.runtime_error_with_code(DiagnosticCode::RuntimeLimit, message))?;
         Ok(Value::Array(shared_values(pairs)))
     }
 
     fn evaluate_zip(&mut self, arguments: &[Expr]) -> Result<Value, SimplyError> {
         if arguments.len() != 2 {
-            return Err(self.runtime_error("`zip` expects two arguments".into()));
+            return Err(self.runtime_argument_error("`zip` expects two arguments"));
         }
         let left = self.evaluate(&arguments[0])?;
         let right = self.evaluate(&arguments[1])?;
-        let left = sequence_values(left).map_err(|message| self.runtime_error(message))?;
-        let right = sequence_values(right).map_err(|message| self.runtime_error(message))?;
-        let pairs = zip_values(left, right).map_err(|message| self.runtime_error(message))?;
+        let left = sequence_values(left).map_err(|message| self.runtime_type_error(message))?;
+        let right = sequence_values(right).map_err(|message| self.runtime_type_error(message))?;
+        let pairs = zip_values(left, right).map_err(|message| {
+            self.runtime_error_with_code(DiagnosticCode::RuntimeLimit, message)
+        })?;
         Ok(Value::Array(shared_values(pairs)))
     }
 
@@ -5215,22 +5360,22 @@ impl Evaluator {
         if name == "select_keys" {
             if arguments.len() != 2 {
                 return Err(
-                    self.runtime_error("`select_keys` expects a map and key sequence".into())
+                    self.runtime_argument_error("`select_keys` expects a map and key sequence")
                 );
             }
             let collection = self.evaluate(&arguments[0])?;
             let keys = match self.evaluate(&arguments[1])? {
                 Value::Array(keys) | Value::List(keys) | Value::Tuple(keys) => keys,
                 _ => {
-                    return Err(self.runtime_error(
-                        "`select_keys` expects an array, list, or tuple of strings".into(),
+                    return Err(self.runtime_type_error(
+                        "`select_keys` expects an array, list, or tuple of strings",
                     ));
                 }
             };
             let mut selected = std::collections::HashSet::with_capacity(keys.len());
             for key in keys.iter() {
                 let Value::String(key) = key else {
-                    return Err(self.runtime_error("`select_keys` keys must be strings".into()));
+                    return Err(self.runtime_type_error("`select_keys` keys must be strings"));
                 };
                 selected.insert(key.as_str());
             }
@@ -5249,17 +5394,17 @@ impl Evaluator {
                         .map(|(key, value)| (key.clone(), value.clone()))
                         .collect(),
                 ))),
-                _ => Err(self.runtime_error("`select_keys` requires a Hash or Tree".into())),
+                _ => Err(self.runtime_type_error("`select_keys` requires a Hash or Tree")),
             };
         }
         if name == "without_key" {
             if arguments.len() != 2 {
-                return Err(self.runtime_error("`without_key` expects a map and key".into()));
+                return Err(self.runtime_argument_error("`without_key` expects a map and key"));
             }
             let collection = self.evaluate(&arguments[0])?;
             let key = match self.evaluate(&arguments[1])? {
                 Value::String(key) => key,
-                _ => return Err(self.runtime_error("`without_key` key must be a string".into())),
+                _ => return Err(self.runtime_type_error("`without_key` key must be a string")),
             };
             return match collection {
                 Value::Hash(entries) => {
@@ -5272,23 +5417,23 @@ impl Evaluator {
                     entries.remove(&key);
                     Ok(Value::Tree(shared_map(entries)))
                 }
-                _ => Err(self.runtime_error("`without_key` requires a Hash or Tree".into())),
+                _ => Err(self.runtime_type_error("`without_key` requires a Hash or Tree")),
             };
         }
         if name == "get" {
             if arguments.len() != 3 {
                 return Err(
-                    self.runtime_error("`get` expects a map, key, and default value".into())
+                    self.runtime_argument_error("`get` expects a map, key, and default value")
                 );
             }
             let collection = self.evaluate(&arguments[0])?;
             let key = match self.evaluate(&arguments[1])? {
                 Value::String(key) => key,
-                _ => return Err(self.runtime_error("`get` key must be a string".into())),
+                _ => return Err(self.runtime_type_error("`get` key must be a string")),
             };
             let entries = match collection {
                 Value::Hash(entries) | Value::Tree(entries) => entries,
-                _ => return Err(self.runtime_error("`get` requires a Hash or Tree".into())),
+                _ => return Err(self.runtime_type_error("`get` requires a Hash or Tree")),
             };
             if let Some(value) = entries.get(&key) {
                 return Ok(value.clone());
@@ -5297,21 +5442,21 @@ impl Evaluator {
         }
         if name == "has_key" {
             if arguments.len() != 2 {
-                return Err(self.runtime_error("`has_key` expects two arguments".into()));
+                return Err(self.runtime_argument_error("`has_key` expects two arguments"));
             }
             let collection = self.evaluate(&arguments[0])?;
             let key = match self.evaluate(&arguments[1])? {
                 Value::String(key) => key,
-                _ => return Err(self.runtime_error("`has_key` key must be a string".into())),
+                _ => return Err(self.runtime_type_error("`has_key` key must be a string")),
             };
             let result = match collection {
                 Value::Hash(entries) | Value::Tree(entries) => entries.contains_key(&key),
-                _ => return Err(self.runtime_error("`has_key` requires a Hash or Tree".into())),
+                _ => return Err(self.runtime_type_error("`has_key` requires a Hash or Tree")),
             };
             return Ok(Value::Bool(result));
         }
         if arguments.len() != 1 {
-            return Err(self.runtime_error(format!("`{name}` expects one argument")));
+            return Err(self.runtime_argument_error(format!("`{name}` expects one argument")));
         }
         let collection = self.evaluate(&arguments[0])?;
         let result = match collection {
@@ -5329,7 +5474,7 @@ impl Evaluator {
                 .collect(),
             Value::Hash(entries) | Value::Tree(entries) => entries.values().cloned().collect(),
             _ => {
-                return Err(self.runtime_error(format!("`{name}` requires a Hash or Tree")));
+                return Err(self.runtime_type_error(format!("`{name}` requires a Hash or Tree")));
             }
         };
         Ok(Value::Array(shared_values(result)))
@@ -5925,6 +6070,7 @@ mod tests {
                 None
             )
             .expect_err("worker limit should be enforced")
+            .message
             .contains("worker count")
         );
         assert!(
@@ -5935,6 +6081,7 @@ mod tests {
                 Some(limits::MAX_CHUNK_SIZE + 1)
             )
             .expect_err("chunk size limit should be enforced")
+            .message
             .contains("chunk size")
         );
         let input = (0..=limits::MAX_PARALLEL_CHUNKS)
@@ -5943,6 +6090,7 @@ mod tests {
         assert!(
             parallel::evaluate_parallel(input, &[], 1, Some(1))
                 .expect_err("chunk count limit should be enforced")
+                .message
                 .contains("chunk count")
         );
     }

@@ -424,7 +424,7 @@ fn check_propagates_semantic_errors_from_imported_modules() {
     let error = String::from_utf8_lossy(&output.stderr);
 
     assert!(!output.status.success());
-    assert!(error.contains("error[E0003]"), "{error}");
+    assert!(error.contains("error[E.semantic.type.mismatch]"), "{error}");
     assert!(error.contains("bad.si"), "{error}");
 
     fs::write(root.join("values.si"), "return list [2, 4]\n")
@@ -510,7 +510,10 @@ fn check_parses_imported_sources_without_executing_them() {
     let nested_error = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
     assert!(nested_error.contains("inner.si"), "{nested_error}");
-    assert!(nested_error.contains("error[E0003]"), "{nested_error}");
+    assert!(
+        nested_error.contains("error[E.semantic.type.mismatch]"),
+        "{nested_error}"
+    );
 
     fs::remove_dir_all(root).expect("failed to remove import test directory");
 }
@@ -743,7 +746,8 @@ fn cli_commands_use_expected_exit_codes_and_streams() {
         .expect("failed to run invalid option command");
     assert!(!invalid_option.status.success());
     assert!(
-        String::from_utf8_lossy(&invalid_option.stderr).contains("error[E0301] (Command error)")
+        String::from_utf8_lossy(&invalid_option.stderr)
+            .contains("error[E.cli.usage] (Command error)")
             && String::from_utf8_lossy(&invalid_option.stderr)
                 .contains("Details: unknown option `--unknown`")
     );
@@ -780,7 +784,7 @@ fn cli_commands_use_expected_exit_codes_and_streams() {
         .expect("failed to run invalid extension command");
     assert!(!invalid_extension.status.success());
     let invalid_extension_error = String::from_utf8_lossy(&invalid_extension.stderr);
-    assert!(invalid_extension_error.contains("error[E0301] (Command error)"));
+    assert!(invalid_extension_error.contains("error[E.cli.usage] (Command error)"));
     assert!(invalid_extension_error.contains("  --> README.md"));
     assert!(
         invalid_extension_error.contains("Details: Simply source files must use the .si extension")
@@ -804,7 +808,10 @@ fn cli_commands_use_expected_exit_codes_and_streams() {
         .expect("failed to run malformed formatter command");
     let _ = fs::remove_file(malformed_path);
     assert!(!malformed_format.status.success());
-    assert!(String::from_utf8_lossy(&malformed_format.stderr).contains("error[E0104]"));
+    assert!(
+        String::from_utf8_lossy(&malformed_format.stderr)
+            .contains("error[E.syntax.expression.missing]")
+    );
 }
 
 #[test]
@@ -824,7 +831,10 @@ fn deeply_nested_expression_returns_a_located_parser_diagnostic() {
 
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("error[E0103] (Parse error)"), "{stderr}");
+    assert!(
+        stderr.contains("error[E.syntax.token.unexpected] (Parse error)"),
+        "{stderr}"
+    );
     assert!(stderr.contains("  --> "), "{stderr}");
     assert!(
         stderr.contains("maximum expression nesting depth"),
@@ -854,7 +864,10 @@ fn deeply_nested_blocks_return_a_located_parser_diagnostic() {
 
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("error[E0103] (Parse error)"), "{stderr}");
+    assert!(
+        stderr.contains("error[E.syntax.token.unexpected] (Parse error)"),
+        "{stderr}"
+    );
     assert!(stderr.contains("  --> "), "{stderr}");
     assert!(stderr.contains("maximum parser nesting depth"), "{stderr}");
     assert!(!stderr.contains("overflowed its stack"), "{stderr}");
@@ -888,7 +901,10 @@ fn deeply_nested_types_and_patterns_return_parser_diagnostics() {
 
         assert_eq!(output.status.code(), Some(1));
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("error[E0103] (Parse error)"), "{stderr}");
+        assert!(
+            stderr.contains("error[E.syntax.token.unexpected] (Parse error)"),
+            "{stderr}"
+        );
         assert!(stderr.contains("  --> "), "{stderr}");
         assert!(stderr.contains("nesting depth"), "{stderr}");
         assert!(!stderr.contains("overflowed its stack"), "{stderr}");
@@ -937,6 +953,46 @@ fn test_command_discovers_only_direct_si_files_in_tests() {
 }
 
 #[test]
+fn test_command_fails_when_no_test_files_are_discovered() {
+    for create_tests_directory in [false, true] {
+        let root = std::env::temp_dir().join(format!(
+            "simply-empty-tests-{}-{}",
+            std::process::id(),
+            TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).expect("failed to create empty test project");
+        if create_tests_directory {
+            fs::create_dir_all(root.join("tests")).expect("failed to create empty tests directory");
+        }
+
+        let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+            .arg("test")
+            .current_dir(&root)
+            .output()
+            .expect("failed to run empty test project");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if create_tests_directory {
+            assert!(
+                stderr.contains("no direct `.si` test files found in `tests`"),
+                "{stderr}"
+            );
+        } else {
+            assert!(
+                stderr.contains("could not read test directory `tests`"),
+                "{stderr}"
+            );
+            assert!(
+                stderr.contains("error[E.runtime.io.operation-failed]"),
+                "{stderr}"
+            );
+        }
+
+        fs::remove_dir_all(root).expect("failed to clean up empty test project");
+    }
+}
+
+#[test]
 fn test_command_continues_after_malformed_test_and_returns_failure() {
     let (success, stdout, stderr) = run_test_project(&[
         ("tests/01-broken.si", "Sayln\n"),
@@ -948,7 +1004,7 @@ fn test_command_continues_after_malformed_test_and_returns_failure() {
     assert!(stdout.contains("PASS tests/02-after-failure.si"));
     assert!(stdout.contains("test result: FAILED"));
     assert!(stdout.contains("1 passed; 1 failed"));
-    assert!(stderr.contains("error[E0104]"));
+    assert!(stderr.contains("error[E.syntax.expression.missing]"));
     assert!(stderr.contains("1 | Sayln"));
 }
 
@@ -982,7 +1038,7 @@ fn repl_preserves_state_prints_expressions_and_recovers_from_errors() {
     assert!(!stdout.contains("... "));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unknown variable `missing`"));
-    assert!(stderr.contains("error[E0206]"));
+    assert!(stderr.contains("error[E.runtime.name.undefined]"));
 }
 
 #[test]

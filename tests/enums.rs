@@ -25,6 +25,26 @@ fn constructs_unit_and_payload_variants_and_matches_them() {
 }
 
 #[test]
+fn unknown_runtime_enum_variant_has_a_specific_diagnostic() {
+    let (success, error) = run_source(
+        "enum State:\n\
+             Ready\n\
+         end\n\
+         Sayln State::Missing\n",
+    );
+
+    assert!(!success);
+    assert!(
+        error.contains("unknown variant `State::Missing`"),
+        "{error}"
+    );
+    assert!(
+        error.contains("error[E.runtime.enum.variant-unknown]"),
+        "{error}"
+    );
+}
+
+#[test]
 fn match_is_an_expression_and_supports_wildcards() {
     let source = "enum Result:\n    Ok as Int\n    Error as String\nend\n\
                   result is Result::Ok(21)\n\

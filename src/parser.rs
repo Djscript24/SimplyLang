@@ -1009,7 +1009,7 @@ impl Parser {
                 Some(self.expect_identifier("expected an error name or `:` after `catch`")?)
             };
             let code = if self.match_kind(TokenKind::As) {
-                Some(self.expect_identifier("expected a diagnostic code after `as`")?)
+                Some(self.expect_diagnostic_code()?)
             } else {
                 None
             };
@@ -1792,6 +1792,19 @@ impl Parser {
             TokenKind::Identifier(name) => Ok(name),
             _ => Err(self.error_at(token.span, message)),
         }
+    }
+
+    fn expect_diagnostic_code(&mut self) -> Result<String, SimplyError> {
+        let mut code = self.expect_identifier("expected a diagnostic code after `as`")?;
+        while self.match_kind(TokenKind::Dot) {
+            code.push('.');
+            code.push_str(&self.expect_identifier("expected a code segment after `.`")?);
+            while self.match_kind(TokenKind::Minus) {
+                code.push('-');
+                code.push_str(&self.expect_identifier("expected a code segment after `-`")?);
+            }
+        }
+        Ok(code)
     }
 
     fn expect_message_name(&mut self) -> Result<String, SimplyError> {

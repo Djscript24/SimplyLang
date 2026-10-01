@@ -7,7 +7,7 @@ fn rejects_same_scope_duplicate_declarations() {
     assert!(!success);
     assert!(stderr.contains("variable `x` is already declared in this scope"));
     assert!(stderr.contains("declare it with `mut` to reassign it"));
-    assert!(stderr.contains("error[E0209] (Runtime error)"));
+    assert!(stderr.contains("error[E.runtime.declaration.conflict] (Runtime error)"));
     assert!(stderr.contains(":2:1"));
     assert!(stderr.contains("2 | x is 20"));
 }

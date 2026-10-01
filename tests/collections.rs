@@ -687,11 +687,11 @@ fn runs_collection_inspection_builtins() {
 fn checks_builtin_collection_arguments() {
     let (success, _, error) = check_source("contains(10, 10)\n");
     assert!(!success);
-    assert!(error.contains("error[E0012]"));
+    assert!(error.contains("error[E.semantic.collection.shape-invalid]"));
 
     let (success, _, error) = check_source("length(10)\n");
     assert!(!success);
-    assert!(error.contains("error[E0012]"));
+    assert!(error.contains("error[E.semantic.collection.shape-invalid]"));
 
     let (success, _, error) = check_source("contains(\"Ada\", 10)\n");
     assert!(!success);

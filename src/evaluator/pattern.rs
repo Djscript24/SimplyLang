@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     ast::{Literal, MatchPattern},
-    error::SimplyError,
+    error::{DiagnosticCode, SimplyError},
     runtime::value::{CsvStreamVersion, Value, shared_values},
 };
 
@@ -129,16 +129,16 @@ impl Evaluator {
                                 *start
                             } else {
                                 let offset = i128::try_from(patterns.len()).map_err(|_| {
-                                    self.runtime_error(
-                                        "sequence pattern length exceeds the supported range"
-                                            .into(),
+                                    self.runtime_error_with_code(
+                                        DiagnosticCode::RuntimeLimit,
+                                        "sequence pattern length exceeds the supported range",
                                     )
                                 })?;
                                 i64::try_from(i128::from(*start) + offset * i128::from(*step))
                                     .map_err(|_| {
-                                        self.runtime_error(
-                                            "range rest position exceeds the supported range"
-                                                .into(),
+                                        self.runtime_error_with_code(
+                                            DiagnosticCode::RuntimeLimit,
+                                            "range rest position exceeds the supported range",
                                         )
                                     })?
                             };
@@ -320,7 +320,10 @@ impl Evaluator {
         }
         let tail = if has_rest {
             let suffix_record = start_record.checked_add(expected_length).ok_or_else(|| {
-                self.runtime_error("CSV stream position exceeds the supported range".into())
+                self.runtime_error_with_code(
+                    DiagnosticCode::RuntimeLimit,
+                    "CSV stream position exceeds the supported range",
+                )
             })?;
             let suffix_offset = reader
                 .stream_position()

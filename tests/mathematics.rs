@@ -98,6 +98,17 @@ fn rejects_invalid_vector_dimensions_and_values() {
         assert!(!success, "{source}");
         assert!(error.contains(expected), "{error}");
     }
+
+    let (success, error) = run_source("Sayln dot([1], [1, 2])\n");
+    assert!(!success);
+    assert!(
+        error.contains("error[E.runtime.collection.operation]"),
+        "{error}"
+    );
+
+    let (success, error) = run_source("Sayln norm([1, \"two\"])\n");
+    assert!(!success);
+    assert!(error.contains("error[E.runtime.type.mismatch]"), "{error}");
 }
 
 #[test]
@@ -163,6 +174,21 @@ fn rejects_invalid_matrix_shapes_and_dimensions() {
         assert!(!success, "{source}");
         assert!(error.contains(expected), "{error}");
     }
+
+    let (success, error) = run_source("Sayln identity(1000000000)\n");
+    assert!(!success);
+    assert!(
+        error.contains("identity matrix is too large to allocate"),
+        "{error}"
+    );
+    assert!(error.contains("error[E.runtime.limit.exceeded]"), "{error}");
+
+    let (success, error) = run_source("Sayln multiply([[1, 2]], [[1, 2]])\n");
+    assert!(!success);
+    assert!(
+        error.contains("error[E.runtime.collection.operation]"),
+        "{error}"
+    );
 }
 
 #[test]

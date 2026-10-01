@@ -153,7 +153,7 @@ fn collection_index(value: &Value, span: Option<&Span>) -> Result<usize, SimplyE
 fn error(span: Option<&Span>, message: impl Into<String>) -> SimplyError {
     SimplyError::Runtime {
         span: span.cloned().unwrap_or_else(|| Span::new(0, 0)),
-        code: crate::error::DiagnosticCode::RuntimeGeneral,
+        code: crate::error::DiagnosticCode::RuntimeCollection,
         message: message.into(),
     }
 }

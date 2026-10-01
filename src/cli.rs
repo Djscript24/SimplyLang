@@ -674,6 +674,11 @@ fn run_tests() -> i32 {
             return 1;
         }
     };
+    if tests.is_empty() {
+        let error = cli_error("no direct `.si` test files found in `tests`");
+        render_error(PathBuf::from("tests"), error, "");
+        return 1;
+    }
 
     let mut passed = 0;
     let mut failed = 0;
@@ -687,7 +692,23 @@ fn run_tests() -> i32 {
             Err(error) => {
                 failed += 1;
                 println!("{} {}", stdout_paint("FAIL", RED), path.display());
-                let source = fs::read_to_string(&path).unwrap_or_default();
+                let source = match fs::read_to_string(&path) {
+                    Ok(source) => source,
+                    Err(read_error) => {
+                        render_error(
+                            &path,
+                            SimplyError::Runtime {
+                                span: Span::new(0, 0),
+                                code: DiagnosticCode::RuntimeIo,
+                                message: format!(
+                                    "could not read source for failed test diagnostics: {read_error}"
+                                ),
+                            },
+                            "",
+                        );
+                        String::new()
+                    }
+                };
                 render_error(&path, error, &source);
             }
         }
@@ -703,26 +724,20 @@ fn run_tests() -> i32 {
 }
 
 fn discover_tests(directory: &Path) -> Result<Vec<PathBuf>, SimplyError> {
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(SimplyError::Runtime {
-                span: Span::new(0, 0),
-                code: DiagnosticCode::RuntimeGeneral,
-                message: format!(
-                    "could not read test directory `{}`: {error}",
-                    directory.display()
-                ),
-            });
-        }
-    };
+    let entries = fs::read_dir(directory).map_err(|error| SimplyError::Runtime {
+        span: Span::new(0, 0),
+        code: DiagnosticCode::RuntimeIo,
+        message: format!(
+            "could not read test directory `{}`: {error}",
+            directory.display()
+        ),
+    })?;
 
     let mut tests = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| SimplyError::Runtime {
             span: Span::new(0, 0),
-            code: DiagnosticCode::RuntimeGeneral,
+            code: DiagnosticCode::RuntimeIo,
             message: format!("could not read test directory entry: {error}"),
         })?;
         let path = entry.path();
@@ -798,7 +813,7 @@ fn repl() -> i32 {
                     "<repl>",
                     SimplyError::Runtime {
                         span: Span::new(0, 0),
-                        code: DiagnosticCode::RuntimeGeneral,
+                        code: DiagnosticCode::RuntimeIo,
                         message: format!("could not read REPL input: {error}"),
                     },
                     "",

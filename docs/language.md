@@ -35,7 +35,8 @@ Simply source files use the `.si` extension. `#` starts a comment outside a stri
 - `return expression`, `if`, `for`, `while`, `break`, and `continue` provide control flow.
 - `try: ... catch error: ... finally: ... end` handles runtime errors. The `catch` binding
   receives a tree with `message`, `code`, `category`, `line`, and `column` fields. Multiple
-  `catch` clauses can filter by diagnostic code, for example `catch error as E0202:`.
+  `catch` clauses can filter by diagnostic code, for example
+  `catch error as E.runtime.numeric.division-by-zero:`.
   `throw expression` raises a user-defined runtime error, and `finally` always runs,
   including when the error is not caught. A `finally` control statement or error takes precedence.
 - `open "path.si" as name` loads a source module relative to the importing file

@@ -1,23 +1,37 @@
-# try-catch-finally.si — structured runtime error handling
-# Demonstrates throw, code-filtered catches, structured error fields, and cleanup.
+# try-catch-finally.si — tagged custom errors and cleanup
+# Demonstrates enum-based throws, pattern-matched catches, and cleanup.
+enum FileError:
+    ReadFailed as String
+end
+
 try:
-    throw "custom failure"
-catch ignored as E0202:
+    throw FileError::ReadFailed("custom failure")
+catch ignored as E.runtime.numeric.division-by-zero:
     Sayln "wrong handler"
 catch error:
-    Sayln error.message
+    match error:
+        FileError::ReadFailed(message):
+            Sayln "custom failure: " + message
+        _:
+            Sayln "another runtime error"
+    end
 finally:
     Sayln "cleanup complete"
 end
 
 try:
     try:
-        throw "inner failure"
+        throw FileError::ReadFailed("inner failure")
     finally:
         Sayln "inner cleanup"
     end
 catch error:
-    Sayln "outer caught: " + error.message
+    match error:
+        FileError::ReadFailed(message):
+            Sayln "outer caught: " + message
+        _:
+            Sayln "another runtime error"
+    end
 finally:
     Sayln "outer cleanup"
 end

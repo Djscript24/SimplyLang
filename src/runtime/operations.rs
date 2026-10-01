@@ -15,19 +15,19 @@ pub(crate) fn unary(
     match operator {
         UnaryOperator::Not => match value {
             Value::Bool(value) => Ok(Value::Bool(!value)),
-            _ => Err(error(span, "`not` requires a boolean")),
+            _ => Err(type_error(span, "`not` requires a boolean")),
         },
         UnaryOperator::Negate => match value {
             Value::Int(value) => value
                 .checked_neg()
                 .map(Value::Int)
-                .ok_or_else(|| error(span, "integer overflow")),
+                .ok_or_else(|| arithmetic_error(span)),
             Value::Float(value) => Ok(Value::Float(-value)),
-            _ => Err(error(span, "unary `-` requires a number")),
+            _ => Err(type_error(span, "unary `-` requires a number")),
         },
         UnaryOperator::Transpose => match value {
             Value::Matrix(rows) => matrix_transpose(&rows, span),
-            _ => Err(error(span, "transpose requires a matrix")),
+            _ => Err(type_error(span, "transpose requires a matrix")),
         },
     }
 }
@@ -51,7 +51,7 @@ pub(crate) fn binary(
             (Value::Float(left), Value::Float(right)) => float_result(left + right, span),
             (Value::Int(left), Value::Float(right)) => float_result(left as f64 + right, span),
             (Value::Float(left), Value::Int(right)) => float_result(left + right as f64, span),
-            _ => Err(error(span, "`+` requires two compatible values")),
+            _ => Err(type_error(span, "`+` requires two compatible values")),
         },
         Subtract | Multiply | Divide | Remainder => numeric_operation(left, operator, right, span),
         MatrixMultiply => matrix_multiply(left, right, span),
@@ -62,11 +62,11 @@ pub(crate) fn binary(
         NotEqual => Ok(Value::Bool(left != right)),
         And => match (left, right) {
             (Value::Bool(left), Value::Bool(right)) => Ok(Value::Bool(left && right)),
-            _ => Err(error(span, "`and` requires two booleans")),
+            _ => Err(type_error(span, "`and` requires two booleans")),
         },
         Or => match (left, right) {
             (Value::Bool(left), Value::Bool(right)) => Ok(Value::Bool(left || right)),
-            _ => Err(error(span, "`or` requires two booleans")),
+            _ => Err(type_error(span, "`or` requires two booleans")),
         },
     }
 }
@@ -96,7 +96,7 @@ fn numeric_operation(
         (Value::Float(left), Value::Float(right)) => (left, right),
         (Value::Int(left), Value::Float(right)) => (left as f64, right),
         (Value::Float(left), Value::Int(right)) => (left, right as f64),
-        _ => return Err(error(span, "arithmetic requires two numbers")),
+        _ => return Err(type_error(span, "arithmetic requires two numbers")),
     };
     if right == 0.0 && matches!(operator, BinaryOperator::Divide | BinaryOperator::Remainder) {
         return Err(division_error(span));
@@ -133,7 +133,7 @@ fn numeric_comparison(
         (Value::Float(left), Value::Float(right)) => (left, right),
         (Value::Int(left), Value::Float(right)) => (left as f64, right),
         (Value::Float(left), Value::Int(right)) => (left, right as f64),
-        _ => return Err(error(span, "comparison requires two numbers")),
+        _ => return Err(type_error(span, "comparison requires two numbers")),
     };
     let result = match operator {
         BinaryOperator::Greater => left > right,
@@ -162,14 +162,20 @@ fn matrix_add(left: &[Value], right: &[Value], span: Option<&Span>) -> Result<Va
     let left_width = matrix_shape(left, span)?;
     let right_width = matrix_shape(right, span)?;
     if left.len() != right.len() || left_width != right_width {
-        return Err(error(span, "matrix dimensions do not match"));
+        return Err(collection_error(span, "matrix dimensions do not match"));
     }
+    ensure_matrix_allocation(
+        left.len(),
+        left_width,
+        span,
+        "matrix result is too large to allocate",
+    )?;
     let mut rows = Vec::new();
     for (left_row, right_row) in left.iter().zip(right) {
         let left = matrix_row_values(left_row, span)?;
         let right = matrix_row_values(right_row, span)?;
         if left.len() != right.len() {
-            return Err(error(span, "matrix dimensions do not match"));
+            return Err(collection_error(span, "matrix dimensions do not match"));
         }
         let mut row = Vec::new();
         for (left, right) in left.iter().zip(right.iter()) {
@@ -188,13 +194,19 @@ fn matrix_add(left: &[Value], right: &[Value], span: Option<&Span>) -> Result<Va
 fn matrix_multiply(left: Value, right: Value, span: Option<&Span>) -> Result<Value, SimplyError> {
     let (left, right) = match (left, right) {
         (Value::Matrix(left), Value::Matrix(right)) => (left, right),
-        _ => return Err(error(span, "matrix multiply requires matrices")),
+        _ => return Err(type_error(span, "matrix multiply requires matrices")),
     };
     let left_width = matrix_shape(&left, span)?;
     let right_width = matrix_shape(&right, span)?;
     if left.is_empty() || right.is_empty() || left_width != right.len() {
-        return Err(error(span, "matrix dimensions do not match"));
+        return Err(collection_error(span, "matrix dimensions do not match"));
     }
+    ensure_matrix_allocation(
+        left.len(),
+        right_width,
+        span,
+        "matrix result is too large to allocate",
+    )?;
     let mut result = Vec::with_capacity(left.len());
     for left_row in left.iter() {
         let left_row = matrix_row_values(left_row, span)?;
@@ -223,22 +235,47 @@ pub(crate) fn math_unary(
     let value = match value {
         Value::Int(value) => value as f64,
         Value::Float(value) if value.is_finite() => value,
-        _ => return Err(error(span, format!("`{name}` requires a finite number"))),
+        _ => {
+            return Err(type_error(
+                span,
+                format!("`{name}` requires a finite number"),
+            ));
+        }
     };
     let result = match name {
         "sqrt" if value >= 0.0 => value.sqrt(),
-        "sqrt" => return Err(error(span, "`sqrt` requires a non-negative number")),
+        "sqrt" => {
+            return Err(arithmetic_error_with_message(
+                span,
+                "`sqrt` requires a non-negative number",
+            ));
+        }
         "exp" => value.exp(),
         "log" if value > 0.0 => value.ln(),
-        "log" => return Err(error(span, "`log` requires a positive number")),
+        "log" => {
+            return Err(arithmetic_error_with_message(
+                span,
+                "`log` requires a positive number",
+            ));
+        }
         "log10" if value > 0.0 => value.log10(),
-        "log10" => return Err(error(span, "`log10` requires a positive number")),
+        "log10" => {
+            return Err(arithmetic_error_with_message(
+                span,
+                "`log10` requires a positive number",
+            ));
+        }
         "sin" => value.sin(),
         "cos" => value.cos(),
         "tan" => value.tan(),
         "floor" => value.floor(),
         "ceil" => value.ceil(),
-        _ => return Err(error(span, format!("unknown math operation `{name}`"))),
+        _ => {
+            return Err(argument_error(
+                span,
+                format!("unknown math operation `{name}`"),
+            ));
+        }
     };
     float_result(result, span)
 }
@@ -263,7 +300,7 @@ pub(crate) fn math_sign(value: Value, span: Option<&Span>) -> Result<Value, Simp
         } else {
             0
         })),
-        _ => Err(error(span, "`sign` requires a finite number")),
+        _ => Err(type_error(span, "`sign` requires a finite number")),
     }
 }
 
@@ -276,7 +313,7 @@ pub(crate) fn vector_add(
     let left = vector_values(left, span)?;
     let right = vector_values(right, span)?;
     if left.len() != right.len() {
-        return Err(error(span, "vector dimensions do not match"));
+        return Err(collection_error(span, "vector dimensions do not match"));
     }
     let operator = if subtract {
         BinaryOperator::Subtract
@@ -319,7 +356,7 @@ pub(crate) fn vector_dot(
     let left = vector_values(left, span)?;
     let right = vector_values(right, span)?;
     if left.len() != right.len() {
-        return Err(error(span, "vector dimensions do not match"));
+        return Err(collection_error(span, "vector dimensions do not match"));
     }
     let mut total = Value::Int(0);
     for (left, right) in left.iter().zip(right) {
@@ -350,7 +387,7 @@ pub(crate) fn vector_distance(
     let left = vector_values(left, span)?;
     let right = vector_values(right, span)?;
     if left.len() != right.len() {
-        return Err(error(span, "vector dimensions do not match"));
+        return Err(collection_error(span, "vector dimensions do not match"));
     }
     let mut distance = 0.0_f64;
     for (left, right) in left.iter().zip(right) {
@@ -367,7 +404,10 @@ pub(crate) fn vector_normalize(vector: &Value, span: Option<&Span>) -> Result<Va
         norm = norm.hypot(numeric_value(value, span)?);
     }
     if norm == 0.0 {
-        return Err(error(span, "cannot normalize a zero vector"));
+        return Err(arithmetic_error_with_message(
+            span,
+            "cannot normalize a zero vector",
+        ));
     }
     let result = values
         .iter()
@@ -394,6 +434,12 @@ pub(crate) fn matrix_transpose_value(
     let rows = matrix_rows(matrix, span)?;
     let height = rows.len();
     let width = rows[0].len();
+    ensure_matrix_allocation(
+        width,
+        height,
+        span,
+        "matrix transpose is too large to allocate",
+    )?;
     let mut transposed = Vec::with_capacity(width);
     for column in 0..width {
         let mut row = Vec::with_capacity(height);
@@ -414,8 +460,14 @@ pub(crate) fn matrix_add_values(
     let left = matrix_rows(left, span)?;
     let right = matrix_rows(right, span)?;
     if left.len() != right.len() || left[0].len() != right[0].len() {
-        return Err(error(span, "matrix dimensions do not match"));
+        return Err(collection_error(span, "matrix dimensions do not match"));
     }
+    ensure_matrix_allocation(
+        left.len(),
+        left[0].len(),
+        span,
+        "matrix result is too large to allocate",
+    )?;
     let operator = if subtract {
         BinaryOperator::Subtract
     } else {
@@ -440,6 +492,12 @@ pub(crate) fn matrix_scale(
 ) -> Result<Value, SimplyError> {
     numeric_value(scalar, span)?;
     let rows = matrix_rows(matrix, span)?;
+    ensure_matrix_allocation(
+        rows.len(),
+        rows[0].len(),
+        span,
+        "matrix result is too large to allocate",
+    )?;
     let result = rows
         .iter()
         .map(|row| {
@@ -467,8 +525,14 @@ pub(crate) fn matrix_multiply_values(
     let left = matrix_rows(left, span)?;
     let right = matrix_rows(right, span)?;
     if left[0].len() != right.len() {
-        return Err(error(span, "matrix dimensions do not match"));
+        return Err(collection_error(span, "matrix dimensions do not match"));
     }
+    ensure_matrix_allocation(
+        left.len(),
+        right[0].len(),
+        span,
+        "matrix result is too large to allocate",
+    )?;
     let mut result = Vec::with_capacity(left.len());
     for left_row in &left {
         let mut row = vec![0.0; right[0].len()];
@@ -490,21 +554,20 @@ pub(crate) fn matrix_multiply_values(
 
 pub(crate) fn matrix_identity(size: usize, span: Option<&Span>) -> Result<Value, SimplyError> {
     if size == 0 {
-        return Err(error(span, "identity matrix size must be positive"));
+        return Err(SimplyError::Runtime {
+            span: span.cloned().unwrap_or_else(|| Span::new(0, 0)),
+            code: DiagnosticCode::RuntimeArgument,
+            message: "identity matrix size must be positive".into(),
+        });
     }
-    let cells = size
-        .checked_mul(size)
-        .ok_or_else(|| error(span, "identity matrix size is too large"))?;
-    if cells > isize::MAX as usize / std::mem::size_of::<Value>() {
-        return Err(error(span, "identity matrix is too large to allocate"));
-    }
+    ensure_matrix_allocation(size, size, span, "identity matrix is too large to allocate")?;
     let mut rows = Vec::new();
     rows.try_reserve_exact(size)
-        .map_err(|_| error(span, "identity matrix is too large to allocate"))?;
+        .map_err(|_| limit_error(span, "identity matrix is too large to allocate"))?;
     for row_index in 0..size {
         let mut row = Vec::new();
         row.try_reserve_exact(size)
-            .map_err(|_| error(span, "identity matrix is too large to allocate"))?;
+            .map_err(|_| limit_error(span, "identity matrix is too large to allocate"))?;
         for column_index in 0..size {
             row.push(Value::Int(i64::from(row_index == column_index)));
         }
@@ -528,7 +591,7 @@ pub(crate) fn statistics_values(
                 _ => unreachable!("range values are integers"),
             })
             .collect(),
-        _ => Err(error(span, "expected a numeric sequence")),
+        _ => Err(type_error(span, "expected a numeric sequence")),
     }
 }
 
@@ -537,7 +600,10 @@ pub(crate) fn population_moments(
     span: Option<&Span>,
 ) -> Result<(f64, f64), SimplyError> {
     if values.is_empty() {
-        return Err(error(span, "statistic requires at least one value"));
+        return Err(argument_error(
+            span,
+            "statistic requires at least one value",
+        ));
     }
     let mut mean = 0.0;
     let mut sum_squared_deviations = 0.0;
@@ -562,7 +628,7 @@ pub(crate) fn statistics_unary(
     span: Option<&Span>,
 ) -> Result<Value, SimplyError> {
     if values.is_empty() {
-        return Err(error(
+        return Err(argument_error(
             span,
             format!("`{name}` requires at least one numeric value"),
         ));
@@ -584,10 +650,11 @@ pub(crate) fn statistics_unary(
             let percent = if name == "median" {
                 50.0
             } else {
-                percentile.ok_or_else(|| error(span, "`percentile` requires a percentile"))?
+                percentile
+                    .ok_or_else(|| argument_error(span, "`percentile` requires a percentile"))?
             };
             if !(0.0..=100.0).contains(&percent) {
-                return Err(error(
+                return Err(argument_error(
                     span,
                     "`percentile` must be between 0 and 100 inclusive",
                 ));
@@ -603,7 +670,7 @@ pub(crate) fn statistics_unary(
                 span,
             )
         }
-        _ => Err(error(span, format!("unknown statistic `{name}`"))),
+        _ => Err(argument_error(span, format!("unknown statistic `{name}`"))),
     }
 }
 
@@ -614,13 +681,16 @@ pub(crate) fn statistics_pair(
     span: Option<&Span>,
 ) -> Result<Value, SimplyError> {
     if left.is_empty() || right.is_empty() {
-        return Err(error(
+        return Err(argument_error(
             span,
             format!("`{name}` requires non-empty sequences"),
         ));
     }
     if left.len() != right.len() {
-        return Err(error(span, "statistic sequence lengths do not match"));
+        return Err(collection_error(
+            span,
+            "statistic sequence lengths do not match",
+        ));
     }
     let mut mean_left = 0.0;
     let mut mean_right = 0.0;
@@ -641,14 +711,14 @@ pub(crate) fn statistics_pair(
         "covariance" => co_moment / left.len() as f64,
         "correlation" => {
             if left_moment <= 0.0 || right_moment <= 0.0 {
-                return Err(error(
+                return Err(arithmetic_error_with_message(
                     span,
                     "`correlation` requires non-constant input sequences",
                 ));
             }
             co_moment / (left_moment * right_moment).sqrt()
         }
-        _ => return Err(error(span, format!("unknown statistic `{name}`"))),
+        _ => return Err(argument_error(span, format!("unknown statistic `{name}`"))),
     };
     float_result(result, span)
 }
@@ -656,10 +726,10 @@ pub(crate) fn statistics_pair(
 fn vector_values<'a>(value: &'a Value, span: Option<&Span>) -> Result<Vec<&'a Value>, SimplyError> {
     let values = match value {
         Value::Array(values) | Value::List(values) | Value::Tuple(values) => values,
-        _ => return Err(error(span, "expected a vector sequence")),
+        _ => return Err(type_error(span, "expected a vector sequence")),
     };
     if values.is_empty() {
-        return Err(error(span, "vector must not be empty"));
+        return Err(argument_error(span, "vector must not be empty"));
     }
     for value in values.iter() {
         numeric_value(value, span)?;
@@ -670,25 +740,25 @@ fn vector_values<'a>(value: &'a Value, span: Option<&Span>) -> Result<Vec<&'a Va
 fn matrix_rows<'a>(value: &'a Value, span: Option<&Span>) -> Result<Vec<&'a [Value]>, SimplyError> {
     let values = match value {
         Value::Matrix(values) | Value::Array(values) | Value::List(values) => values,
-        _ => return Err(error(span, "expected a matrix of numeric rows")),
+        _ => return Err(type_error(span, "expected a matrix of numeric rows")),
     };
     if values.is_empty() {
-        return Err(error(span, "matrix must not be empty"));
+        return Err(collection_error(span, "matrix must not be empty"));
     }
     let mut rows = Vec::with_capacity(values.len());
     let mut width = None;
     for row in values.iter() {
         let row = match row {
             Value::Array(row) | Value::List(row) => row.as_slice(),
-            _ => return Err(error(span, "matrix rows must be arrays or lists")),
+            _ => return Err(type_error(span, "matrix rows must be arrays or lists")),
         };
         if row.is_empty() {
-            return Err(error(span, "matrix rows must not be empty"));
+            return Err(collection_error(span, "matrix rows must not be empty"));
         }
         if let Some(width) = width
             && width != row.len()
         {
-            return Err(error(span, "matrix rows must have equal widths"));
+            return Err(collection_error(span, "matrix rows must have equal widths"));
         }
         width = Some(row.len());
         for value in row {
@@ -706,22 +776,22 @@ fn numeric_result_value(value: Value, span: Option<&Span>) -> Result<Value, Simp
 
 fn matrix_shape(matrix: &[Value], span: Option<&Span>) -> Result<usize, SimplyError> {
     if matrix.is_empty() {
-        return Err(error(span, "matrix must not be empty"));
+        return Err(collection_error(span, "matrix must not be empty"));
     }
     let width = matrix_row_values(&matrix[0], span)?.len();
     if width == 0 {
-        return Err(error(span, "matrix rows must not be empty"));
+        return Err(collection_error(span, "matrix rows must not be empty"));
     }
     for row in matrix {
         let values = matrix_row_values(row, span)?;
         if values.len() != width {
-            return Err(error(span, "matrix rows must have equal widths"));
+            return Err(collection_error(span, "matrix rows must have equal widths"));
         }
         if values
             .iter()
             .any(|value| !matches!(value, Value::Int(_) | Value::Float(_)))
         {
-            return Err(error(span, "matrix values must be numeric"));
+            return Err(type_error(span, "matrix values must be numeric"));
         }
     }
     Ok(width)
@@ -730,12 +800,18 @@ fn matrix_shape(matrix: &[Value], span: Option<&Span>) -> Result<usize, SimplyEr
 fn matrix_row_values<'a>(row: &'a Value, span: Option<&Span>) -> Result<&'a [Value], SimplyError> {
     match row {
         Value::Array(values) | Value::List(values) => Ok(values.as_slice()),
-        _ => Err(error(span, "matrix rows must be arrays or lists")),
+        _ => Err(type_error(span, "matrix rows must be arrays or lists")),
     }
 }
 
 fn matrix_transpose(rows: &[Value], span: Option<&Span>) -> Result<Value, SimplyError> {
     let width = matrix_shape(rows, span)?;
+    ensure_matrix_allocation(
+        width,
+        rows.len(),
+        span,
+        "matrix transpose is too large to allocate",
+    )?;
     let mut result = Vec::with_capacity(width);
     for column in 0..width {
         let mut output = Vec::with_capacity(rows.len());
@@ -752,16 +828,65 @@ fn numeric_value(value: &Value, span: Option<&Span>) -> Result<f64, SimplyError>
     match value {
         Value::Int(value) => Ok(*value as f64),
         Value::Float(value) if value.is_finite() => Ok(*value),
-        _ => Err(error(span, "expected a finite numeric value")),
+        _ => Err(type_error(span, "expected a finite numeric value")),
     }
 }
 
-fn error(span: Option<&Span>, message: impl Into<String>) -> SimplyError {
+fn type_error(span: Option<&Span>, message: impl Into<String>) -> SimplyError {
     SimplyError::Runtime {
         span: span.cloned().unwrap_or_else(|| Span::new(0, 0)),
-        code: DiagnosticCode::RuntimeGeneral,
+        code: DiagnosticCode::RuntimeTypeMismatch,
         message: message.into(),
     }
+}
+
+fn collection_error(span: Option<&Span>, message: impl Into<String>) -> SimplyError {
+    SimplyError::Runtime {
+        span: span.cloned().unwrap_or_else(|| Span::new(0, 0)),
+        code: DiagnosticCode::RuntimeCollection,
+        message: message.into(),
+    }
+}
+
+fn argument_error(span: Option<&Span>, message: impl Into<String>) -> SimplyError {
+    SimplyError::Runtime {
+        span: span.cloned().unwrap_or_else(|| Span::new(0, 0)),
+        code: DiagnosticCode::RuntimeArgument,
+        message: message.into(),
+    }
+}
+
+fn arithmetic_error_with_message(span: Option<&Span>, message: impl Into<String>) -> SimplyError {
+    SimplyError::Runtime {
+        span: span.cloned().unwrap_or_else(|| Span::new(0, 0)),
+        code: DiagnosticCode::RuntimeArithmetic,
+        message: message.into(),
+    }
+}
+
+fn limit_error(span: Option<&Span>, message: impl Into<String>) -> SimplyError {
+    SimplyError::Runtime {
+        span: span.cloned().unwrap_or_else(|| Span::new(0, 0)),
+        code: DiagnosticCode::RuntimeLimit,
+        message: message.into(),
+    }
+}
+
+fn ensure_matrix_allocation(
+    rows: usize,
+    columns: usize,
+    span: Option<&Span>,
+    message: &str,
+) -> Result<(), SimplyError> {
+    let cells = rows
+        .checked_mul(columns)
+        .ok_or_else(|| limit_error(span, message))?;
+    if cells > crate::runtime::limits::MAX_MATRIX_CELLS
+        || cells > isize::MAX as usize / std::mem::size_of::<Value>()
+    {
+        return Err(limit_error(span, message));
+    }
+    Ok(())
 }
 
 fn arithmetic_error(span: Option<&Span>) -> SimplyError {
@@ -782,8 +907,20 @@ fn division_error(span: Option<&Span>) -> SimplyError {
 
 #[cfg(test)]
 mod tests {
-    use super::{binary, numeric_comparison};
-    use crate::{ast::BinaryOperator, runtime::value::Value};
+    use super::{binary, ensure_matrix_allocation, numeric_comparison};
+    use crate::{ast::BinaryOperator, error::DiagnosticCode, runtime::value::Value};
+
+    #[test]
+    fn matrix_result_allocations_obey_the_cell_limit() {
+        assert!(ensure_matrix_allocation(1_000, 1_000, None, "too large").is_ok());
+
+        let too_many_cells = ensure_matrix_allocation(1_001, 1_000, None, "too large").unwrap_err();
+        assert_eq!(too_many_cells.code(), DiagnosticCode::RuntimeLimit);
+
+        let overflowing_dimensions =
+            ensure_matrix_allocation(usize::MAX, 2, None, "too large").unwrap_err();
+        assert_eq!(overflowing_dimensions.code(), DiagnosticCode::RuntimeLimit);
+    }
 
     #[test]
     fn compares_large_integers_without_float_precision_loss() {

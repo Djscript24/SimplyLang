@@ -695,9 +695,24 @@ fn file_io_failures_return_runtime_diagnostics() {
     ] {
         let (success, error) = run_source(&source);
         assert!(!success, "{source}");
-        assert!(error.contains("error[E0206]"), "{error}");
+        assert!(
+            error.contains("error[E.runtime.io.operation-failed]"),
+            "{error}"
+        );
         assert!(error.contains(expected), "{error}");
     }
+
+    let source = format!(
+        "try:\n\
+             Sayln read_file(\"{}\")\n\
+         catch failure as E.runtime.io.operation-failed:\n\
+             Sayln failure.code\n\
+         end\n",
+        missing.display()
+    );
+    let (success, output) = run_source_stdout(&source);
+    assert!(success, "{output}");
+    assert_eq!(output, "E.runtime.io.operation-failed\n");
 
     let (success, _, error) = check_source("Sayln read_file(10)\n");
     assert!(!success);
@@ -1167,7 +1182,7 @@ fn reports_missing_imports_with_structured_diagnostics() {
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
     assert!(error.contains("Runtime error"));
-    assert!(error.contains("error[E0204]"));
+    assert!(error.contains("error[E.runtime.module.import]"));
     assert!(error.contains("1 | open \"missing.si\" as missing"));
 }
 
@@ -1196,7 +1211,7 @@ fn reports_circular_imports_without_recursing_forever() {
     assert!(!output.status.success());
     assert!(error.contains("cyclic import"));
     assert!(error.contains("a.si") && error.contains("b.si") && error.contains("c.si"));
-    assert!(error.contains("error[E0204]"));
+    assert!(error.contains("error[E.runtime.module.import]"));
 }
 
 #[cfg(unix)]

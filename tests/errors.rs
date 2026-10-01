@@ -8,7 +8,7 @@ fn reports_runtime_errors() {
     assert!(type_error.contains("cannot assign a String value to `value`"));
     assert!(type_error.contains("expected Int, found String"));
     assert!(type_error.contains("1:1"));
-    assert!(type_error.contains("error[E0208] (Runtime error)"));
+    assert!(type_error.contains("error[E.runtime.type.mismatch] (Runtime error)"));
 
     let (success, index_error) = run_source("values is array [1]\nSayln values[2]\n");
     assert!(!success);
@@ -19,6 +19,7 @@ fn reports_runtime_errors() {
         run_source("fn one(value):\n    return value\nend\nSayln one()\n");
     assert!(!success);
     assert!(argument_error.contains("expects 1 arguments"));
+    assert!(argument_error.contains("error[E.runtime.argument.invalid]"));
 
     let (success, collection_type_error) = run_source("values as List[String] is list [1]\n");
     assert!(!success);
@@ -31,7 +32,33 @@ fn reports_runtime_errors() {
     let (success, overflow_error) = run_source("Sayln 9223372036854775807 + 1\n");
     assert!(!success);
     assert!(overflow_error.contains("integer arithmetic error"));
-    assert!(overflow_error.contains("error[E0203]"));
+    assert!(overflow_error.contains("error[E.runtime.numeric.arithmetic-invalid]"));
+}
+
+#[test]
+fn runtime_assertions_use_a_catchable_diagnostic_identity() {
+    let (success, output) = run_source_stdout(
+        "try:\n\
+             assert(false, \"condition did not hold\")\n\
+         catch failure as E.runtime.assertion.failed:\n\
+             Sayln failure.code\n\
+         end\n",
+    );
+
+    assert!(success, "{output}");
+    assert_eq!(output, "E.runtime.assertion.failed\n");
+}
+
+#[test]
+fn runtime_control_errors_have_a_specific_diagnostic() {
+    let (success, error) = run_source("break\n");
+
+    assert!(!success);
+    assert!(error.contains("control statement is outside its valid context"));
+    assert!(
+        error.contains("error[E.runtime.control.invalid]"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -40,14 +67,14 @@ fn validates_numeric_conversion_literals_and_runtime_values() {
         check_source("mut name is to_int(\"Djoest\")\nname -> 10\nSayln name\n");
     assert!(!success);
     assert!(error.contains("cannot convert `Djoest` to an Int"));
-    assert!(error.contains("error[E0018]"));
+    assert!(error.contains("error[E.semantic.conversion.literal-invalid]"));
     assert!(error.contains("Replace this text with a valid number"));
 
     let (success, runtime_error) =
         run_source("text is \"Djoest\"\nmut name is to_int(text)\nname -> 10\nSayln name\n");
     assert!(!success);
     assert!(runtime_error.contains("cannot convert `Djoest` to an Int"));
-    assert!(runtime_error.contains("error[E0207]"));
+    assert!(runtime_error.contains("error[E.runtime.conversion.failed]"));
     assert!(runtime_error.contains("to_int"));
     assert!(!runtime_error.contains("convert it explicitly"));
 
@@ -60,24 +87,24 @@ fn validates_numeric_conversion_literals_and_runtime_values() {
     let (success, _, error) = check_source("Sayln to_float(\"NaN\")\n");
     assert!(!success);
     assert!(error.contains("cannot convert `NaN` to a finite Float"));
-    assert!(error.contains("error[E0018]"));
+    assert!(error.contains("error[E.semantic.conversion.literal-invalid]"));
 }
 
 #[test]
 fn reports_stable_codes_for_lex_and_parse_errors() {
     let (success, lex_error) = run_source("Sayln ?\n");
     assert!(!success);
-    assert!(lex_error.contains("error[E0101]"));
+    assert!(lex_error.contains("error[E.lex.character.invalid]"));
     assert!(lex_error.contains("Sayln ?"));
 
     let (success, parse_error) = run_source("Sayln\n");
     assert!(!success);
-    assert!(parse_error.contains("error[E0104]"));
+    assert!(parse_error.contains("error[E.syntax.expression.missing]"));
     assert!(parse_error.contains("1 | Sayln"));
 
     let (success, number_error) = run_source("Sayln 1e\n");
     assert!(!success);
-    assert!(number_error.contains("error[E0106] (Lex error)"));
+    assert!(number_error.contains("error[E.lex.number.invalid] (Lex error)"));
     assert!(number_error.contains("This number literal is not valid."));
     assert!(number_error.contains("1 | Sayln 1e"));
 }
@@ -96,7 +123,7 @@ fn explains_reassignment_with_no_value() {
     let (success, error) = run_source("mut name is 10\nname ->\n");
 
     assert!(!success);
-    assert!(error.contains("error[E0104]"));
+    assert!(error.contains("error[E.syntax.expression.missing]"));
     assert!(error.contains("expected a value after `->`"));
     assert!(error.contains("on this line or the next line"));
     assert!(error.contains("2 | name ->"));
@@ -120,46 +147,74 @@ fn rejects_malformed_programs_with_parse_diagnostics() {
             error.contains("Parse error"),
             "unexpected diagnostic: {error}"
         );
-        assert!(error.contains("error[E010"), "missing parse code: {error}");
+        assert!(
+            error.contains("error[E.syntax."),
+            "missing parse code: {error}"
+        );
     }
 }
 
 #[test]
 fn reports_structured_diagnostics_for_all_malformed_input_shapes() {
     let cases = [
-        ("Sayln ?\n", "Lex error", "error[E0101]", "1:7"),
-        ("Sayln 1e\n", "Lex error", "error[E0106]", "1:7"),
-        ("Sayln\n", "Parse error", "error[E0104]", "1:6"),
+        (
+            "Sayln ?\n",
+            "Lex error",
+            "error[E.lex.character.invalid]",
+            "1:7",
+        ),
+        (
+            "Sayln 1e\n",
+            "Lex error",
+            "error[E.lex.number.invalid]",
+            "1:7",
+        ),
+        (
+            "Sayln\n",
+            "Parse error",
+            "error[E.syntax.expression.missing]",
+            "1:6",
+        ),
         (
             "open \"m.si\" as 42\n",
             "Parse error",
-            "error[E0103]",
+            "error[E.syntax.token.unexpected]",
             "1:16",
         ),
-        ("values is array [1\n", "Parse error", "error[E0103]", "2:1"),
-        ("Sayln \"unterminated\n", "Lex error", "error[E0102]", "1:7"),
+        (
+            "values is array [1\n",
+            "Parse error",
+            "error[E.syntax.token.unexpected]",
+            "2:1",
+        ),
+        (
+            "Sayln \"unterminated\n",
+            "Lex error",
+            "error[E.lex.string.unterminated]",
+            "1:7",
+        ),
         (
             "fn broken(value):\n    return value\n",
             "Parse error",
-            "error[E0103]",
+            "error[E.syntax.token.unexpected]",
             "3:1",
         ),
         (
             "if true:\n    Sayln true\n",
             "Parse error",
-            "error[E0103]",
+            "error[E.syntax.token.unexpected]",
             "3:1",
         ),
         (
             "values is list [1]\nresult is pipeline:\n    values\n    nope\nend\n",
             "Parse error",
-            "error[E0103]",
+            "error[E.syntax.token.unexpected]",
             "4:5",
         ),
         (
             "values is list [1]\nSayln values[0\n",
             "Parse error",
-            "error[E0103]",
+            "error[E.syntax.token.unexpected]",
             "2:15",
         ),
     ];
@@ -201,7 +256,7 @@ fn reports_the_original_type_for_mutable_reassignment() {
     assert!(error.contains("2:1"));
     assert!(error.contains("cannot reassign `name` with type Int"));
     assert!(error.contains("variable `name` remains type String"));
-    assert!(error.contains("error[E0208] (Runtime error)"));
+    assert!(error.contains("error[E.runtime.type.mismatch] (Runtime error)"));
 }
 
 #[test]
@@ -211,7 +266,7 @@ fn inferred_types_are_preserved_for_mutable_reassignment() {
     assert!(error.contains("2:1"));
     assert!(error.contains("cannot reassign `name` with type Int"));
     assert!(error.contains("variable `name` remains type String"));
-    assert!(error.contains("error[E0208] (Runtime error)"));
+    assert!(error.contains("error[E.runtime.type.mismatch] (Runtime error)"));
 }
 
 #[test]
@@ -219,12 +274,12 @@ fn checks_programs_without_executing_them() {
     let (success, output, error) = check_source("Sayln missing\n");
     assert!(!success);
     assert!(output.contains("Checking"));
-    assert!(error.contains("error[E0001]"));
+    assert!(error.contains("error[E.semantic.name.undefined]"));
     assert!(error.contains("unknown variable `missing`"));
 
     let (success, _, error) = check_source("value as Int is \"wrong\"\n");
     assert!(!success);
-    assert!(error.contains("error[E0003] (Semantic error)"));
+    assert!(error.contains("error[E.semantic.type.mismatch] (Semantic error)"));
 
     let (success, output, error) = check_source("Sayln \"no output during check\"\n");
     assert!(success, "unexpected check error: {error}");
@@ -245,7 +300,7 @@ fn diagnostics_include_source_path_and_context() {
 fn checks_expression_function_and_control_flow_types() {
     let (success, _, error) = check_source("Sayln 10 + \"hello\"\n");
     assert!(!success);
-    assert!(error.contains("error[E0003]"));
+    assert!(error.contains("error[E.semantic.type.mismatch]"));
 
     let (success, _, error) = check_source(
         "fn add(left as Int, right as Int) gives Int:\n    return left + right\nend\nSayln add(\"hello\", 2)\n",
@@ -255,7 +310,7 @@ fn checks_expression_function_and_control_flow_types() {
 
     let (success, _, error) = check_source("break\n");
     assert!(!success);
-    assert!(error.contains("error[E0007]"));
+    assert!(error.contains("error[E.semantic.control.loop-transfer-invalid]"));
 
     let (success, _, error) = check_source("return 1\n");
     assert!(!success);

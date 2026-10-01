@@ -513,6 +513,38 @@ fn invalid_parallel_worker_count_is_reported() {
 }
 
 #[test]
+fn parallel_runtime_errors_preserve_their_diagnostic_code() {
+    let (success, output) = run_source_stdout(
+        "try:\n\
+             flow total from list [1, 2]:\n\
+                 parallel 2\n\
+                 derive item / 0\n\
+                 sum\n\
+             end\n\
+         catch failure as E.runtime.numeric.division-by-zero:\n\
+             Sayln failure.code\n\
+         end\n",
+    );
+
+    assert!(success, "{output}");
+    assert_eq!(output, "E.runtime.numeric.division-by-zero\n");
+
+    let (success, diagnostic) = run_source(
+        "flow total from list [1, 2]:\n\
+             parallel 2\n\
+             derive item / 0\n\
+             sum\n\
+         end\n",
+    );
+    assert!(!success, "division by zero should escape the parallel flow");
+    assert!(
+        diagnostic.contains("error[E.runtime.numeric.division-by-zero]"),
+        "{diagnostic}"
+    );
+    assert!(diagnostic.contains(":1:1"), "{diagnostic}");
+}
+
+#[test]
 fn invalid_flow_checkpoint_is_reported() {
     let root = std::env::temp_dir().join(format!(
         "simply-invalid-checkpoint-{}-{}",
@@ -541,6 +573,45 @@ fn invalid_flow_checkpoint_is_reported() {
     let _ = fs::remove_dir_all(root);
     assert!(!success);
     assert!(output.contains("invalid recovery state"), "{output}");
+    assert!(
+        output.contains("error[E.runtime.operation.failed]"),
+        "{output}"
+    );
+}
+
+#[test]
+fn checkpoint_filesystem_errors_use_the_io_diagnostic() {
+    let root = std::env::temp_dir().join(format!(
+        "simply-checkpoint-io-error-{}-{}",
+        std::process::id(),
+        TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&root).expect("failed to create checkpoint I/O test directory");
+    let input = root.join("input.csv");
+    let output = root.join("output.csv");
+    fs::write(&input, "1\n").expect("failed to write checkpoint I/O input");
+    let source = format!(
+        "flow result from csv_rows(\"{}\"):\n\
+             checkpoint \"{}\"\n\
+             derive item\n\
+             write_csv(\"{}\")\n\
+         end\n",
+        input.display(),
+        root.display(),
+        output.display()
+    );
+
+    let (success, error) = run_source(&source);
+    fs::remove_dir_all(root).expect("failed to clean up checkpoint I/O test directory");
+
+    assert!(
+        !success,
+        "a directory must not be accepted as a checkpoint file"
+    );
+    assert!(
+        error.contains("error[E.runtime.io.operation-failed]"),
+        "{error}"
+    );
 }
 
 #[test]
