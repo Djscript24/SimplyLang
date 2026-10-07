@@ -180,6 +180,9 @@ impl<T> std::fmt::Debug for ArenaRef<T> {
 
 impl<T: PartialEq> PartialEq for ArenaRef<T> {
     fn eq(&self, other: &Self) -> bool {
+        if self.same_instance(other) {
+            return true;
+        }
         if !self.arena.ptr_eq(&other.arena) {
             return false;
         }
@@ -189,6 +192,16 @@ impl<T: PartialEq> PartialEq for ArenaRef<T> {
 }
 
 impl<T> ArenaRef<T> {
+    pub(crate) fn identity_key(&self) -> Option<(u64, usize, u32)> {
+        self.with(|_| {
+            (
+                self.handle.arena_id,
+                self.handle.index,
+                self.handle.generation,
+            )
+        })
+    }
+
     pub(crate) fn same_instance(&self, other: &Self) -> bool {
         self.handle == other.handle && self.with(|_| ()).is_some() && other.with(|_| ()).is_some()
     }
@@ -218,5 +231,68 @@ impl<T> ArenaRef<T> {
         self.arena
             .with_mut(|arena| arena.get_mut(self.handle).map(update))
             .flatten()
+    }
+}
+
+impl<T: Clone> ArenaRef<Vec<T>> {
+    pub(crate) fn len(&self) -> usize {
+        self.with(Vec::len).unwrap_or(0)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.with(Vec::is_empty).unwrap_or(true)
+    }
+
+    pub(crate) fn get(&self, index: usize) -> Option<T> {
+        self.with(|values| values.get(index).cloned()).flatten()
+    }
+
+    pub(crate) fn first(&self) -> Option<T> {
+        self.get(0)
+    }
+
+    pub(crate) fn iter(&self) -> std::vec::IntoIter<T> {
+        self.get_cloned().unwrap_or_default().into_iter()
+    }
+}
+
+impl<K: Clone + Ord, V: Clone> ArenaRef<std::collections::BTreeMap<K, V>> {
+    pub(crate) fn len(&self) -> usize {
+        self.with(std::collections::BTreeMap::len).unwrap_or(0)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.with(std::collections::BTreeMap::is_empty)
+            .unwrap_or(true)
+    }
+
+    pub(crate) fn get(&self, key: &K) -> Option<V> {
+        self.with(|values| values.get(key).cloned()).flatten()
+    }
+
+    pub(crate) fn contains_key(&self, key: &K) -> bool {
+        self.with(|values| values.contains_key(key))
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn iter(&self) -> std::vec::IntoIter<(K, V)> {
+        self.with(|values| {
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<Vec<_>>()
+                .into_iter()
+        })
+        .unwrap_or_default()
+    }
+
+    pub(crate) fn keys(&self) -> std::vec::IntoIter<K> {
+        self.with(|values| values.keys().cloned().collect::<Vec<_>>().into_iter())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn values(&self) -> std::vec::IntoIter<V> {
+        self.with(|values| values.values().cloned().collect::<Vec<_>>().into_iter())
+            .unwrap_or_default()
     }
 }

@@ -1,6 +1,158 @@
 use super::*;
 
 impl SemanticAnalyzer {
+    pub(super) fn expression_contains_borrowed_collection(
+        &self,
+        expression: &Expr,
+        value_type: &Type,
+        scopes: &[HashSet<String>],
+    ) -> Result<bool, SimplyError> {
+        if !Self::type_may_contain_collection(value_type) {
+            return Ok(false);
+        }
+        match expression {
+            Expr::Identifier(name) => Ok(scopes.iter().any(|scope| scope.contains(name))),
+            Expr::Array(values) | Expr::List(values) => {
+                let element_type = match value_type {
+                    Type::Array(element) | Type::List(element) => element.as_ref(),
+                    _ => return Ok(self.expression_contains_ref_parameter(expression, scopes)),
+                };
+                for value in values {
+                    if self.expression_contains_borrowed_collection(value, element_type, scopes)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            Expr::Tuple(values) => {
+                let Type::Tuple(element_types) = value_type else {
+                    return Ok(self.expression_contains_ref_parameter(expression, scopes));
+                };
+                for (value, element_type) in values.iter().zip(element_types) {
+                    if self.expression_contains_borrowed_collection(value, element_type, scopes)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            Expr::Matrix(rows) => {
+                let element_type = match value_type {
+                    Type::Matrix => Type::Unknown,
+                    Type::TypedMatrix(element, _, _) => element.as_ref().clone(),
+                    _ => return Ok(self.expression_contains_ref_parameter(expression, scopes)),
+                };
+                for row in rows {
+                    let row_type = Type::Array(Box::new(element_type.clone()));
+                    if self.expression_contains_borrowed_collection(row, &row_type, scopes)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            Expr::Hash(entries) => {
+                let element_type = match value_type {
+                    Type::HashValues(element) => element.as_ref().clone(),
+                    Type::Hash => Type::Unknown,
+                    _ => return Ok(self.expression_contains_ref_parameter(expression, scopes)),
+                };
+                for (_, value) in entries {
+                    if self.expression_contains_borrowed_collection(value, &element_type, scopes)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            Expr::Index { target, .. } | Expr::Field { target, .. } => {
+                Ok(self.expression_contains_ref_parameter(target, scopes))
+            }
+            Expr::Call { name, .. }
+                if matches!(
+                    name.as_str(),
+                    "cross"
+                        | "entries"
+                        | "enumerate"
+                        | "identity"
+                        | "keys"
+                        | "least_squares"
+                        | "matvec"
+                        | "matrix_add"
+                        | "matrix_scale"
+                        | "matrix_subtract"
+                        | "multiply"
+                        | "reverse"
+                        | "select_keys"
+                        | "values"
+                        | "vector_add"
+                        | "vector_scale"
+                        | "vector_subtract"
+                        | "without_key"
+                        | "zip"
+                ) && !self
+                    .function_scopes
+                    .iter()
+                    .rev()
+                    .any(|scope| scope.contains_key(name))
+                    && !matches!(self.variables.get(name), Some(Type::Function { .. }))
+                    && !Self::collection_may_contain_nested_collection(value_type) =>
+            {
+                Ok(false)
+            }
+            _ => Ok(self.expression_contains_ref_parameter(expression, scopes)),
+        }
+    }
+
+    fn collection_may_contain_nested_collection(value_type: &Type) -> bool {
+        match value_type {
+            Type::Array(element) | Type::List(element) | Type::Vector(element, _) => {
+                Self::type_may_contain_collection(element)
+            }
+            Type::HashValues(element) => Self::type_may_contain_collection(element),
+            Type::Hash | Type::Struct(_) | Type::Enum(_) | Type::Unknown => true,
+            Type::Tuple(elements) => elements.iter().any(Self::type_may_contain_collection),
+            _ => false,
+        }
+    }
+
+    fn reject_borrow_escape(
+        &self,
+        expression: &Expr,
+        value_type: &Type,
+        destination: &str,
+    ) -> Result<(), SimplyError> {
+        if !self.ref_parameter_scopes.is_empty()
+            && self.expression_contains_borrowed_collection(
+                expression,
+                value_type,
+                &self.ref_parameter_scopes,
+            )?
+        {
+            return Err(self.error(
+                DiagnosticCode::InvalidRefUsage,
+                format!("a `ref` parameter cannot escape through {destination}"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn is_ref_borrowed(&self, name: &str) -> bool {
+        self.ref_parameter_scopes
+            .iter()
+            .any(|scope| scope.contains(name))
+    }
+
+    pub(super) fn type_may_contain_collection(value_type: &Type) -> bool {
+        match value_type {
+            Type::Array(_)
+            | Type::List(_)
+            | Type::Hash
+            | Type::HashValues(_)
+            | Type::Vector(_, _) => true,
+            Type::Tuple(elements) => elements.iter().any(Self::type_may_contain_collection),
+            Type::Struct(_) | Type::Enum(_) | Type::Unknown => true,
+            _ => false,
+        }
+    }
+
     pub(super) fn analyze_statements(&mut self, statements: &[Stmt]) -> Result<(), SimplyError> {
         for (index, statement) in statements.iter().enumerate() {
             let following: HashSet<String> = statements[index + 1..]
@@ -30,7 +182,96 @@ impl SemanticAnalyzer {
             self.ordered_function_references.pop();
             result?;
         }
+
         Ok(())
+    }
+
+    pub(super) fn expression_contains_ref_parameter(
+        &self,
+        expression: &Expr,
+        scopes: &[HashSet<String>],
+    ) -> bool {
+        match expression {
+            Expr::Identifier(name) => scopes.iter().any(|scope| scope.contains(name)),
+            Expr::Array(values)
+            | Expr::List(values)
+            | Expr::Tuple(values)
+            | Expr::Matrix(values) => values
+                .iter()
+                .any(|value| self.expression_contains_ref_parameter(value, scopes)),
+            Expr::Hash(entries) => entries
+                .iter()
+                .any(|(_, value)| self.expression_contains_ref_parameter(value, scopes)),
+            Expr::Unary { operand, .. } | Expr::Ref(operand) => {
+                self.expression_contains_ref_parameter(operand, scopes)
+            }
+            Expr::Binary { left, right, .. } => {
+                self.expression_contains_ref_parameter(left, scopes)
+                    || self.expression_contains_ref_parameter(right, scopes)
+            }
+            Expr::EnumVariant { arguments, .. } => arguments
+                .iter()
+                .any(|argument| self.expression_contains_ref_parameter(argument, scopes)),
+            Expr::Call { name, arguments } => {
+                let user_function = self
+                    .function_scopes
+                    .iter()
+                    .rev()
+                    .any(|scope| scope.contains_key(name))
+                    || matches!(self.variables.get(name), Some(Type::Function { .. }));
+                let returns_independent_collection =
+                    matches!(name.as_str(), "least_squares" | "matvec" | "cross" | "keys");
+                let safe_builtin = !user_function && returns_independent_collection;
+                !safe_builtin
+                    && arguments
+                        .iter()
+                        .any(|argument| self.expression_contains_ref_parameter(argument, scopes))
+            }
+            Expr::MessageDispatch {
+                receiver,
+                arguments,
+                ..
+            } => {
+                self.expression_contains_ref_parameter(receiver, scopes)
+                    || arguments
+                        .iter()
+                        .any(|argument| self.expression_contains_ref_parameter(argument, scopes))
+            }
+            Expr::Index { target, index } => {
+                self.expression_contains_ref_parameter(target, scopes)
+                    || self.expression_contains_ref_parameter(index, scopes)
+            }
+            Expr::Field { target, .. } => self.expression_contains_ref_parameter(target, scopes),
+            Expr::Pipeline { source, steps } => {
+                self.expression_contains_ref_parameter(source, scopes)
+                    || steps.iter().any(|step| match step {
+                        PipelineStep::Where(expression)
+                        | PipelineStep::Derive(expression)
+                        | PipelineStep::TakeWhile(expression)
+                        | PipelineStep::DropWhile(expression)
+                        | PipelineStep::WriteCsv(expression) => {
+                            self.expression_contains_ref_parameter(expression, scopes)
+                        }
+                        PipelineStep::Partition { rules, .. } => rules.iter().any(|rule| {
+                            rule.condition.as_ref().is_some_and(|condition| {
+                                self.expression_contains_ref_parameter(condition, scopes)
+                            })
+                        }),
+                        _ => false,
+                    })
+            }
+            Expr::Match { value, arms } => {
+                self.expression_contains_ref_parameter(value, scopes)
+                    || arms.iter().any(|arm| {
+                        arm.guard.as_ref().is_some_and(|guard| {
+                            self.expression_contains_ref_parameter(guard, scopes)
+                        }) || arm.result.as_ref().is_some_and(|result| {
+                            self.expression_contains_ref_parameter(result, scopes)
+                        })
+                    })
+            }
+            Expr::Literal(_) => false,
+        }
     }
 
     pub(super) fn analyze_statement(&mut self, statement: &Stmt) -> Result<(), SimplyError> {
@@ -116,20 +357,27 @@ impl SemanticAnalyzer {
                 for field in &fields {
                     self.define_variable(field.name.clone(), field.field_type.clone(), true)?;
                 }
-                for (parameter, parameter_type, mutable) in parameters {
+                let ref_names = parameters
+                    .iter()
+                    .filter(|(_, _, _, by_ref)| *by_ref)
+                    .map(|(parameter, _, _, _)| parameter.clone())
+                    .collect();
+                self.ref_parameter_scopes.push(ref_names);
+                for (parameter, parameter_type, mutable, by_ref) in parameters {
                     self.define_variable(
                         parameter.clone(),
                         parameter_type
                             .as_ref()
                             .map(|typ| self.resolve_type_identity(typ))
                             .unwrap_or(Type::Unknown),
-                        *mutable,
+                        *mutable && !*by_ref,
                     )?;
                 }
                 let body_result = self
                     .collect_functions(body)
                     .and_then(|()| self.analyze_statements(body));
                 let inferred_return = self.inferred_return.clone();
+                self.ref_parameter_scopes.pop();
                 self.variables.truncate(frame_start);
                 self.function_scopes.pop();
                 self.function_depth = saved_function_depth;
@@ -160,6 +408,7 @@ impl SemanticAnalyzer {
                             actual.clone()
                         }
                     });
+                self.reject_borrow_escape(value, &expected, "a variable binding")?;
                 if matches!(expected, Type::Matrix | Type::TypedMatrix(_, _, _)) {
                     self.require_rectangular_matrix_literal(value)?;
                 }
@@ -175,9 +424,16 @@ impl SemanticAnalyzer {
                     source: Box::new(source.clone()),
                     steps: steps.clone(),
                 })?;
+                self.reject_borrow_escape(source, &actual, "a flow binding")?;
                 self.define_variable(name.clone(), actual, false)?;
             }
             Stmt::Reassign { name, value } => {
+                if self.is_ref_borrowed(name) {
+                    return Err(self.error(
+                        DiagnosticCode::InvalidRefUsage,
+                        format!("`ref` value `{name}` is read-only and cannot be reassigned"),
+                    ));
+                }
                 if self.is_snapshot_capture(name) || !self.variables.is_mutable(name) {
                     return Err(self.error(
                         DiagnosticCode::InvalidReassignment,
@@ -193,14 +449,26 @@ impl SemanticAnalyzer {
                     )
                 })?;
                 let actual = self.analyze_expression(value)?;
+                self.reject_borrow_escape(value, &expected, "a variable assignment")?;
                 self.require_type(&expected, &actual)?;
             }
             Stmt::DestructureReassign { pattern, value } => {
                 let actual = self.analyze_expression(value)?;
+                self.reject_borrow_escape(value, &actual, "a destructuring assignment")?;
                 let mut targets = Vec::new();
                 self.validate_destructure_assignment_pattern(pattern, &actual, &mut targets)?;
             }
-            Stmt::SetIndex { name, index, value } => {
+            Stmt::SetIndex {
+                name,
+                indices,
+                value,
+            } => {
+                if self.is_ref_borrowed(name) {
+                    return Err(self.error(
+                        DiagnosticCode::InvalidRefUsage,
+                        format!("`ref` value `{name}` is read-only and cannot be mutated"),
+                    ));
+                }
                 if self.is_snapshot_capture(name) || !self.variables.is_mutable(name) {
                     return Err(self.error(
                         DiagnosticCode::SemanticCollectionOperation,
@@ -213,25 +481,34 @@ impl SemanticAnalyzer {
                         format!("unknown variable `{name}`"),
                     )
                 })?;
-                let index_type = self.analyze_expression(index)?;
-                let value_type = self.analyze_expression(value)?;
-                match target {
-                    Type::Array(element) | Type::List(element) | Type::Vector(element, _) => {
-                        self.require_type(&Type::Int, &index_type)?;
-                        self.require_type(&element, &value_type)?;
-                    }
-                    Type::Hash => self.require_type(&Type::String, &index_type)?,
-                    Type::HashValues(element) => {
-                        self.require_type(&Type::String, &index_type)?;
-                        self.require_type(&element, &value_type)?;
-                    }
-                    _ => {
-                        return Err(self.error(
-                            DiagnosticCode::SemanticCollectionOperation,
-                            format!("`{name}` is not mutable"),
-                        ));
-                    }
+                let mut current_type = target;
+                for index in indices {
+                    let index_type = self.analyze_expression(index)?;
+                    current_type = match current_type {
+                        Type::Array(element) | Type::List(element) | Type::Vector(element, _) => {
+                            self.require_type(&Type::Int, &index_type)?;
+                            *element
+                        }
+                        Type::Hash => {
+                            self.require_type(&Type::String, &index_type)?;
+                            Type::Unknown
+                        }
+                        Type::HashValues(element) => {
+                            self.require_type(&Type::String, &index_type)?;
+                            *element
+                        }
+                        Type::Unknown => Type::Unknown,
+                        _ => {
+                            return Err(self.error(
+                                DiagnosticCode::SemanticCollectionOperation,
+                                format!("`{name}` is not mutable"),
+                            ));
+                        }
+                    };
                 }
+                let value_type = self.analyze_expression(value)?;
+                self.reject_borrow_escape(value, &value_type, "a collection mutation")?;
+                self.require_type(&current_type, &value_type)?;
             }
             Stmt::Destructure {
                 pattern,
@@ -239,6 +516,7 @@ impl SemanticAnalyzer {
                 value,
             } => {
                 let value_type = self.analyze_expression(value)?;
+                self.reject_borrow_escape(value, &value_type, "a destructuring binding")?;
                 let mut bindings = Vec::new();
                 self.validate_destructure_pattern(pattern, &value_type, &mut bindings)?;
 
@@ -266,9 +544,15 @@ impl SemanticAnalyzer {
             }
             Stmt::CollectionOp {
                 name,
-                operation: _,
+                operation,
                 value,
             } => {
+                if self.is_ref_borrowed(name) {
+                    return Err(self.error(
+                        DiagnosticCode::InvalidRefUsage,
+                        format!("`ref` value `{name}` is read-only and cannot be mutated"),
+                    ));
+                }
                 if self.is_snapshot_capture(name) || !self.variables.is_mutable(name) {
                     return Err(self.error(
                         DiagnosticCode::SemanticCollectionOperation,
@@ -282,6 +566,9 @@ impl SemanticAnalyzer {
                     )
                 })?;
                 let value_type = self.analyze_expression(value)?;
+                if *operation == CollectionOperation::Add {
+                    self.reject_borrow_escape(value, &value_type, "a collection mutation")?;
+                }
                 match target {
                     Type::List(element) if *element == Type::Unknown => {
                         self.variables
@@ -332,14 +619,20 @@ impl SemanticAnalyzer {
                     HashSet::new()
                 };
                 self.blocked_function_references.push(blocked);
-                for (parameter, parameter_type, mutable) in parameters {
+                let ref_names = parameters
+                    .iter()
+                    .filter(|(_, _, _, by_ref)| *by_ref)
+                    .map(|(parameter, _, _, _)| parameter.clone())
+                    .collect();
+                self.ref_parameter_scopes.push(ref_names);
+                for (parameter, parameter_type, mutable, by_ref) in parameters {
                     self.define_variable(
                         parameter.clone(),
                         parameter_type
                             .as_ref()
                             .map(|typ| self.resolve_type_identity(typ))
                             .unwrap_or(Type::Unknown),
-                        *mutable,
+                        *mutable && !*by_ref,
                     )?;
                 }
                 let body_result = self
@@ -382,6 +675,7 @@ impl SemanticAnalyzer {
                 self.function_return = saved_return;
                 if return_type.is_none() {
                     let inferred_return = self.inferred_return.clone();
+                    self.ref_parameter_scopes.pop();
                     if let Some(signature) = self
                         .function_scopes
                         .iter_mut()
@@ -407,6 +701,11 @@ impl SemanticAnalyzer {
             }
             Stmt::Return(expression) => {
                 let actual = self.analyze_expression(expression)?;
+                let escape_type = self
+                    .function_return
+                    .clone()
+                    .unwrap_or_else(|| actual.clone());
+                self.reject_borrow_escape(expression, &escape_type, "a return value")?;
                 if self.function_depth == 0 && !self.module_return_allowed {
                     return Err(self.error(
                         DiagnosticCode::InvalidReturn,
@@ -542,18 +841,32 @@ impl SemanticAnalyzer {
                 let span = self.current_span.clone().unwrap_or_else(|| Span::new(0, 0));
                 self.variables
                     .insert_at(name.clone(), element, *mutable, span)?;
+                let borrowed_element = Self::type_may_contain_collection(
+                    self.variables.get(name).unwrap_or(&Type::Unknown),
+                ) && !self.ref_parameter_scopes.is_empty()
+                    && self.expression_contains_ref_parameter(iterable, &self.ref_parameter_scopes);
+                if borrowed_element {
+                    self.ref_parameter_scopes
+                        .push(HashSet::from([name.clone()]));
+                }
                 self.loop_depth += 1;
                 let body_result = self
                     .collect_functions(body)
                     .and_then(|()| self.analyze_statements(body));
                 if let Err(error) = body_result {
                     self.loop_depth -= 1;
+                    if borrowed_element {
+                        self.ref_parameter_scopes.pop();
+                    }
                     self.variables.truncate(frame_start);
                     self.function_scopes.pop();
                     self.saw_return = saved_saw_return;
                     return Err(error);
                 }
                 self.loop_depth -= 1;
+                if borrowed_element {
+                    self.ref_parameter_scopes.pop();
+                }
                 self.variables.truncate(frame_start);
                 self.function_scopes.pop();
                 self.saw_return = saved_saw_return;

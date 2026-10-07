@@ -392,7 +392,7 @@ fn formats_all_examples_idempotently() {
         "examples/05-functions/functions.si",
         "examples/05-functions/closures.si",
         "examples/06-collections/arrays-lists.si",
-        "examples/06-collections/hash-tree.si",
+        "examples/06-collections/hashes.si",
         "examples/06-collections/matrices.si",
         "examples/06-collections/tuples.si",
         "examples/07-pipelines/collections.si",

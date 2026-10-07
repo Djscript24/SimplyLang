@@ -200,6 +200,13 @@ define_diagnostic_registry! {
         "The value here is not the kind of value this code requires.",
         "Make the value's type match the required type. Text-to-number conversion only works when the text contains a valid number."
     );
+    InvalidRefUsage => (
+        "E.semantic.ref.invalid",
+        "E0020",
+        Semantic,
+        "A `ref` value is used outside its allowed read-only function-call lifetime.",
+        "Use `ref` only on a function parameter or function-call argument, and do not let the borrowed value escape or mutate it."
+    );
     InvalidReassignment => (
         "E.semantic.binding.reassignment",
         "E0105",
@@ -373,7 +380,7 @@ define_diagnostic_registry! {
         "E0014",
         Semantic,
         "This value cannot be accessed with an index.",
-        "Use an array, list, tuple, hash, tree, or matrix with a valid index."
+        "Use an array, list, tuple, hash, or matrix with a valid index."
     );
     SemanticTupleIndex => (
         "E.semantic.index.tuple.invalid",

@@ -1,6 +1,13 @@
 use super::*;
 
 impl SemanticAnalyzer {
+    pub(super) fn is_mutable_collection_type(typ: &Type) -> bool {
+        matches!(
+            typ,
+            Type::Array(_) | Type::List(_) | Type::Hash | Type::HashValues(_) | Type::Vector(_, _)
+        )
+    }
+
     pub(super) fn collect_structs_and_messages(
         &mut self,
         statements: &[Stmt],
@@ -145,7 +152,7 @@ impl SemanticAnalyzer {
                         ));
                     }
                     let fields = &self.structs[receiver_type];
-                    for (parameter, parameter_type, _) in parameters {
+                    for (parameter, parameter_type, _, by_ref) in parameters {
                         if fields.iter().any(|field| &field.name == parameter) {
                             return Err(self.error(
                                 DiagnosticCode::DuplicateDeclaration,
@@ -157,17 +164,52 @@ impl SemanticAnalyzer {
                         if let Some(parameter_type) = parameter_type {
                             self.validate_declared_type(parameter_type)?;
                         }
+                        if *by_ref
+                            && !parameter_type.as_ref().is_some_and(|typ| {
+                                matches!(
+                                    typ,
+                                    Type::Array(_)
+                                        | Type::List(_)
+                                        | Type::Hash
+                                        | Type::HashValues(_)
+                                        | Type::Vector(_, _)
+                                )
+                            })
+                        {
+                            return Err(self.error(
+                                DiagnosticCode::InvalidRefUsage,
+                                format!(
+                                    "`ref` parameter `{parameter}` must be an Array, List, or Hash"
+                                ),
+                            ));
+                        }
+                        if !*by_ref
+                            && parameter_type
+                                .as_ref()
+                                .is_some_and(Self::is_mutable_collection_type)
+                        {
+                            return Err(self.error(
+                                DiagnosticCode::InvalidRefUsage,
+                                format!(
+                                    "collection parameter `{parameter}` must be declared `ref`"
+                                ),
+                            ));
+                        }
                     }
                     self.messages.insert(
                         key,
                         MessageSignature {
                             parameters: parameters
                                 .iter()
-                                .map(|(_, parameter_type, _)| {
+                                .map(|(_, parameter_type, _, _)| {
                                     parameter_type
                                         .as_ref()
                                         .map(|typ| self.resolve_type_identity(typ))
                                 })
+                                .collect(),
+                            ref_parameters: parameters
+                                .iter()
+                                .map(|(_, _, _, by_ref)| *by_ref)
                                 .collect(),
                             return_type: None,
                         },
@@ -446,18 +488,65 @@ impl SemanticAnalyzer {
                 name,
                 parameters,
                 return_type,
-                body: _,
+                body,
             } = statement
             {
+                let borrowed_capture = if self
+                    .ref_parameter_scopes
+                    .iter()
+                    .any(|scope| !scope.is_empty())
+                {
+                    let captured_dependencies = closure_dependencies(body, parameters);
+                    self.ref_parameter_scopes
+                        .iter()
+                        .flat_map(|scope| scope.iter())
+                        .filter(|name| captured_dependencies.contains(name.as_str()))
+                        .min()
+                } else {
+                    None
+                };
+                if let Some(captured_name) = borrowed_capture {
+                    return Err(self.error(
+                        DiagnosticCode::InvalidRefUsage,
+                        format!("a closure cannot capture `ref` parameter `{captured_name}`"),
+                    ));
+                }
                 if self.structs.contains_key(name) || self.enums.contains_key(name) {
                     return Err(self.error(
                         DiagnosticCode::DuplicateDeclaration,
                         format!("function `{name}` conflicts with a struct type"),
                     ));
                 }
-                for (_, parameter_type, _) in parameters {
+                for (_, parameter_type, _, by_ref) in parameters {
                     if let Some(parameter_type) = parameter_type {
                         self.validate_declared_type(parameter_type)?;
+                    }
+                    if *by_ref
+                        && !parameter_type.as_ref().is_some_and(|typ| {
+                            matches!(
+                                typ,
+                                Type::Array(_)
+                                    | Type::List(_)
+                                    | Type::Hash
+                                    | Type::HashValues(_)
+                                    | Type::Vector(_, _)
+                            )
+                        })
+                    {
+                        return Err(self.error(
+                            DiagnosticCode::InvalidRefUsage,
+                            "a `ref` parameter must be an Array, List, or Hash",
+                        ));
+                    }
+                    if !*by_ref
+                        && parameter_type
+                            .as_ref()
+                            .is_some_and(Self::is_mutable_collection_type)
+                    {
+                        return Err(self.error(
+                            DiagnosticCode::InvalidRefUsage,
+                            "collection parameters must be declared `ref`",
+                        ));
                     }
                 }
                 if let Some(return_type) = return_type {
@@ -475,7 +564,7 @@ impl SemanticAnalyzer {
                 }
                 let resolved_parameters: Vec<Option<Type>> = parameters
                     .iter()
-                    .map(|(_, parameter_type, _)| {
+                    .map(|(_, parameter_type, _, _)| {
                         parameter_type
                             .as_ref()
                             .map(|typ| self.resolve_type_identity(typ))
@@ -491,6 +580,10 @@ impl SemanticAnalyzer {
                         name.clone(),
                         FunctionSignature {
                             parameters: resolved_parameters.clone(),
+                            ref_parameters: parameters
+                                .iter()
+                                .map(|(_, _, _, by_ref)| *by_ref)
+                                .collect(),
                             return_type: resolved_return_type.clone(),
                         },
                     );

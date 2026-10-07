@@ -16,7 +16,7 @@ runtime behavior, useful diagnostics, and a compact command-line workflow.
 - Immutable bindings by default; use `mut` for reassignment or mutation.
 - Functions with typed parameters and optional return types.
 - Nested functions and escaping closures with lexical binding resolution.
-- Arrays, lists, tuples, hashes, trees, and matrices.
+- Arrays, lists, tuples, hashes, and matrices.
 - Tuple and sequence destructuring declarations with nested targets, wildcards,
   and lazy rest suffixes.
 - Structural match patterns for enums, positional and named-field structs,
@@ -30,9 +30,9 @@ runtime behavior, useful diagnostics, and a compact command-line workflow.
 - Relative imports with isolated evaluation and explicit named exports.
 - Structured lexer, parser, semantic, and runtime diagnostics.
 - Formatter, REPL, native Simply tests, and runtime benchmarks.
-- Deterministic hash/tree iteration and copy-on-write collection storage.
-- String indexing, slicing, character inspection, and text file I/O provide
-  foundations for future self-hosted compiler development.
+- Deterministic Hash iteration and alias-visible mutable collection storage.
+- String indexing, slicing, character inspection, JSON conversion, and text
+  file I/O provide foundations for future self-hosted compiler development.
 - Scalar mathematics, vector and matrix operations, and population statistics
   provide a numerical foundation for future scientific and ML-oriented work.
 
@@ -143,7 +143,7 @@ numbers is list [1, 2] # List[Int]
 Supported type forms include:
 
 ```text
-String  Int  Float  Bool  Hash  Tree  Matrix
+String  Int  Float  Bool  Hash  Matrix
 Array[T]  List[T]  Tuple[T1, T2, ...]
 ```
 
@@ -202,9 +202,9 @@ grid is matrix [[1, 2], [3, 4]]
 
 Arrays are fixed-length ordered values; both arrays and lists support indexed
 access and writes through mutable bindings, while only lists support `add` and
-`remove`. Tuples are fixed-length and heterogeneous. Hashes and trees use
-string keys and sorted, deterministic iteration; hashes are mutable and trees
-are read-only. Matrices use two-dimensional row/column indexing and require
+`remove`. Tuples are fixed-length and heterogeneous. Hashes use string keys
+and sorted, deterministic iteration; indexed writes require a mutable binding.
+Matrices use two-dimensional row/column indexing and require
 rectangular numeric rows for matrix operations. Ranges are lazy half-open
 integer sequences. Matrix multiplication returns floating-point cells.
 
@@ -445,38 +445,44 @@ signatures.
 | --- | --- |
 | `assert(condition[, message])` | Check a condition and fail with an optional diagnostic message. |
 | `range(start, end[, step])` | Create a lazy integer sequence with an optional non-zero step. |
-| `length(value)` | Get collection or string size; `count(value)` is a compatibility alias. |
+| `length(value)` | Get collection or string size. Pipeline `count` counts surviving items. |
 | `enumerate(sequence)` | Return zero-based `(index, value)` pairs for sequences and strings. |
 | `zip(left, right)` | Pair sequence values into tuples, stopping at the shorter input. |
 | `contains(collection, value)` | Test collection membership or a string substring. |
-| `has_key(map, key)` | Test whether a Hash or Tree contains a string key. |
+| `has_key(map, key)` | Test whether a Hash contains a string key. |
 | `get(map, key, default)` | Get a map value or lazily evaluate a fallback. |
-| `without_key(map, key)` | Return a Hash or Tree copy with the named key removed. |
+| `without_key(map, key)` | Return a Hash copy with the named key removed. |
 | `select_keys(map, keys)` | Copy a map with only the requested string keys. |
 | `keys(map)` / `values(map)` / `entries(map)` | Return map keys, values, or `(key, value)` tuples in deterministic key order. |
 | `any(collection)` / `all(collection)` | Reduce Boolean collections; pipeline terminals also work on transformed lazy sources. |
 | `join(collection, separator)` | Join string values. |
-| `total(collection)` | Sum numeric arrays, lists, tuples, or ranges. |
-| `sum` pipeline terminal | Sum transformed pipeline values, including CSV streams. |
-| `count` pipeline terminal | Count items reaching the end of a transformed pipeline. |
-| `trim`, `split`, `replace` | Transform strings. |
+| `total(collection)` | Sum an existing numeric array, list, tuple, or range. |
+| `sum` pipeline terminal | Sum transformed values, including CSV streams. |
+| `count` pipeline terminal | Count items surviving all preceding pipeline steps. |
+| `trim`, `split`, `replace` | Transform strings; `replace` matches literal text. |
+| `regex_replace(text, pattern, replacement)` | Replace matches using regex syntax. |
+| `regex_find_all(text, pattern)` | Extract all matching text as an array of strings. |
+| `score_rules(rules)` | Sum weighted Bool conditions and return score plus matched/unmatched labels. |
 | `starts_with`, `ends_with` | Test string prefixes and suffixes. |
 | `characters(text)` | Materialize a string as an array of scalar strings. |
 | `substring(text, start, length)` | Slice a string by Unicode scalar positions. |
 | `to_float(value)`, `to_int(value)` | Convert numeric values or parse numeric strings. |
 | `is_ascii_alpha`, `is_ascii_digit`, `is_whitespace` | Inspect one character. |
 | `read_file(path)`, `write_file(path, content)` | Read and write UTF-8 text files. |
+| `parse_json(text)`, `to_json(value)`, `to_json_pretty(value)` | Parse JSON or serialize supported values compactly or with indentation. |
+| `read_json(path)`, `write_json(path, value)`, `write_json_pretty(path, value)` | Read and atomically write compact or indented JSON files. |
+| `read_json_lines(path)`, `write_json_lines(path, sequence)`, `append_json_line(path, value)` | Read, write, and append JSON Lines (NDJSON) records. |
 | `csv_rows(path)`, `csv_row(...)` | Read lazy CSV rows or construct a mixed-type output row. |
 | `Ask(prompt[, type])` | Read a line as String or parse it as Int, Float, String, or Bool. |
 | `sqrt`, `pow`, `exp`, `log`, `log10`, `sin`, `cos`, `tan` | Scalar mathematical functions. |
 | `floor`, `ceil`, `sign`, `abs`, `round`, `clamp` | Numeric rounding, sign, and bounds operations. |
 | `vector_add`, `vector_subtract`, `vector_scale`, `dot`, `norm`, `distance`, `normalize` | Numeric vector operations. |
 | `shape`, `transpose`, `matrix_add`, `matrix_subtract`, `matrix_scale`, `multiply`, `identity` | Rectangular numeric matrix operations. |
-| `mean`, `median`, `variance`, `stddev`, `percentile` | Descriptive statistics; variance uses the population convention. |
+| `mean`, `median`, `variance`, `stddev`, `percentile` | Statistics over existing collections; variance uses the population convention. |
 | `covariance`, `correlation` | Pairwise population statistics for equal-length sequences. |
 | `is_empty(value)` | Test collections and strings. |
 | `reverse(sequence)` | Reverse arrays, lists, tuples, or ranges (range results are arrays). |
-| `type_of(value)` / `print(value)` | Inspect values or print them. |
+| `type_of(value)` | Inspect a value's runtime type. Use `Say` or `Sayln` for output. |
 | `receiver :: message(arguments)` | Dispatch a message; struct receivers use type-specific behavior. |
 
 Numerical collection functions use existing Simply arrays, lists, and tuples;
@@ -546,8 +552,9 @@ The implementation follows a conventional interpreter pipeline:
 4. The evaluator executes the program.
 5. Runtime modules implement values, operations, collections, and scopes.
 
-Collections use reference-counted copy-on-write storage. Sharing a collection
-is cheap; a mutation detaches storage when another value still shares it.
+Array, List, and Hash assignments alias shared mutable contents. A mutation
+through a `mut` binding is visible through every alias. Collection nodes live
+in evaluator-owned generational arenas until that evaluator ends.
 Function bodies and imported programs use shared storage where appropriate.
 
 ## Repository Layout
@@ -593,7 +600,7 @@ developer documentation, and `examples/` groups sample programs by topic.
   numeric/matrix rules.
 - [Grammar](docs/grammar.md) — implementation-oriented syntax summary.
 - [Semantics](docs/semantics.md) — scopes, mutability, imports, and evaluation.
-- [Memory model](docs/memory-model.md) — sharing, copy-on-write, closure
+- [Memory model](docs/memory-model.md) — sharing, collection aliases, closure
   capture, equality, and value lifetimes.
 - [Errors and diagnostics](docs/errors.md) — error categories and stable codes.
 - [Performance](docs/performance.md) — optimizations and benchmark workloads.

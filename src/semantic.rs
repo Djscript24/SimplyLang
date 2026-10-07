@@ -9,10 +9,11 @@ use std::{
 
 use crate::{
     ast::{
-        BinaryOperator, Expr, Literal, MatchPattern, PipelineStep, Program, Stmt, StructField,
-        UnaryOperator, is_parallel_safe_expression,
+        BinaryOperator, CollectionOperation, Expr, Literal, MatchPattern, PipelineStep, Program,
+        Stmt, StructField, UnaryOperator, is_parallel_safe_expression,
     },
     error::{DiagnosticCode, SimplyError, Span},
+    evaluator::closure_dependencies,
     runtime::limits,
     types::{DeclarationIdentity, DeclarationKind, Type},
 };
@@ -20,12 +21,14 @@ use crate::{
 #[derive(Clone)]
 struct FunctionSignature {
     parameters: Vec<Option<Type>>,
+    ref_parameters: Vec<bool>,
     return_type: Option<Type>,
 }
 
 #[derive(Clone)]
 struct MessageSignature {
     parameters: Vec<Option<Type>>,
+    ref_parameters: Vec<bool>,
     return_type: Option<Type>,
 }
 
@@ -76,6 +79,7 @@ pub struct SemanticAnalyzer {
     loop_depth: usize,
     function_depth: usize,
     function_capture_frames: Vec<(usize, bool)>,
+    ref_parameter_scopes: Vec<HashSet<String>>,
     function_return: Option<Type>,
     inferred_return: Option<Type>,
     saw_return: bool,
@@ -337,9 +341,6 @@ impl SemanticAnalyzer {
             ),
             Type::HashValues(element) => {
                 Type::HashValues(Box::new(self.resolve_type_identity(element)))
-            }
-            Type::TreeValues(element) => {
-                Type::TreeValues(Box::new(self.resolve_type_identity(element)))
             }
             Type::Function {
                 parameters,

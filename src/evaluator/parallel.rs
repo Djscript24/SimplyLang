@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
     ast::{BinaryOperator, Expr, Literal, PipelineStep},
     error::{DiagnosticCode, SimplyError},
-    runtime::{limits, operations, value::Value},
+    runtime::{heap::RuntimeHeap, limits, operations, value::Value},
 };
 
 #[derive(Debug)]
@@ -70,7 +70,8 @@ fn evaluate_expression(expression: &Expr, item: &ParallelValue) -> ParallelResul
         Expr::Identifier(name) if name == "item" => item.as_value(),
         Expr::Unary { operator, operand } => {
             let operand = evaluate_expression(operand, item)?.into_value();
-            operations::unary(operand, operator, None).map_err(operation_error)?
+            operations::unary(&RuntimeHeap::default(), operand, operator, None)
+                .map_err(operation_error)?
         }
         Expr::Binary {
             left,
@@ -86,7 +87,8 @@ fn evaluate_expression(expression: &Expr, item: &ParallelValue) -> ParallelResul
                 return Ok(ParallelValue::Bool(value));
             }
             let right = evaluate_expression(right, item)?.into_value();
-            operations::binary(left, operator, right, None).map_err(operation_error)?
+            operations::binary(&RuntimeHeap::default(), left, operator, right, None)
+                .map_err(operation_error)?
         }
         _ => {
             return Err(runtime_error(

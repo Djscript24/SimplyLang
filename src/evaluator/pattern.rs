@@ -7,7 +7,7 @@ use std::{
 use crate::{
     ast::{Literal, MatchPattern},
     error::{DiagnosticCode, SimplyError},
-    runtime::value::{CsvStreamVersion, Value, shared_values},
+    runtime::value::{CsvStreamVersion, Value},
 };
 
 use super::{Evaluator, csv};
@@ -74,7 +74,7 @@ impl Evaluator {
                 }
                 let mut bindings = Vec::new();
                 for (pattern, value) in patterns.iter().zip(values.iter()) {
-                    let Some(nested) = self.match_value_pattern(pattern, value)? else {
+                    let Some(nested) = self.match_value_pattern(pattern, &value)? else {
                         return Ok(None);
                     };
                     bindings.extend(nested);
@@ -84,17 +84,7 @@ impl Evaluator {
             MatchPattern::Sequence { patterns, rest } => {
                 let (values, rest_value) = match value {
                     Value::Array(values) => {
-                        if values.len() < patterns.len()
-                            || (rest.is_none() && values.len() != patterns.len())
-                        {
-                            return Ok(None);
-                        }
-                        let tail = rest.as_ref().map(|_| {
-                            Value::Array(shared_values(values[patterns.len()..].to_vec()))
-                        });
-                        (values[..patterns.len()].to_vec(), tail)
-                    }
-                    Value::List(values) => {
+                        let values = values.get_cloned().unwrap_or_default();
                         if values.len() < patterns.len()
                             || (rest.is_none() && values.len() != patterns.len())
                         {
@@ -102,7 +92,19 @@ impl Evaluator {
                         }
                         let tail = rest
                             .as_ref()
-                            .map(|_| Value::List(shared_values(values[patterns.len()..].to_vec())));
+                            .map(|_| self.make_array(values[patterns.len()..].to_vec()));
+                        (values[..patterns.len()].to_vec(), tail)
+                    }
+                    Value::List(values) => {
+                        let values = values.get_cloned().unwrap_or_default();
+                        if values.len() < patterns.len()
+                            || (rest.is_none() && values.len() != patterns.len())
+                        {
+                            return Ok(None);
+                        }
+                        let tail = rest
+                            .as_ref()
+                            .map(|_| self.make_list(values[patterns.len()..].to_vec()));
                         (values[..patterns.len()].to_vec(), tail)
                     }
                     Value::Range { start, end, step } => {
@@ -175,7 +177,7 @@ impl Evaluator {
                 };
                 let mut bindings = Vec::new();
                 for (pattern, value) in patterns.iter().zip(values.iter()) {
-                    let Some(nested) = self.match_value_pattern(pattern, value)? else {
+                    let Some(nested) = self.match_value_pattern(pattern, &value)? else {
                         return Ok(None);
                     };
                     bindings.extend(nested);
@@ -194,7 +196,7 @@ impl Evaluator {
                     let Some(value) = values.get(key) else {
                         return Ok(None);
                     };
-                    let Some(nested) = self.match_value_pattern(pattern, value)? else {
+                    let Some(nested) = self.match_value_pattern(pattern, &value)? else {
                         return Ok(None);
                     };
                     bindings.extend(nested);
@@ -317,7 +319,7 @@ impl Evaluator {
             let row = csv::parse_record(line).map_err(|message| {
                 self.runtime_error(format!("invalid CSV row in `{path}`: {message}"))
             })?;
-            rows.push(Value::List(shared_values(row)));
+            rows.push(self.make_list(row));
         }
         let tail = if has_rest {
             let suffix_record = start_record.checked_add(expected_length).ok_or_else(|| {

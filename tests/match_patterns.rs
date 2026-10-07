@@ -352,15 +352,15 @@ fn rest_sequence_patterns_bind_typed_suffixes_and_match_minimum_lengths() {
         assert_eq!(output, expected, "{value}");
     }
 
-    let list_source = "fn expect_list(values as List[Int]) gives Int:\n\
-                           return count(values)\n\
+    let list_source = "fn expect_list(ref values as List[Int]) gives Int:\n\
+                           return length(values)\n\
                        end\n\
                        values is list [1, 2, 3]\n\
                        match values:\n\
                            []:\n\
                                Sayln \"empty\"\n\
                            [first, second, ...tail]:\n\
-                               Sayln expect_list(tail)\n\
+                               Sayln expect_list(ref tail)\n\
                                Sayln type_of(tail)\n\
                                Sayln tail\n\
                            _:\n\
@@ -409,13 +409,13 @@ fn rest_sequence_patterns_bind_typed_suffixes_and_match_minimum_lengths() {
     assert!(success, "range rest binding failed: {output}");
     assert_eq!(output, "Range\n[2, 3, 4]\n");
 
-    let typed_array_suffix = "fn expect_array(values as Array[Int]) gives Int:\n\
-                                  return count(values)\n\
+    let typed_array_suffix = "fn expect_array(ref values as Array[Int]) gives Int:\n\
+                                  return length(values)\n\
                               end\n\
                               values is [10, 20]\n\
                               match values:\n\
                                   [first, second, ...tail]:\n\
-                                      Sayln expect_array(tail)\n\
+                                      Sayln expect_array(ref tail)\n\
                                       Sayln type_of(tail)\n\
                                       Sayln tail\n\
                                   _:\n\
@@ -494,11 +494,11 @@ fn rest_sequence_patterns_compose_with_nested_patterns_ranges_or_and_guards() {
     assert!(success, "nested OR with rest failed: {output}");
     assert_eq!(output, "matched\n");
 
-    let nested_rest = "fn expect_int_array(values as Array[Int]) gives Int:\n\
-                           return count(values)\n\
+    let nested_rest = "fn expect_int_array(ref values as Array[Int]) gives Int:\n\
+                           return length(values)\n\
                        end\n\
-                       fn expect_nested_array(values as Array[Array[Int]]) gives Int:\n\
-                           return count(values)\n\
+                       fn expect_nested_array(ref values as Array[Array[Int]]) gives Int:\n\
+                           return length(values)\n\
                        end\n\
                        values is [[1, 2, 3], [4, 5], [6]]\n\
                        match values:\n\
@@ -506,8 +506,8 @@ fn rest_sequence_patterns_compose_with_nested_patterns_ranges_or_and_guards() {
                            [[], ...outer]:\n    Sayln \"empty inner sequence\"\n\
                            [[x, ...inner], ...outer]:\n\
                                Sayln x\n\
-                               Sayln expect_int_array(inner)\n\
-                               Sayln expect_nested_array(outer)\n\
+                               Sayln expect_int_array(ref inner)\n\
+                               Sayln expect_nested_array(ref outer)\n\
                                Sayln inner\n\
                                Sayln outer\n\
                        end\n";
@@ -587,7 +587,7 @@ fn rest_sequence_usefulness_and_exhaustiveness_respect_lengths_and_prefixes() {
     let guarded_tail = "values is [1, 2]\n\
                         match values:\n\
                             []:\n    Sayln \"empty\"\n\
-                            [head, ...tail] if count(tail) > 0:\n    Sayln head\n\
+                            [head, ...tail] if length(tail) > 0:\n    Sayln head\n\
                             [head, ...tail]:\n    Sayln type_of(tail)\n\
                         end\n";
     let (valid, _, error) = check_source(guarded_tail);
@@ -2659,9 +2659,9 @@ fn pattern_type_checking_rejects_provably_incompatible_shapes_recursively() {
             "literal pattern of type String cannot match value of type Int",
         ),
         (
-            "record is tree:\n    age is 18\nend\n\
+            "record is list [18]\n\
              match record:\n    {age: age}:\n        age\n    _:\n        0\nend\n",
-            "hash pattern cannot match value of type Tree",
+            "hash pattern cannot match value of type List[Int]",
         ),
     ];
 
@@ -2686,13 +2686,22 @@ fn unknown_scrutinee_types_remain_permissive_for_dynamic_nested_patterns() {
                       end\n\
                       return result\n\
                   end\n\
+                  fn inspect_array(ref value as Array[Int]) gives Int:\n\
+                      result is match value:\n\
+                          [_, _]:\n\
+                              1\n\
+                          _:\n\
+                              0\n\
+                      end\n\
+                      return result\n\
+                  end\n\
                   enum Result:\n\
                       Ok as Int\n\
                       Error as String\n\
                   end\n\
                   Sayln inspect(Result::Ok(3))\n\
-                  Sayln inspect([1, 2])\n\
-                  Sayln inspect(\"dynamic\")\n";
+                  Sayln inspect(\"dynamic\")\n\
+                  Sayln inspect_array(ref [1, 2])\n";
     let (valid, _, error) = check_source(source);
     assert!(
         valid,
@@ -2703,7 +2712,7 @@ fn unknown_scrutinee_types_remain_permissive_for_dynamic_nested_patterns() {
         success,
         "Unknown scrutinee patterns failed at runtime: {output}"
     );
-    assert_eq!(output, "1\n1\n0\n");
+    assert_eq!(output, "1\n0\n1\n");
 
     let dynamic_hash_value = "type Person:\n\
                                   name as String\n\

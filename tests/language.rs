@@ -1,7 +1,7 @@
 mod common;
 use common::*;
 
-use std::{path::Path, process::Command};
+use std::{fs, path::Path, process::Command};
 
 fn run_fixture(command: &str, fixture: &str) -> std::process::Output {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -194,6 +194,170 @@ fn characters_materializes_unicode_scalars_for_linear_traversal() {
     let (success, _, error) = check_source("Sayln characters(10)\n");
     assert!(!success);
     assert!(error.contains("expected String, found Int"), "{error}");
+}
+
+#[test]
+fn regex_builtins_extract_matches_replace_text_and_report_invalid_patterns() {
+    let source = r#"text is "Ada 42 and Zoë 7"
+Sayln regex_find_all(text, "\\p{L}+")
+Sayln regex_find_all(text, "[0-9]+")
+Sayln regex_replace(text, "[0-9]+", "[number]")
+"#;
+    let (success, output) = run_source_stdout(source);
+    assert!(success, "{output}");
+    assert_eq!(
+        output,
+        "[Ada, and, Zoë]\n[42, 7]\nAda [number] and Zoë [number]\n"
+    );
+
+    let (success, error) = run_source("regex_find_all(\"text\", \"[\")\n");
+    assert!(!success);
+    assert!(error.contains("invalid regular expression"), "{error}");
+
+    let (success, _, error) = check_source("regex_replace(\"text\", 1, \"value\")\n");
+    assert!(!success);
+    assert!(error.contains("expected String, found Int"), "{error}");
+}
+
+#[test]
+fn score_rules_returns_weighted_total_and_explanations() {
+    let source = r#"rules is [
+    ("income", true, 3),
+    ("debt", false, 2),
+    ("history", true, -1)
+]
+result is score_rules(rules)
+Sayln result["score"]
+Sayln result["matched"]
+Sayln result["unmatched"]
+"#;
+    let (success, output) = run_source_stdout(source);
+    assert!(success, "{output}");
+    assert_eq!(output, "2\n[income, history]\n[debt]\n");
+
+    let (success, error) = run_source("score_rules([(1, true, 2)])\n");
+    assert!(!success);
+    assert!(
+        error.contains("label in rule 1 must be a String"),
+        "{error}"
+    );
+
+    let (success, _, error) = check_source("score_rules(1)\n");
+    assert!(!success);
+    assert!(
+        error.contains("expects an Array, List, or Tuple"),
+        "{error}"
+    );
+}
+
+#[test]
+fn json_builtins_round_trip_values_and_report_unsupported_or_invalid_input() {
+    let source = r#"data is parse_json("{\"name\":\"Mina\",\"ok\":true,\"items\":[null,2.5]}")
+Sayln data["name"]
+Sayln data["ok"]
+Sayln to_json(data)
+"#;
+    let (success, output) = run_source_stdout(source);
+    assert!(success, "{output}");
+    assert_eq!(
+        output,
+        "Mina\ntrue\n{\"items\":[null,2.5],\"name\":\"Mina\",\"ok\":true}\n"
+    );
+
+    let (success, error) = run_source("parse_json(\"{\")\n");
+    assert!(!success);
+    assert!(error.contains("could not parse JSON"), "{error}");
+
+    let (success, error) = run_source("to_json(range(1, 3))\n");
+    assert!(!success);
+    assert!(
+        error.contains("cannot serialize a Range to JSON"),
+        "{error}"
+    );
+
+    let (success, _, error) = check_source("parse_json(1)\n");
+    assert!(!success);
+    assert!(error.contains("expected String, found Int"), "{error}");
+
+    let (success, _, error) = check_source("Sayln read_json(\"data.json\")[\"name\"]\n");
+    assert!(success, "{error}");
+}
+
+#[test]
+fn pretty_json_builtin_formats_nested_values() {
+    let source = r#"data is parse_json("{\"values\":[1,true]}")
+Sayln to_json_pretty(data)
+"#;
+    let (success, output) = run_source_stdout(source);
+    assert!(success, "{output}");
+    assert_eq!(output, "{\n  \"values\": [\n    1,\n    true\n  ]\n}\n");
+}
+
+#[test]
+fn json_file_builtins_read_and_atomically_write_json_values() {
+    let id = TEMP_SOURCE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("simply-json-files-{}-{id}", std::process::id()));
+    fs::create_dir_all(&root).expect("failed to create JSON test directory");
+    let input = root.join("input.json");
+    let output = root.join("output.json");
+    let pretty_output = root.join("pretty-output.json");
+    fs::write(&input, r#"{"count":3,"ok":true}"#).expect("failed to write JSON test input");
+    let source = format!(
+        "value is read_json({input:?})\n\
+         write_json({output:?}, value)\n\
+         write_json_pretty({pretty_output:?}, value)\n\
+         Sayln to_json(read_json({output:?}))\n"
+    );
+
+    let (success, stdout) = run_source_stdout(&source);
+    assert!(success, "{stdout}");
+    assert_eq!(stdout, "{\"count\":3,\"ok\":true}\n");
+    assert_eq!(
+        fs::read_to_string(&output).expect("failed to read JSON output"),
+        r#"{"count":3,"ok":true}"#
+    );
+    assert_eq!(
+        fs::read_to_string(&pretty_output).expect("failed to read pretty JSON output"),
+        "{\n  \"count\": 3,\n  \"ok\": true\n}"
+    );
+    fs::remove_dir_all(root).expect("failed to remove JSON test directory");
+}
+
+#[test]
+fn json_lines_builtins_round_trip_sequences_and_report_invalid_line_numbers() {
+    let id = TEMP_SOURCE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("simply-json-lines-{}-{id}", std::process::id()));
+    fs::create_dir_all(&root).expect("failed to create JSON Lines test directory");
+    let input = root.join("input.jsonl");
+    let output = root.join("output.jsonl");
+    let append_target = root.join("append.jsonl");
+    fs::write(&input, "{\"id\":1}\n\n{\"id\":2}\n").expect("failed to write JSON Lines input");
+    fs::write(&append_target, "{\"id\":1}").expect("failed to write append test input");
+    let source = format!(
+        "records is read_json_lines({input:?})\n\
+         Sayln records[1][\"id\"]\n\
+         write_json_lines({output:?}, records)\n\
+         append_json_line({append_target:?}, records[1])\n"
+    );
+
+    let (success, stdout) = run_source_stdout(&source);
+    assert!(success, "{stdout}");
+    assert_eq!(stdout, "2\n");
+    assert_eq!(
+        fs::read_to_string(&output).expect("failed to read JSON Lines output"),
+        "{\"id\":1}\n{\"id\":2}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&append_target).expect("failed to read appended JSON Lines output"),
+        "{\"id\":1}\n{\"id\":2}\n"
+    );
+
+    fs::write(&input, "{\"id\":1}\nnot-json\n").expect("failed to write malformed JSON Lines");
+    let malformed = format!("read_json_lines({input:?})\n");
+    let (success, error) = run_source(&malformed);
+    assert!(!success);
+    assert!(error.contains("invalid JSON on line 2"), "{error}");
+    fs::remove_dir_all(root).expect("failed to remove JSON Lines test directory");
 }
 
 #[test]

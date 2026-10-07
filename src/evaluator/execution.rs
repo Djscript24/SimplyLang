@@ -80,11 +80,12 @@ impl Evaluator {
             let source = self.function_source_context();
             let resolved_parameters = parameters
                 .iter()
-                .map(|(name, typ, mutable)| {
+                .map(|(name, typ, mutable, by_ref)| {
                     (
                         name.clone(),
                         typ.as_ref().map(|typ| self.resolve_type_identity(typ)),
                         *mutable,
+                        *by_ref,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -116,7 +117,7 @@ impl Evaluator {
                 Type::Function {
                     parameters: resolved_parameters
                         .iter()
-                        .map(|(_, typ, _)| typ.clone().map(Box::new))
+                        .map(|(_, typ, _, _)| typ.clone().map(Box::new))
                         .collect(),
                     return_type: resolved_return_type.map(Box::new),
                 },
@@ -404,7 +405,11 @@ impl Evaluator {
                     collections::mutate_list(target, operation, value, name, span.as_ref())?;
                     self.persist_active_message_field(name);
                 }
-                Stmt::SetIndex { name, index, value } => {
+                Stmt::SetIndex {
+                    name,
+                    indices,
+                    value,
+                } => {
                     if !self.scopes.is_mutable(name) {
                         return Err(self.runtime_error_with_code(
                             DiagnosticCode::RuntimeMutability,
@@ -413,16 +418,24 @@ impl Evaluator {
                             ),
                         ));
                     }
-                    let index_value = self.evaluate(index)?;
+                    let index_values = indices
+                        .iter()
+                        .map(|index| self.evaluate(index))
+                        .collect::<Result<Vec<_>, _>>()?;
                     let value = self.evaluate(value)?;
-                    if let Some(expected) = self.variable_types.lookup(name)
-                        && let Type::Array(element) | Type::List(element) | Type::Vector(element, _) =
-                            expected
-                    {
-                        self.ensure_type(&value, element, name)?;
-                    } else if let Some(Type::HashValues(element)) = self.variable_types.lookup(name)
-                    {
-                        self.ensure_type(&value, element, name)?;
+                    let mut element_type = self.variable_types.lookup(name).cloned();
+                    for _ in &index_values {
+                        element_type = element_type.map(|current| match current {
+                            Type::Array(element)
+                            | Type::List(element)
+                            | Type::Vector(element, _) => *element,
+                            Type::HashValues(element) => *element,
+                            Type::Hash | Type::Unknown => Type::Unknown,
+                            _ => Type::Unknown,
+                        });
+                    }
+                    if let Some(expected) = element_type.as_ref() {
+                        self.ensure_type(&value, expected, name)?;
                     }
                     let span = self.current_span.clone();
                     let target = match self.lookup_mut(name) {
@@ -433,7 +446,7 @@ impl Evaluator {
                             )));
                         }
                     };
-                    collections::set_index(target, index_value, value, span.as_ref())?;
+                    collections::set_index_path(target, index_values, value, span.as_ref())?;
                     self.persist_active_message_field(name);
                 }
                 Stmt::Destructure {
@@ -482,11 +495,12 @@ impl Evaluator {
                     let source = self.function_source_context();
                     let resolved_parameters = parameters
                         .iter()
-                        .map(|(name, typ, mutable)| {
+                        .map(|(name, typ, mutable, by_ref)| {
                             (
                                 name.clone(),
                                 typ.as_ref().map(|typ| self.resolve_type_identity(typ)),
                                 *mutable,
+                                *by_ref,
                             )
                         })
                         .collect::<Vec<_>>();
@@ -525,7 +539,7 @@ impl Evaluator {
                         Type::Function {
                             parameters: resolved_parameters
                                 .iter()
-                                .map(|(_, typ, _)| typ.clone().map(Box::new))
+                                .map(|(_, typ, _, _)| typ.clone().map(Box::new))
                                 .collect(),
                             return_type: resolved_return_type.clone().map(Box::new),
                         },
@@ -566,12 +580,11 @@ impl Evaluator {
                         Value::Range { start, end, step } => {
                             Box::new(Value::range_values(start, end, step))
                         }
-                        Value::Array(values) | Value::List(values) | Value::Tuple(values) => {
-                            Box::new(owned_values(values).into_iter())
+                        Value::Array(values) | Value::List(values) => {
+                            Box::new(values.get_cloned().unwrap_or_default().into_iter())
                         }
-                        Value::Hash(values) | Value::Tree(values) => {
-                            Box::new(owned_map_values(values).into_iter())
-                        }
+                        Value::Tuple(values) => Box::new(values.to_vec().into_iter()),
+                        Value::Hash(values) => Box::new(owned_map_values(values).into_iter()),
                         _ => {
                             return Err(self.runtime_collection_error("for requires a collection"));
                         }
@@ -659,7 +672,7 @@ impl Evaluator {
                                     let error_type = error
                                         .thrown_value()
                                         .map(|value| self.type_of_value(value))
-                                        .unwrap_or(Type::Tree);
+                                        .unwrap_or(Type::Hash);
                                     self.variable_types.define(name.clone(), error_type, false);
                                     self.scopes
                                         .define(name.clone(), self.error_value(&error), false)
@@ -742,6 +755,6 @@ impl Evaluator {
         );
         fields.insert("line".into(), Value::Int(error.span().line as i64));
         fields.insert("column".into(), Value::Int(error.span().column as i64));
-        Value::Tree(shared_map(fields))
+        self.make_hash(fields)
     }
 }

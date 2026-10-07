@@ -1,0 +1,19 @@
+# JSON conversion and file I/O built-ins.
+# Run from the repository root; file paths use the process working directory.
+record is read_json("examples/08-standard-library/sample.json")
+
+Sayln record["name"]
+Sayln to_json(record)
+Sayln to_json_pretty(record)
+
+write_json("json-output.json", record)
+write_json_pretty("json-output-pretty.json", record)
+loaded is read_json("json-output-pretty.json")
+Sayln loaded["scores"][1]
+
+records is read_json_lines("examples/08-standard-library/sample.jsonl")
+Sayln records[0]["name"]
+write_json_lines("json-output.jsonl", records)
+append_json_line("json-output.jsonl", parse_json("{\"name\":\"Linus\",\"active\":true}"))
+updated_records is read_json_lines("json-output.jsonl")
+Sayln updated_records[2]["name"]

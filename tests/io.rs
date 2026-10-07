@@ -490,7 +490,7 @@ fn runtime_accepts_unit_range_and_csv_stream_declared_types() {
         &source,
         format!(
             "fn no_op() gives Unit:\n\
-                 return print(\"unit\")\n\
+                 return assert(true)\n\
              end\n\
              no_op()\n\
              values as Range is range(1, 3)\n\
@@ -518,7 +518,7 @@ fn runtime_accepts_unit_range_and_csv_stream_declared_types() {
         String::from_utf8_lossy(&output.stdout)
             .lines()
             .collect::<Vec<_>>(),
-        ["unit", "[1, 2]", "2"]
+        ["[1, 2]", "2"]
     );
     fs::remove_dir_all(root).expect("failed to clean up declared type test directory");
 }

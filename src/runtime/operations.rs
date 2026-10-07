@@ -4,10 +4,14 @@
 use crate::{
     ast::{BinaryOperator, UnaryOperator},
     error::{DiagnosticCode, SimplyError, Span},
-    runtime::value::{Value, shared_values},
+    runtime::{
+        heap::RuntimeHeap,
+        value::{Value, shared_values},
+    },
 };
 
 pub(crate) fn unary(
+    heap: &RuntimeHeap,
     value: Value,
     operator: &UnaryOperator,
     span: Option<&Span>,
@@ -26,13 +30,14 @@ pub(crate) fn unary(
             _ => Err(type_error(span, "unary `-` requires a number")),
         },
         UnaryOperator::Transpose => match value {
-            Value::Matrix(rows) => matrix_transpose(&rows, span),
+            Value::Matrix(rows) => matrix_transpose(heap, &rows, span),
             _ => Err(type_error(span, "transpose requires a matrix")),
         },
     }
 }
 
 pub(crate) fn binary(
+    heap: &RuntimeHeap,
     left: Value,
     operator: &BinaryOperator,
     right: Value,
@@ -45,7 +50,7 @@ pub(crate) fn binary(
             (
                 left @ (Value::Matrix(_) | Value::Array(_) | Value::List(_)),
                 right @ (Value::Matrix(_) | Value::Array(_) | Value::List(_)),
-            ) => matrix_add_values(&left, &right, false, span),
+            ) => matrix_add_values(heap, &left, &right, false, span),
             (Value::String(left), Value::String(right)) => Ok(Value::String(left + &right)),
             (Value::Int(left), Value::Int(right)) => left
                 .checked_add(right)
@@ -57,7 +62,7 @@ pub(crate) fn binary(
             _ => Err(type_error(span, "`+` requires two compatible values")),
         },
         Subtract | Multiply | Divide | Remainder => numeric_operation(left, operator, right, span),
-        MatrixMultiply => matrix_multiply_values(&left, &right, span),
+        MatrixMultiply => matrix_multiply_values(heap, &left, &right, span),
         Greater | GreaterEqual | Less | LessEqual => {
             numeric_comparison(left, operator, right, span)
         }
@@ -239,6 +244,7 @@ pub(crate) fn math_sign(value: Value, span: Option<&Span>) -> Result<Value, Simp
 }
 
 pub(crate) fn vector_add(
+    heap: &RuntimeHeap,
     left: &Value,
     right: &Value,
     subtract: bool,
@@ -257,12 +263,13 @@ pub(crate) fn vector_add(
     let values = left
         .iter()
         .zip(right)
-        .map(|(left, right)| binary((*left).clone(), &operator, right.clone(), span))
+        .map(|(left, right)| binary(heap, (*left).clone(), &operator, right.clone(), span))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Value::Array(shared_values(values)))
+    Ok(Value::Array(heap.insert_sequence(values)))
 }
 
 pub(crate) fn vector_scale(
+    heap: &RuntimeHeap,
     vector: &Value,
     scalar: &Value,
     span: Option<&Span>,
@@ -272,6 +279,7 @@ pub(crate) fn vector_scale(
         .iter()
         .map(|value| {
             binary(
+                heap,
                 (*value).clone(),
                 &BinaryOperator::Multiply,
                 scalar.clone(),
@@ -279,10 +287,11 @@ pub(crate) fn vector_scale(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Value::Array(shared_values(values)))
+    Ok(Value::Array(heap.insert_sequence(values)))
 }
 
 pub(crate) fn vector_dot(
+    heap: &RuntimeHeap,
     left: &Value,
     right: &Value,
     span: Option<&Span>,
@@ -295,17 +304,19 @@ pub(crate) fn vector_dot(
     let mut total = Value::Int(0);
     for (left, right) in left.iter().zip(right) {
         let product = binary(
-            (*left).clone(),
+            heap,
+            left.clone(),
             &BinaryOperator::Multiply,
             right.clone(),
             span,
         )?;
-        total = binary(total, &BinaryOperator::Add, product, span)?;
+        total = binary(heap, total, &BinaryOperator::Add, product, span)?;
     }
     Ok(total)
 }
 
 pub(crate) fn vector_cross(
+    heap: &RuntimeHeap,
     left: &Value,
     right: &Value,
     span: Option<&Span>,
@@ -335,13 +346,13 @@ pub(crate) fn vector_cross(
         .into_iter()
         .map(|value| float_result(value, span))
         .collect::<Result<Vec<_>, _>>()
-        .map(|values| Value::Array(shared_values(values)))
+        .map(|values| Value::Array(heap.insert_sequence(values)))
 }
 
 pub(crate) fn vector_norm(vector: &Value, span: Option<&Span>) -> Result<Value, SimplyError> {
     let mut norm = 0.0_f64;
     for value in vector_values(vector, span)? {
-        norm = norm.hypot(numeric_value(value, span)?);
+        norm = norm.hypot(numeric_value(&value, span)?);
     }
     float_result(norm, span)
 }
@@ -358,13 +369,17 @@ pub(crate) fn vector_distance(
     }
     let mut distance = 0.0_f64;
     for (left, right) in left.iter().zip(right) {
-        let difference = numeric_value(left, span)? - numeric_value(right, span)?;
+        let difference = numeric_value(left, span)? - numeric_value(&right, span)?;
         distance = distance.hypot(difference);
     }
     float_result(distance, span)
 }
 
-pub(crate) fn vector_normalize(vector: &Value, span: Option<&Span>) -> Result<Value, SimplyError> {
+pub(crate) fn vector_normalize(
+    heap: &RuntimeHeap,
+    vector: &Value,
+    span: Option<&Span>,
+) -> Result<Value, SimplyError> {
     let values = vector_values(vector, span)?;
     let mut norm = 0.0_f64;
     for value in &values {
@@ -380,7 +395,7 @@ pub(crate) fn vector_normalize(vector: &Value, span: Option<&Span>) -> Result<Va
         .iter()
         .map(|value| float_result(numeric_value(value, span)? / norm, span))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Value::Array(shared_values(result)))
+    Ok(Value::Array(heap.insert_sequence(result)))
 }
 
 pub(crate) fn matrix_shape_value(
@@ -465,6 +480,7 @@ pub(crate) fn matrix_rank(matrix: &Value, span: Option<&Span>) -> Result<Value, 
 }
 
 pub(crate) fn matrix_vector_multiply(
+    heap: &RuntimeHeap,
     matrix: &Value,
     vector: &Value,
     span: Option<&Span>,
@@ -491,7 +507,7 @@ pub(crate) fn matrix_vector_multiply(
             float_result(total, span)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Value::Array(shared_values(result)))
+    Ok(Value::Array(heap.insert_sequence(result)))
 }
 
 pub(crate) fn matrix_determinant(
@@ -554,7 +570,11 @@ pub(crate) fn matrix_determinant(
     float_result(sign * determinant, span)
 }
 
-pub(crate) fn matrix_inverse(matrix: &Value, span: Option<&Span>) -> Result<Value, SimplyError> {
+pub(crate) fn matrix_inverse(
+    heap: &RuntimeHeap,
+    matrix: &Value,
+    span: Option<&Span>,
+) -> Result<Value, SimplyError> {
     let rows = matrix_rows(matrix, span)?;
     let size = rows.len();
     if rows[0].len() != size {
@@ -616,13 +636,14 @@ pub(crate) fn matrix_inverse(matrix: &Value, span: Option<&Span>) -> Result<Valu
             row.into_iter()
                 .map(|value| float_result(value, span))
                 .collect::<Result<Vec<_>, _>>()
-                .map(|row| Value::Array(shared_values(row)))
+                .map(|row| Value::Array(heap.insert_sequence(row)))
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Value::Matrix(shared_values(result)))
 }
 
 pub(crate) fn matrix_solve(
+    heap: &RuntimeHeap,
     matrix: &Value,
     right_hand_side: &Value,
     span: Option<&Span>,
@@ -756,7 +777,7 @@ pub(crate) fn matrix_solve(
         Ok(Value::Matrix(shared_values(
             output
                 .into_iter()
-                .map(|row| Value::Array(shared_values(row)))
+                .map(|row| Value::Array(heap.insert_sequence(row)))
                 .collect(),
         )))
     } else {
@@ -764,11 +785,15 @@ pub(crate) fn matrix_solve(
             .into_iter()
             .map(|mut row| row.pop().expect("vector solve has one RHS column"))
             .collect();
-        Ok(Value::Array(shared_values(solution)))
+        Ok(Value::Array(heap.insert_sequence(solution)))
     }
 }
 
-pub(crate) fn matrix_lu(matrix: &Value, span: Option<&Span>) -> Result<Value, SimplyError> {
+pub(crate) fn matrix_lu(
+    heap: &RuntimeHeap,
+    matrix: &Value,
+    span: Option<&Span>,
+) -> Result<Value, SimplyError> {
     let rows = matrix_rows(matrix, span)?;
     let row_count = rows.len();
     let column_count = rows[0].len();
@@ -852,13 +877,17 @@ pub(crate) fn matrix_lu(matrix: &Value, span: Option<&Span>) -> Result<Value, Si
         .collect::<Vec<_>>();
 
     Ok(Value::Tuple(shared_values(vec![
-        float_matrix_value(lower, span)?,
-        float_matrix_value(upper, span)?,
-        float_matrix_value(permutation_matrix, span)?,
+        float_matrix_value(heap, lower, span)?,
+        float_matrix_value(heap, upper, span)?,
+        float_matrix_value(heap, permutation_matrix, span)?,
     ])))
 }
 
-pub(crate) fn matrix_qr(matrix: &Value, span: Option<&Span>) -> Result<Value, SimplyError> {
+pub(crate) fn matrix_qr(
+    heap: &RuntimeHeap,
+    matrix: &Value,
+    span: Option<&Span>,
+) -> Result<Value, SimplyError> {
     let rows = matrix_rows(matrix, span)?;
     let row_count = rows.len();
     let column_count = rows[0].len();
@@ -940,12 +969,16 @@ pub(crate) fn matrix_qr(matrix: &Value, span: Option<&Span>) -> Result<Value, Si
     }
 
     Ok(Value::Tuple(shared_values(vec![
-        float_matrix_value(orthogonal, span)?,
-        float_matrix_value(upper, span)?,
+        float_matrix_value(heap, orthogonal, span)?,
+        float_matrix_value(heap, upper, span)?,
     ])))
 }
 
-pub(crate) fn matrix_cholesky(matrix: &Value, span: Option<&Span>) -> Result<Value, SimplyError> {
+pub(crate) fn matrix_cholesky(
+    heap: &RuntimeHeap,
+    matrix: &Value,
+    span: Option<&Span>,
+) -> Result<Value, SimplyError> {
     let rows = matrix_rows(matrix, span)?;
     let size = rows.len();
     if rows[0].len() != size {
@@ -999,22 +1032,27 @@ pub(crate) fn matrix_cholesky(matrix: &Value, span: Option<&Span>) -> Result<Val
         }
     }
 
-    float_matrix_value(lower, span)
+    float_matrix_value(heap, lower, span)
 }
 
-fn float_matrix_value(rows: Vec<Vec<f64>>, span: Option<&Span>) -> Result<Value, SimplyError> {
+fn float_matrix_value(
+    heap: &RuntimeHeap,
+    rows: Vec<Vec<f64>>,
+    span: Option<&Span>,
+) -> Result<Value, SimplyError> {
     rows.into_iter()
         .map(|row| {
             row.into_iter()
                 .map(|value| float_result(value, span))
                 .collect::<Result<Vec<_>, _>>()
-                .map(|row| Value::Array(shared_values(row)))
+                .map(|row| Value::Array(heap.insert_sequence(row)))
         })
         .collect::<Result<Vec<_>, _>>()
         .map(|rows| Value::Matrix(shared_values(rows)))
 }
 
 pub(crate) fn matrix_least_squares(
+    heap: &RuntimeHeap,
     matrix: &Value,
     right_hand_side: &Value,
     span: Option<&Span>,
@@ -1143,10 +1181,11 @@ pub(crate) fn matrix_least_squares(
         .into_iter()
         .map(|value| float_result(value, span))
         .collect::<Result<Vec<_>, _>>()
-        .map(|solution| Value::Array(shared_values(solution)))
+        .map(|solution| Value::Array(heap.insert_sequence(solution)))
 }
 
 pub(crate) fn matrix_transpose_value(
+    heap: &RuntimeHeap,
     matrix: &Value,
     span: Option<&Span>,
 ) -> Result<Value, SimplyError> {
@@ -1165,12 +1204,13 @@ pub(crate) fn matrix_transpose_value(
         for source_row in &rows {
             row.push(numeric_result_value(source_row[column].clone(), span)?);
         }
-        transposed.push(Value::Array(shared_values(row)));
+        transposed.push(Value::Array(heap.insert_sequence(row)));
     }
     Ok(Value::Matrix(shared_values(transposed)))
 }
 
 pub(crate) fn matrix_add_values(
+    heap: &RuntimeHeap,
     left: &Value,
     right: &Value,
     subtract: bool,
@@ -1197,14 +1237,15 @@ pub(crate) fn matrix_add_values(
         let row = left_row
             .iter()
             .zip(right_row)
-            .map(|(left, right)| binary((*left).clone(), &operator, right.clone(), span))
+            .map(|(left, right)| binary(heap, (*left).clone(), &operator, right.clone(), span))
             .collect::<Result<Vec<_>, _>>()?;
-        result.push(Value::Array(shared_values(row)));
+        result.push(Value::Array(heap.insert_sequence(row)));
     }
     Ok(Value::Matrix(shared_values(result)))
 }
 
 pub(crate) fn matrix_scale(
+    heap: &RuntimeHeap,
     matrix: &Value,
     scalar: &Value,
     span: Option<&Span>,
@@ -1223,6 +1264,7 @@ pub(crate) fn matrix_scale(
             row.iter()
                 .map(|value| {
                     binary(
+                        heap,
                         (*value).clone(),
                         &BinaryOperator::Multiply,
                         scalar.clone(),
@@ -1230,13 +1272,14 @@ pub(crate) fn matrix_scale(
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()
-                .map(|row| Value::Array(shared_values(row)))
+                .map(|row| Value::Array(heap.insert_sequence(row)))
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Value::Matrix(shared_values(result)))
 }
 
 pub(crate) fn matrix_multiply_values(
+    heap: &RuntimeHeap,
     left: &Value,
     right: &Value,
     span: Option<&Span>,
@@ -1257,21 +1300,25 @@ pub(crate) fn matrix_multiply_values(
         let mut row = vec![0.0; right[0].len()];
         for (index, left_value) in left_row.iter().enumerate() {
             let left_value = numeric_value(left_value, span)?;
-            for (total, right_value) in row.iter_mut().zip(right[index]) {
+            for (total, right_value) in row.iter_mut().zip(&right[index]) {
                 *total += left_value * numeric_value(right_value, span)?;
                 if !total.is_finite() {
                     return Err(arithmetic_error(span));
                 }
             }
         }
-        result.push(Value::Array(shared_values(
-            row.into_iter().map(Value::Float).collect(),
-        )));
+        result.push(Value::Array(
+            heap.insert_sequence(row.into_iter().map(Value::Float).collect()),
+        ));
     }
     Ok(Value::Matrix(shared_values(result)))
 }
 
-pub(crate) fn matrix_identity(size: usize, span: Option<&Span>) -> Result<Value, SimplyError> {
+pub(crate) fn matrix_identity(
+    heap: &RuntimeHeap,
+    size: usize,
+    span: Option<&Span>,
+) -> Result<Value, SimplyError> {
     if size == 0 {
         return Err(SimplyError::Runtime {
             span: span.cloned().unwrap_or_else(|| Span::new(0, 0)),
@@ -1290,7 +1337,7 @@ pub(crate) fn matrix_identity(size: usize, span: Option<&Span>) -> Result<Value,
         for column_index in 0..size {
             row.push(Value::Int(i64::from(row_index == column_index)));
         }
-        rows.push(Value::Array(shared_values(row)));
+        rows.push(Value::Array(heap.insert_sequence(row)));
     }
     Ok(Value::Matrix(shared_values(rows)))
 }
@@ -1300,7 +1347,9 @@ pub(crate) fn statistics_values(
     span: Option<&Span>,
 ) -> Result<Vec<f64>, SimplyError> {
     match values {
-        Value::Array(values) | Value::List(values) | Value::Tuple(values) => values
+        Value::Array(_) | Value::List(_) | Value::Tuple(_) => values
+            .sequence_snapshot()
+            .unwrap_or_default()
             .iter()
             .map(|value| numeric_value(value, span))
             .collect(),
@@ -1442,35 +1491,32 @@ pub(crate) fn statistics_pair(
     float_result(result, span)
 }
 
-fn vector_values<'a>(value: &'a Value, span: Option<&Span>) -> Result<Vec<&'a Value>, SimplyError> {
-    let values = match value {
-        Value::Array(values) | Value::List(values) | Value::Tuple(values) => values,
-        _ => return Err(type_error(span, "expected a vector sequence")),
-    };
+fn vector_values(value: &Value, span: Option<&Span>) -> Result<Vec<Value>, SimplyError> {
+    let values = value
+        .sequence_snapshot()
+        .ok_or_else(|| type_error(span, "expected a vector sequence"))?;
     if values.is_empty() {
         return Err(argument_error(span, "vector must not be empty"));
     }
-    for value in values.iter() {
+    for value in &values {
         numeric_value(value, span)?;
     }
-    Ok(values.iter().collect())
+    Ok(values)
 }
 
-fn matrix_rows<'a>(value: &'a Value, span: Option<&Span>) -> Result<Vec<&'a [Value]>, SimplyError> {
-    let values = match value {
-        Value::Matrix(values) | Value::Array(values) | Value::List(values) => values,
-        _ => return Err(type_error(span, "expected a matrix of numeric rows")),
-    };
+fn matrix_rows(value: &Value, span: Option<&Span>) -> Result<Vec<Vec<Value>>, SimplyError> {
+    let values = value
+        .sequence_snapshot()
+        .ok_or_else(|| type_error(span, "expected a matrix of numeric rows"))?;
     if values.is_empty() {
         return Err(collection_error(span, "matrix must not be empty"));
     }
     let mut rows = Vec::with_capacity(values.len());
     let mut width = None;
     for row in values.iter() {
-        let row = match row {
-            Value::Array(row) | Value::List(row) => row.as_slice(),
-            _ => return Err(type_error(span, "matrix rows must be arrays or lists")),
-        };
+        let row = row
+            .sequence_snapshot()
+            .ok_or_else(|| type_error(span, "matrix rows must be arrays or lists"))?;
         if row.is_empty() {
             return Err(collection_error(span, "matrix rows must not be empty"));
         }
@@ -1480,7 +1526,7 @@ fn matrix_rows<'a>(value: &'a Value, span: Option<&Span>) -> Result<Vec<&'a [Val
             return Err(collection_error(span, "matrix rows must have equal widths"));
         }
         width = Some(row.len());
-        for value in row {
+        for value in &row {
             numeric_value(value, span)?;
         }
         rows.push(row);
@@ -1516,14 +1562,16 @@ fn matrix_shape(matrix: &[Value], span: Option<&Span>) -> Result<usize, SimplyEr
     Ok(width)
 }
 
-fn matrix_row_values<'a>(row: &'a Value, span: Option<&Span>) -> Result<&'a [Value], SimplyError> {
-    match row {
-        Value::Array(values) | Value::List(values) => Ok(values.as_slice()),
-        _ => Err(type_error(span, "matrix rows must be arrays or lists")),
-    }
+fn matrix_row_values(row: &Value, span: Option<&Span>) -> Result<Vec<Value>, SimplyError> {
+    row.sequence_snapshot()
+        .ok_or_else(|| type_error(span, "matrix rows must be arrays or lists"))
 }
 
-fn matrix_transpose(rows: &[Value], span: Option<&Span>) -> Result<Value, SimplyError> {
+fn matrix_transpose(
+    heap: &RuntimeHeap,
+    rows: &[Value],
+    span: Option<&Span>,
+) -> Result<Value, SimplyError> {
     let width = matrix_shape(rows, span)?;
     ensure_matrix_allocation(
         width,
@@ -1538,7 +1586,7 @@ fn matrix_transpose(rows: &[Value], span: Option<&Span>) -> Result<Value, Simply
             let values = matrix_row_values(row, span)?;
             output.push(Value::Float(numeric_value(&values[column], span)?));
         }
-        result.push(Value::Array(shared_values(output)));
+        result.push(Value::Array(heap.insert_sequence(output)));
     }
     Ok(Value::Matrix(shared_values(result)))
 }

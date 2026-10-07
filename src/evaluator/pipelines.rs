@@ -155,9 +155,10 @@ impl Evaluator {
             };
             match terminal {
                 PipelineStep::Count => count += 1,
-                PipelineStep::Sum => sum.add(value, self.current_span.as_ref())?,
+                PipelineStep::Sum => sum.add(&self.heap, value, self.current_span.as_ref())?,
                 PipelineStep::Average => {
                     total = operations::binary(
+                        &self.heap,
                         total,
                         &BinaryOperator::Add,
                         value,
@@ -224,6 +225,7 @@ impl Evaluator {
             Expr::Literal(Literal::Bool(value)) => Ok(Value::Bool(*value)),
             Expr::Identifier(name) if name == "item" => Ok(item.clone()),
             Expr::Unary { operator, operand } => operations::unary(
+                &self.heap,
                 self.evaluate_scalar_pipeline_expression(operand, item)?,
                 operator,
                 self.current_span.as_ref(),
@@ -242,6 +244,7 @@ impl Evaluator {
                     return Ok(Value::Bool(value));
                 }
                 operations::binary(
+                    &self.heap,
                     left,
                     operator,
                     self.evaluate_scalar_pipeline_expression(right, item)?,
@@ -496,7 +499,7 @@ impl Evaluator {
                 let row = csv::parse_record(line).map_err(|message| {
                     self.runtime_error(format!("invalid CSV row in `{input_path}`: {message}"))
                 })?;
-                let mut current = Some(Value::List(shared_values(row)));
+                let mut current = Some(self.make_list(row));
                 let mut stop_after_record = false;
                 let mut stop_source = false;
                 for (step_index, step) in steps[..steps.len() - 1].iter().enumerate() {
@@ -652,11 +655,12 @@ impl Evaluator {
                 }
                 match terminal {
                     PipelineStep::Sum => {
-                        sum.add(value, self.current_span.as_ref())?;
+                        sum.add(&self.heap, value, self.current_span.as_ref())?;
                     }
                     PipelineStep::Count => count += 1,
                     PipelineStep::Average => {
                         total = operations::binary(
+                            &self.heap,
                             total,
                             &BinaryOperator::Add,
                             value,
@@ -687,10 +691,8 @@ impl Evaluator {
                         }
                     },
                     PipelineStep::WriteCsv(_) => {
-                        let values = match value {
-                            Value::Array(values) | Value::List(values) | Value::Tuple(values) => {
-                                values
-                            }
+                        let values = match value.sequence_snapshot() {
+                            Some(values) => values,
                             _ => {
                                 return Err(self.runtime_type_error(
                                     "write_csv requires derive to produce a row collection",
@@ -701,7 +703,7 @@ impl Evaluator {
                             output
                                 .as_mut()
                                 .expect("write_csv output should be initialized"),
-                            values.as_slice(),
+                            &values,
                         )
                         .map_err(|message| {
                             self.runtime_error_with_code(DiagnosticCode::RuntimeIo, message)
@@ -761,7 +763,7 @@ impl Evaluator {
                 Ok(Value::Bool(all_result))
             } else if let PipelineStep::Partition { .. } = terminal {
                 match partitioned.take() {
-                    Some(categories) => Ok(partition_result(categories)),
+                    Some(categories) => Ok(partition_result(&self.heap, categories)),
                     None => Err(self.runtime_error("partition result was not initialized".into())),
                 }
             } else if matches!(terminal, PipelineStep::Sum) {
@@ -882,7 +884,7 @@ impl Evaluator {
                     let mut total = SumAccumulator::new(sum_type.clone());
                     for value in values.drain(..) {
                         let mapped = self.evaluate_pipeline_item(value, expression)?;
-                        total.add(mapped, self.current_span.as_ref())?;
+                        total.add(&self.heap, mapped, self.current_span.as_ref())?;
                     }
                     return Ok(total.finish());
                 }
@@ -910,7 +912,7 @@ impl Evaluator {
                 PipelineStep::Sum => {
                     let mut total = SumAccumulator::new(sum_type.clone());
                     for value in values.drain(..) {
-                        total.add(value, self.current_span.as_ref())?;
+                        total.add(&self.heap, value, self.current_span.as_ref())?;
                     }
                     return Ok(total.finish());
                 }
@@ -954,7 +956,7 @@ impl Evaluator {
                 }
             }
         }
-        Ok(Value::List(shared_values(std::mem::take(values))))
+        Ok(self.make_list(std::mem::take(values)))
     }
 
     pub(super) fn evaluate_streaming_pipeline_with_sum_type<I>(
@@ -1274,10 +1276,11 @@ impl Evaluator {
             match terminal {
                 Some(PipelineStep::Count) => count += 1,
                 Some(PipelineStep::Sum) => {
-                    sum.add(value, self.current_span.as_ref())?;
+                    sum.add(&self.heap, value, self.current_span.as_ref())?;
                 }
                 Some(PipelineStep::Average) => {
                     total = operations::binary(
+                        &self.heap,
                         total,
                         &BinaryOperator::Add,
                         value,
@@ -1306,8 +1309,8 @@ impl Evaluator {
                     }
                 },
                 Some(PipelineStep::WriteCsv(_)) => {
-                    let values = match value {
-                        Value::Array(values) | Value::List(values) | Value::Tuple(values) => values,
+                    let values = match value.sequence_snapshot() {
+                        Some(values) => values,
                         _ => {
                             return Err(self.runtime_type_error(
                                 "write_csv requires derive to produce a row collection",
@@ -1318,7 +1321,7 @@ impl Evaluator {
                         output_file
                             .as_mut()
                             .expect("write_csv output should be initialized"),
-                        values.as_slice(),
+                        &values,
                     )
                     .map_err(|message| {
                         self.runtime_error_with_code(DiagnosticCode::RuntimeIo, message)
@@ -1373,7 +1376,7 @@ impl Evaluator {
             Some(PipelineStep::Any) => Ok(Value::Bool(any_result)),
             Some(PipelineStep::All) => Ok(Value::Bool(all_result)),
             Some(PipelineStep::Partition { .. }) => match partitioned {
-                Some(categories) => Ok(partition_result(categories)),
+                Some(categories) => Ok(partition_result(&self.heap, categories)),
                 None => Err(self.runtime_error("partition result was not initialized".into())),
             },
             Some(PipelineStep::WriteCsv(_)) => {
@@ -1387,7 +1390,7 @@ impl Evaluator {
                 }
                 Ok(Value::Unit)
             }
-            None => Ok(Value::List(shared_values(output))),
+            None => Ok(self.make_list(output)),
             Some(PipelineStep::Where(_)) | Some(PipelineStep::Derive(_)) => {
                 unreachable!("pipeline terminal is normalized before evaluation")
             }
@@ -1466,10 +1469,11 @@ impl Evaluator {
             match terminal {
                 Some(PipelineStep::Count) => count += 1,
                 Some(PipelineStep::Sum) => {
-                    sum.add(value, self.current_span.as_ref())?;
+                    sum.add(&self.heap, value, self.current_span.as_ref())?;
                 }
                 Some(PipelineStep::Average) => {
                     total = operations::binary(
+                        &self.heap,
                         total,
                         &BinaryOperator::Add,
                         value,

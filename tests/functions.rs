@@ -190,7 +190,7 @@ fn closures_keep_creation_time_snapshots_across_rebinding() {
 }
 
 #[test]
-fn returned_closure_keeps_collection_snapshot_after_scope_cleanup() {
+fn returned_closure_keeps_collection_alias_after_scope_cleanup() {
     let source = "fn make_reader():\n\
                       mut values is list [1]\n\
                       fn read() gives List[Int]:\n\
@@ -209,7 +209,7 @@ fn returned_closure_keeps_collection_snapshot_after_scope_cleanup() {
         success,
         "returned closure lost its captured value: {output}"
     );
-    assert_eq!(output, "[1]\n[1, 2, 3]\n");
+    assert_eq!(output, "[1, 2, 3]\n[1, 2, 3]\n");
 }
 
 #[test]
@@ -412,7 +412,7 @@ fn unknown_messages_fail_at_runtime() {
     assert!(error.contains("Runtime error"));
 
     let (success, _, error) = check_source(
-        "fn greet(self as Hash):\n    return self[\"name\"]\nend\nperson is hash:\n    name is \"Ada\"\nend\nSayln person :: greet\n",
+        "fn greet(ref self as Hash) gives String:\n    return self[\"name\"]\nend\nperson is hash:\n    name is \"Ada\"\nend\nSayln person :: greet\n",
     );
     assert!(success, "valid message failed semantic checking: {error}");
 }
@@ -425,14 +425,14 @@ fn rejects_unknown_dispatch_targets_for_statically_known_receivers() {
     assert!(!success, "unknown dispatch target passed semantic checking");
     assert!(error.contains("unknown message `missing` for a Hash receiver"));
 
-    let wrong_receiver = "fn greet(value as String):\n    return value\nend\n\
-                          person is hash:\n    name is \"Ada\"\nend\nperson :: greet\n";
+    let wrong_receiver =
+        "fn greet(value as String):\n    return value\nend\nrange(1, 2) :: greet\n";
     let (success, _, error) = check_source(wrong_receiver);
     assert!(
         !success,
         "incompatible receiver type passed semantic checking"
     );
-    assert!(error.contains("expected String, found Hash"), "{error}");
+    assert!(error.contains("expected String, found Range"), "{error}");
 }
 
 #[test]

@@ -1,12 +1,31 @@
 //! Atomic filesystem writes shared by file built-ins and checkpoints.
 use std::{
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
 };
 
 static TEMPORARY_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn append_line(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .open(path)?;
+    let length = file.metadata()?.len();
+    if length > 0 {
+        file.seek(SeekFrom::End(-1))?;
+        let mut last_byte = [0];
+        file.read_exact(&mut last_byte)?;
+        if last_byte[0] != b'\n' {
+            file.write_all(b"\n")?;
+        }
+    }
+    file.write_all(contents)?;
+    file.write_all(b"\n")
+}
 
 pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let destination = match fs::symlink_metadata(path) {

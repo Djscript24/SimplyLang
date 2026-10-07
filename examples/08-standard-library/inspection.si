@@ -1,10 +1,9 @@
 # inspection.si — collection inspection example
-# Demonstrates membership checks, runtime type inspection, and print output.
-# Key components: contains, type_of, and print.
-# Membership, type inspection, and print
+# Demonstrates membership checks, runtime type inspection, and output.
+# Key components: contains, type_of, and Sayln.
 items is list ["one", "two"]
 
 Sayln contains(items, "one")
 Sayln contains(items, "missing")
 Sayln type_of(items)
-print("Printed with the print function")
+Sayln "Output uses Sayln"

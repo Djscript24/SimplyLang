@@ -285,7 +285,7 @@ fn explain_source(source: &str, path: &Path) -> Result<(), SimplyError> {
     println!();
     println!("runtime model:");
     println!("  bindings: immutable by default");
-    println!("  collections: value semantics, copy-on-write");
+    println!("  collections: shared mutable Arrays, Lists, and Hashes");
     println!("  closures: lexical snapshot capture");
     Ok(())
 }
@@ -528,8 +528,10 @@ fn collect_statement_stats(statements: &[Stmt], stats: &mut ExplainStats, inside
             Stmt::Reassign { value, .. }
             | Stmt::DestructureReassign { value, .. }
             | Stmt::CollectionOp { value, .. } => collect_expression_stats(value, stats),
-            Stmt::SetIndex { index, value, .. } => {
-                collect_expression_stats(index, stats);
+            Stmt::SetIndex { indices, value, .. } => {
+                for index in indices {
+                    collect_expression_stats(index, stats);
+                }
                 collect_expression_stats(value, stats);
             }
             Stmt::Import { .. }
@@ -579,7 +581,9 @@ fn collect_expression_stats(expression: &Expr, stats: &mut ExplainStats) {
                 }
             }
         }
-        Expr::Unary { operand, .. } => collect_expression_stats(operand, stats),
+        Expr::Unary { operand, .. } | Expr::Ref(operand) => {
+            collect_expression_stats(operand, stats)
+        }
         Expr::Binary { left, right, .. } => {
             collect_expression_stats(left, stats);
             collect_expression_stats(right, stats);
@@ -594,7 +598,7 @@ fn collect_expression_stats(expression: &Expr, stats: &mut ExplainStats) {
             collect_expression_stats(index, stats);
         }
         Expr::Field { target, .. } => collect_expression_stats(target, stats),
-        Expr::Hash(entries) | Expr::Tree(entries) => {
+        Expr::Hash(entries) => {
             for (_, value) in entries {
                 collect_expression_stats(value, stats);
             }
@@ -872,7 +876,6 @@ fn repl_block_depth(tokens: &[Token]) -> usize {
             | TokenKind::Flow
             | TokenKind::Pipeline
             | TokenKind::Hash
-            | TokenKind::Tree
             | TokenKind::Partition => {
                 let is_else_if = matches!(
                     tokens.get(index.wrapping_sub(1)),

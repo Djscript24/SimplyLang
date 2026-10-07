@@ -1,12 +1,12 @@
 # SimplyLang Types
 
-The interpreter supports `Unit`, `String`, `Int`, `Float`, `Bool`, `Range`, `CsvStream`, `Array[T]`, `List[T]`, `Vector[T]`, `Tuple[T1, T2, ...]`, `Hash`, `Tree`, `Matrix`, `Matrix[T]`, and function types internally.
+The interpreter supports `Unit`, `String`, `Int`, `Float`, `Bool`, `Range`, `CsvStream`, `Array[T]`, `List[T]`, `Vector[T]`, `Tuple[T1, T2, ...]`, `Hash`, `Matrix`, `Matrix[T]`, and function types internally.
 
 An unannotated binding receives the inferred type of its initial expression. Bindings are immutable by default; prefix a declaration with `mut` to permit reassignment and collection mutation. A reassignment must remain compatible with the binding's type. Explicit annotations are checked when the value is defined, reassigned, inserted into a collection, or passed to a typed function parameter.
 
 `Int` and `Float` are both numeric. Arithmetic involving either float produces `Float`; otherwise it produces `Int`. Floating-point arithmetic rejects non-finite results (`NaN`, positive infinity, and negative infinity) as runtime arithmetic errors. Division or remainder by zero is always an error. `Unknown` is reserved for genuinely unavailable type information. It is not type-compatible with an unrelated concrete type at the top level; semantic checks defer only when an expression's actual type is unknown, leaving that check to the runtime. Nested unknown element information is deferred to runtime checks. Empty collections retain unknown element types because there is no value from which to infer one.
 
-Arrays and lists are homogeneous. Tuple elements may have different types and tuple indexing with a known integer index is checked statically. Hash and tree keys are strings; inferred hash/tree literals retain a common value type for indexed reads and collection checks when their values agree. A heterogeneous map retains an unknown value type. Tree indexed writes are intentionally rejected, while Hash indexed writes require a mutable binding. Matrix dimensions and numeric contents are validated by the runtime operations.
+Arrays and lists are homogeneous. Tuple elements may have different types and tuple indexing with a known integer index is checked statically. Hash keys are strings; inferred Hash literals retain a common value type for indexed reads and collection checks when their values agree. A heterogeneous map retains an unknown value type. Hash indexed writes require a mutable binding. Matrix dimensions and numeric contents are validated by the runtime operations.
 
 `Vector[T]` is a statically element-typed view over an `Array[T]`, `List[T]`,
 or homogeneous tuple; `Vector[T, N]` additionally fixes its length. It does

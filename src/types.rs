@@ -52,8 +52,6 @@ pub enum Type {
     Tuple(Vec<Type>),
     Hash,
     HashValues(Box<Type>),
-    Tree,
-    TreeValues(Box<Type>),
     Matrix,
     TypedMatrix(Box<Type>, Option<usize>, Option<usize>),
     Struct(DeclarationIdentity),
@@ -87,8 +85,6 @@ impl Type {
             ),
             Self::Hash => "Hash".into(),
             Self::HashValues(_) => "Hash".into(),
-            Self::Tree => "Tree".into(),
-            Self::TreeValues(_) => "Tree".into(),
             Self::Matrix => "Matrix".into(),
             Self::TypedMatrix(element, Some(rows), Some(columns)) => {
                 format!("Matrix[{}, {rows}, {columns}]", element.name())
@@ -113,9 +109,8 @@ impl Type {
             (Self::Unknown, Self::Unknown) => true,
             (Self::Unknown, _) | (_, Self::Unknown) => nested,
             (Self::Range, Self::Range) | (Self::CsvStream, Self::CsvStream) => true,
-            (Self::HashValues(_), Self::Hash) | (Self::TreeValues(_), Self::Tree) => true,
-            (Self::HashValues(actual), Self::HashValues(expected))
-            | (Self::TreeValues(actual), Self::TreeValues(expected)) => {
+            (Self::HashValues(_), Self::Hash) => true,
+            (Self::HashValues(actual), Self::HashValues(expected)) => {
                 actual.compatible_at(expected, true)
             }
             (Self::Array(actual), Self::Array(expected))

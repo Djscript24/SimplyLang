@@ -1,0 +1,11 @@
+# Read a plain text file with the standard library.
+# Run from the repository root; paths use the process working directory.
+notes is read_file("examples/08-standard-library/sample.txt")
+words is regex_find_all(notes, "\\p{L}+")
+numbers is regex_find_all(notes, "[0-9]+")
+redacted is regex_replace(notes, "[0-9]+", "[number]")
+
+Sayln words
+Sayln length(words)
+Sayln numbers
+Sayln redacted

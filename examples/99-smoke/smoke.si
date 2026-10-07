@@ -7,12 +7,8 @@ values is array [5, 10, 15]
 
 open "../08-standard-library/imported-values.si" as imported_values
 
-fn total(items):
-    mut result is 0
-    for item in items:
-        result -> result + item
-    end
-    return result
+flow total from values:
+    sum
 end
 
 filtered_total is pipeline:
@@ -21,15 +17,11 @@ filtered_total is pipeline:
     sum
 end
 
-fn greet(self):
-    return "Hello " + self["name"]
-end
-
 person is hash:
     name is "Ada"
 end
 
-if total(values) == 30 and filtered_total == 50 and person :: greet == "Hello Ada" and name == "Simply":
+if total == 30 and filtered_total == 50 and person["name"] == "Ada" and name == "Simply":
     Sayln "Smoke test passed"
 else:
     Sayln "Smoke test failed"

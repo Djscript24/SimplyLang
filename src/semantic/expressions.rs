@@ -7,6 +7,7 @@ impl SemanticAnalyzer {
             Expr::Literal(Literal::Int(_)) => Ok(Type::Int),
             Expr::Literal(Literal::Float(_)) => Ok(Type::Float),
             Expr::Literal(Literal::Bool(_)) => Ok(Type::Bool),
+            Expr::Ref(inner) => self.analyze_expression(inner),
             Expr::Identifier(name) => {
                 if let Some(typ) = self.variables.get(name).cloned() {
                     if matches!(typ, Type::Function { .. }) {
@@ -19,6 +20,12 @@ impl SemanticAnalyzer {
                     .rev()
                     .find_map(|scope| scope.get(name))
                 {
+                    if function.ref_parameters.iter().any(|by_ref| *by_ref) {
+                        return Err(self.error(
+                            DiagnosticCode::InvalidRefUsage,
+                            "a function with `ref` parameters cannot be used as a value",
+                        ));
+                    }
                     self.check_function_reference_order(name)?;
                     Ok(Type::Function {
                         parameters: function
@@ -79,7 +86,7 @@ impl SemanticAnalyzer {
                     column_count,
                 ))
             }
-            Expr::Hash(entries) | Expr::Tree(entries) => {
+            Expr::Hash(entries) => {
                 let mut value_type = None;
                 for (_, value) in entries {
                     let actual = self.analyze_expression(value)?;
@@ -88,12 +95,9 @@ impl SemanticAnalyzer {
                         None => actual,
                     });
                 }
-                let value_type = value_type.unwrap_or(Type::Unknown);
-                Ok(if matches!(expression, Expr::Hash(_)) {
-                    Type::HashValues(Box::new(value_type))
-                } else {
-                    Type::TreeValues(Box::new(value_type))
-                })
+                Ok(Type::HashValues(Box::new(
+                    value_type.unwrap_or(Type::Unknown),
+                )))
             }
             Expr::Unary { operator, operand } => {
                 let operand_type = self.analyze_expression(operand)?;
@@ -140,6 +144,15 @@ impl SemanticAnalyzer {
                 arguments,
             } => {
                 if self.enums.contains_key(enum_name) {
+                    if arguments
+                        .iter()
+                        .any(|argument| matches!(argument, Expr::Ref(_)))
+                    {
+                        return Err(self.error(
+                            DiagnosticCode::InvalidRefUsage,
+                            "`ref` arguments are not allowed for enum variants",
+                        ));
+                    }
                     self.enum_variant_type(enum_name, variant_name, arguments)
                 } else if self.variables.get(enum_name).is_none() {
                     Err(self.error(
@@ -163,8 +176,8 @@ impl SemanticAnalyzer {
             Expr::Field { target, name } => {
                 let target_type = self.analyze_expression(target)?;
                 match target_type {
-                    Type::Hash | Type::Tree | Type::Unknown => Ok(Type::Unknown),
-                    Type::HashValues(value) | Type::TreeValues(value) => Ok(*value),
+                    Type::Hash | Type::Unknown => Ok(Type::Unknown),
+                    Type::HashValues(value) => Ok(*value),
                     _ => Err(self.error(
                         DiagnosticCode::SemanticField,
                         format!("value has no field `{name}`"),
@@ -433,6 +446,13 @@ impl SemanticAnalyzer {
                 .iter()
                 .map(|argument| self.analyze_expression(argument))
                 .collect::<Result<Vec<_>, _>>()?;
+            self.validate_ref_arguments(
+                arguments,
+                &argument_types,
+                &vec![false; fields.len()],
+                name,
+                false,
+            )?;
             if fields.len() != argument_types.len() {
                 return Err(self.error(
                     DiagnosticCode::InvalidFunctionCall,
@@ -447,6 +467,84 @@ impl SemanticAnalyzer {
                 self.require_type(&field.field_type, actual)?;
             }
             return Ok(Type::Struct(self.struct_identities[name].clone()));
+        }
+        let user_function = self
+            .function_scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name))
+            .cloned();
+        let variable_function = match self.variables.get(name) {
+            Some(Type::Function {
+                parameters,
+                return_type,
+            }) => Some((parameters.clone(), return_type.clone())),
+            _ => None,
+        };
+        if user_function.is_some() || variable_function.is_some() {
+            let argument_types = arguments
+                .iter()
+                .map(|argument| self.analyze_expression(argument))
+                .collect::<Result<Vec<_>, _>>()?;
+            if let Some(function) = user_function {
+                self.validate_ref_arguments(
+                    arguments,
+                    &argument_types,
+                    &function.ref_parameters,
+                    name,
+                    true,
+                )?;
+                if function.parameters.len() != argument_types.len() {
+                    return Err(self.error(
+                        DiagnosticCode::InvalidFunctionCall,
+                        format!(
+                            "function `{name}` expects {} arguments, got {}",
+                            function.parameters.len(),
+                            argument_types.len()
+                        ),
+                    ));
+                }
+                for (expected, actual) in function.parameters.iter().zip(&argument_types) {
+                    if let Some(expected) = expected {
+                        self.require_type(expected, actual)?;
+                    }
+                }
+                return Ok(function.return_type.unwrap_or(Type::Unit));
+            }
+            let (parameters, return_type) =
+                variable_function.expect("function presence was checked above");
+            self.validate_ref_arguments(
+                arguments,
+                &argument_types,
+                &vec![false; parameters.len()],
+                name,
+                true,
+            )?;
+            if parameters.len() != argument_types.len() {
+                return Err(self.error(
+                    DiagnosticCode::InvalidFunctionCall,
+                    format!(
+                        "function `{name}` expects {} arguments, got {}",
+                        parameters.len(),
+                        argument_types.len()
+                    ),
+                ));
+            }
+            for (expected, actual) in parameters.iter().zip(&argument_types) {
+                if let Some(expected) = expected {
+                    self.require_type(expected, actual)?;
+                }
+            }
+            return Ok(return_type.as_deref().cloned().unwrap_or(Type::Unknown));
+        }
+        if arguments
+            .iter()
+            .any(|argument| matches!(argument, Expr::Ref(_)))
+        {
+            return Err(self.error(
+                DiagnosticCode::InvalidRefUsage,
+                "`ref` arguments are only allowed for declared `ref` parameters",
+            ));
         }
         if name == "Ask" {
             if !(1..=2).contains(&arguments.len()) {
@@ -481,13 +579,7 @@ impl SemanticAnalyzer {
             .iter()
             .map(|argument| self.analyze_expression(argument))
             .collect::<Result<Vec<_>, _>>()?;
-        let user_function = self
-            .function_scopes
-            .iter()
-            .rev()
-            .any(|scope| scope.contains_key(name))
-            || matches!(self.variables.get(name), Some(Type::Function { .. }));
-        if name == "enumerate" && !user_function {
+        if name == "enumerate" {
             self.expect_count(name, &argument_types, 1)?;
             let element_type = match &argument_types[0] {
                 Type::Array(element) | Type::List(element) | Type::Vector(element, _) => {
@@ -516,7 +608,7 @@ impl SemanticAnalyzer {
                 element_type,
             ]))));
         }
-        if name == "zip" && !user_function {
+        if name == "zip" {
             self.expect_count(name, &argument_types, 2)?;
             let element_type = |typ: &Type| match typ {
                 Type::Array(element) | Type::List(element) | Type::Vector(element, _) => {
@@ -555,10 +647,6 @@ impl SemanticAnalyzer {
             return Ok(Type::Array(Box::new(Type::Tuple(vec![left, right]))));
         }
         match name {
-            "print" => {
-                self.expect_count(name, &argument_types, 1)?;
-                Ok(Type::Unit)
-            }
             "assert" => {
                 if !(1..=2).contains(&argument_types.len()) {
                     return Err(self.error(
@@ -576,7 +664,7 @@ impl SemanticAnalyzer {
                 self.expect_count(name, &argument_types, 1)?;
                 Ok(Type::String)
             }
-            "length" | "count" => {
+            "length" => {
                 self.expect_count(name, &argument_types, 1)?;
                 self.require_collection_or_string(&argument_types[0])?;
                 Ok(Type::Int)
@@ -589,16 +677,13 @@ impl SemanticAnalyzer {
                 }
                 Ok(Type::Bool)
             }
-            "has_key" if !user_function => {
+            "has_key" => {
                 self.expect_count(name, &argument_types, 2)?;
-                if !matches!(
-                    argument_types[0],
-                    Type::Hash | Type::HashValues(_) | Type::Tree | Type::TreeValues(_)
-                ) {
+                if !matches!(argument_types[0], Type::Hash | Type::HashValues(_)) {
                     return Err(self.error(
                         DiagnosticCode::SemanticCollection,
                         format!(
-                            "`has_key` requires a Hash or Tree, found {}",
+                            "`has_key` requires a Hash, found {}",
                             argument_types[0].name()
                         ),
                     ));
@@ -606,20 +691,15 @@ impl SemanticAnalyzer {
                 self.require_type(&Type::String, &argument_types[1])?;
                 Ok(Type::Bool)
             }
-            "get" if !user_function => {
+            "get" => {
                 self.expect_count(name, &argument_types, 3)?;
                 let value_type = match &argument_types[0] {
-                    Type::HashValues(value_type) | Type::TreeValues(value_type) => {
-                        (**value_type).clone()
-                    }
-                    Type::Hash | Type::Tree | Type::Unknown => Type::Unknown,
+                    Type::HashValues(value_type) => (**value_type).clone(),
+                    Type::Hash | Type::Unknown => Type::Unknown,
                     _ => {
                         return Err(self.error(
                             DiagnosticCode::SemanticCollection,
-                            format!(
-                                "`get` requires a Hash or Tree, found {}",
-                                argument_types[0].name()
-                            ),
+                            format!("`get` requires a Hash, found {}", argument_types[0].name()),
                         ));
                     }
                 };
@@ -631,16 +711,13 @@ impl SemanticAnalyzer {
                     Ok(value_type)
                 }
             }
-            "without_key" if !user_function => {
+            "without_key" => {
                 self.expect_count(name, &argument_types, 2)?;
-                if !matches!(
-                    argument_types[0],
-                    Type::Hash | Type::HashValues(_) | Type::Tree | Type::TreeValues(_)
-                ) {
+                if !matches!(argument_types[0], Type::Hash | Type::HashValues(_)) {
                     return Err(self.error(
                         DiagnosticCode::SemanticCollection,
                         format!(
-                            "`without_key` requires a Hash or Tree, found {}",
+                            "`without_key` requires a Hash, found {}",
                             argument_types[0].name()
                         ),
                     ));
@@ -648,16 +725,13 @@ impl SemanticAnalyzer {
                 self.require_type(&Type::String, &argument_types[1])?;
                 Ok(argument_types[0].clone())
             }
-            "select_keys" if !user_function => {
+            "select_keys" => {
                 self.expect_count(name, &argument_types, 2)?;
-                if !matches!(
-                    argument_types[0],
-                    Type::Hash | Type::HashValues(_) | Type::Tree | Type::TreeValues(_)
-                ) {
+                if !matches!(argument_types[0], Type::Hash | Type::HashValues(_)) {
                     return Err(self.error(
                         DiagnosticCode::SemanticCollection,
                         format!(
-                            "`select_keys` requires a Hash or Tree, found {}",
+                            "`select_keys` requires a Hash, found {}",
                             argument_types[0].name()
                         ),
                     ));
@@ -684,34 +758,26 @@ impl SemanticAnalyzer {
                 }
                 Ok(argument_types[0].clone())
             }
-            "keys" if !user_function => {
+            "keys" => {
                 self.expect_count(name, &argument_types, 1)?;
-                if !matches!(
-                    argument_types[0],
-                    Type::Hash | Type::HashValues(_) | Type::Tree | Type::TreeValues(_)
-                ) {
+                if !matches!(argument_types[0], Type::Hash | Type::HashValues(_)) {
                     return Err(self.error(
                         DiagnosticCode::SemanticCollection,
-                        format!(
-                            "`keys` requires a Hash or Tree, found {}",
-                            argument_types[0].name()
-                        ),
+                        format!("`keys` requires a Hash, found {}", argument_types[0].name()),
                     ));
                 }
                 Ok(Type::Array(Box::new(Type::String)))
             }
-            "values" if !user_function => {
+            "values" => {
                 self.expect_count(name, &argument_types, 1)?;
                 let value_type = match &argument_types[0] {
-                    Type::HashValues(value_type) | Type::TreeValues(value_type) => {
-                        (**value_type).clone()
-                    }
-                    Type::Hash | Type::Tree | Type::Unknown => Type::Unknown,
+                    Type::HashValues(value_type) => (**value_type).clone(),
+                    Type::Hash | Type::Unknown => Type::Unknown,
                     _ => {
                         return Err(self.error(
                             DiagnosticCode::SemanticCollection,
                             format!(
-                                "`values` requires a Hash or Tree, found {}",
+                                "`values` requires a Hash, found {}",
                                 argument_types[0].name()
                             ),
                         ));
@@ -719,18 +785,16 @@ impl SemanticAnalyzer {
                 };
                 Ok(Type::Array(Box::new(value_type)))
             }
-            "entries" if !user_function => {
+            "entries" => {
                 self.expect_count(name, &argument_types, 1)?;
                 let value_type = match &argument_types[0] {
-                    Type::HashValues(value_type) | Type::TreeValues(value_type) => {
-                        (**value_type).clone()
-                    }
-                    Type::Hash | Type::Tree | Type::Unknown => Type::Unknown,
+                    Type::HashValues(value_type) => (**value_type).clone(),
+                    Type::Hash | Type::Unknown => Type::Unknown,
                     _ => {
                         return Err(self.error(
                             DiagnosticCode::SemanticCollection,
                             format!(
-                                "`entries` requires a Hash or Tree, found {}",
+                                "`entries` requires a Hash, found {}",
                                 argument_types[0].name()
                             ),
                         ));
@@ -766,6 +830,56 @@ impl SemanticAnalyzer {
                 self.expect_count(name, &argument_types, 1)?;
                 self.require_type(&Type::String, &argument_types[0])?;
                 Ok(Type::String)
+            }
+            "parse_json" => {
+                self.expect_count(name, &argument_types, 1)?;
+                self.require_type(&Type::String, &argument_types[0])?;
+                Ok(Type::Unknown)
+            }
+            "read_json" => {
+                self.expect_count(name, &argument_types, 1)?;
+                self.require_type(&Type::String, &argument_types[0])?;
+                Ok(Type::Unknown)
+            }
+            "read_json_lines" => {
+                self.expect_count(name, &argument_types, 1)?;
+                self.require_type(&Type::String, &argument_types[0])?;
+                Ok(Type::Array(Box::new(Type::Unknown)))
+            }
+            "to_json" | "to_json_pretty" => {
+                self.expect_count(name, &argument_types, 1)?;
+                Ok(Type::String)
+            }
+            "write_json" | "write_json_pretty" => {
+                self.expect_count(name, &argument_types, 2)?;
+                self.require_type(&Type::String, &argument_types[0])?;
+                Ok(Type::Unit)
+            }
+            "write_json_lines" => {
+                self.expect_count(name, &argument_types, 2)?;
+                self.require_type(&Type::String, &argument_types[0])?;
+                if !matches!(
+                    argument_types[1],
+                    Type::Array(_)
+                        | Type::List(_)
+                        | Type::Tuple(_)
+                        | Type::Vector(_, _)
+                        | Type::Unknown
+                ) {
+                    return Err(self.error(
+                        DiagnosticCode::SemanticCollection,
+                        format!(
+                            "`write_json_lines` expects an Array, List, or Tuple, found {}",
+                            argument_types[1].name()
+                        ),
+                    ));
+                }
+                Ok(Type::Unit)
+            }
+            "append_json_line" => {
+                self.expect_count(name, &argument_types, 2)?;
+                self.require_type(&Type::String, &argument_types[0])?;
+                Ok(Type::Unit)
             }
             "write_file" => {
                 self.expect_count(name, &argument_types, 2)?;
@@ -1169,6 +1283,39 @@ impl SemanticAnalyzer {
                 }
                 Ok(Type::String)
             }
+            "regex_find_all" => {
+                self.expect_count(name, &argument_types, 2)?;
+                self.require_type(&Type::String, &argument_types[0])?;
+                self.require_type(&Type::String, &argument_types[1])?;
+                Ok(Type::Array(Box::new(Type::String)))
+            }
+            "regex_replace" => {
+                self.expect_count(name, &argument_types, 3)?;
+                for argument in &argument_types {
+                    self.require_type(&Type::String, argument)?;
+                }
+                Ok(Type::String)
+            }
+            "score_rules" => {
+                self.expect_count(name, &argument_types, 1)?;
+                if !matches!(
+                    argument_types[0],
+                    Type::Array(_)
+                        | Type::List(_)
+                        | Type::Vector(_, _)
+                        | Type::Tuple(_)
+                        | Type::Unknown
+                ) {
+                    return Err(self.error(
+                        DiagnosticCode::SemanticCollection,
+                        format!(
+                            "`score_rules` expects an Array, List, or Tuple, found {}",
+                            argument_types[0].name()
+                        ),
+                    ));
+                }
+                Ok(Type::Hash)
+            }
             "starts_with" | "ends_with" => {
                 self.expect_count(name, &argument_types, 2)?;
                 for argument in &argument_types {
@@ -1304,6 +1451,7 @@ impl SemanticAnalyzer {
             let Some(signature) = self
                 .messages
                 .get(&(type_identity.clone(), message.to_owned()))
+                .cloned()
             else {
                 return Err(self.error(
                     DiagnosticCode::InvalidFunctionCall,
@@ -1313,6 +1461,13 @@ impl SemanticAnalyzer {
                     ),
                 ));
             };
+            self.validate_ref_arguments(
+                arguments,
+                &argument_types,
+                &signature.ref_parameters,
+                message,
+                true,
+            )?;
             if signature.parameters.len() != argument_types.len() {
                 return Err(self.error(
                     DiagnosticCode::InvalidFunctionCall,
@@ -1323,6 +1478,7 @@ impl SemanticAnalyzer {
                     ),
                 ));
             }
+
             for (expected, actual) in signature.parameters.iter().zip(&argument_types) {
                 if let Some(expected) = expected {
                     self.require_type(expected, actual)?;
@@ -1330,7 +1486,7 @@ impl SemanticAnalyzer {
             }
             return Ok(signature.return_type.clone().unwrap_or(Type::Unknown));
         }
-        let (parameters, return_type) = if let Some(function) = self
+        let (parameters, return_type, ref_parameters, receiver_ref) = if let Some(function) = self
             .function_scopes
             .iter()
             .rev()
@@ -1339,6 +1495,13 @@ impl SemanticAnalyzer {
             (
                 function.parameters.clone(),
                 function.return_type.clone().unwrap_or(Type::Unit),
+                function
+                    .ref_parameters
+                    .iter()
+                    .skip(1)
+                    .copied()
+                    .collect::<Vec<_>>(),
+                function.ref_parameters.first().copied().unwrap_or(false),
             )
         } else if let Some(Type::Function {
             parameters,
@@ -1351,6 +1514,8 @@ impl SemanticAnalyzer {
                     .map(|parameter| parameter.as_deref().cloned())
                     .collect(),
                 return_type.as_deref().cloned().unwrap_or(Type::Unknown),
+                vec![false; parameters.len().saturating_sub(1)],
+                false,
             )
         } else if receiver_type == Type::Unknown
             || matches!(self.variables.get(message), Some(&Type::Unknown))
@@ -1368,6 +1533,12 @@ impl SemanticAnalyzer {
         let actual_types = std::iter::once(&receiver_type)
             .chain(argument_types.iter())
             .collect::<Vec<_>>();
+        if Self::is_mutable_collection_type(&receiver_type) && !receiver_ref {
+            return Err(self.error(
+                DiagnosticCode::InvalidFunctionCall,
+                "collection message receivers require a `ref` parameter",
+            ));
+        }
         if parameters.len() != actual_types.len() {
             return Err(self.error(
                 DiagnosticCode::InvalidFunctionCall,
@@ -1378,12 +1549,73 @@ impl SemanticAnalyzer {
                 ),
             ));
         }
+        self.validate_ref_arguments(arguments, &argument_types, &ref_parameters, message, true)?;
         for (expected, actual) in parameters.iter().zip(actual_types) {
             if let Some(expected) = expected {
                 self.require_type(expected, actual)?;
             }
         }
         Ok(return_type)
+    }
+
+    fn validate_ref_arguments(
+        &self,
+        arguments: &[Expr],
+        argument_types: &[Type],
+        expected: &[bool],
+        callee: &str,
+        require_collection_ref: bool,
+    ) -> Result<(), SimplyError> {
+        for (index, argument) in arguments.iter().enumerate() {
+            let marked = matches!(argument, Expr::Ref(_));
+            let required = expected.get(index).copied().unwrap_or(false);
+            if marked != required {
+                return Err(self.error(
+                    DiagnosticCode::InvalidRefUsage,
+                    format!(
+                        "argument {} to `{callee}` {} `ref`",
+                        index + 1,
+                        if required { "requires" } else { "must not use" }
+                    ),
+                ));
+            }
+            if !required
+                && require_collection_ref
+                && argument_types
+                    .get(index)
+                    .is_some_and(Self::is_mutable_collection_type)
+            {
+                return Err(self.error(
+                    DiagnosticCode::InvalidRefUsage,
+                    format!(
+                        "collection argument {} to `{callee}` requires a `ref` parameter",
+                        index + 1
+                    ),
+                ));
+            }
+            if !required
+                && self
+                    .ref_parameter_scopes
+                    .iter()
+                    .any(|scope| !scope.is_empty())
+            {
+                let actual_type = argument_types.get(index).unwrap_or(&Type::Unknown);
+                if self.expression_contains_borrowed_collection(
+                    argument,
+                    actual_type,
+                    &self.ref_parameter_scopes,
+                )? {
+                    return Err(self.error(
+                        DiagnosticCode::InvalidRefUsage,
+                        format!(
+                            "a `ref` parameter cannot escape through argument {} to `{callee}`",
+                            index + 1
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn enum_variant_type(

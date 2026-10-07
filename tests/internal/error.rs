@@ -37,7 +37,7 @@ fn renders_canonical_codes_instead_of_legacy_aliases() {
 #[test]
 fn diagnostic_codes_are_unique() {
     let mut unique = std::collections::HashSet::new();
-    assert_eq!(DiagnosticCode::ALL.len(), 40);
+    assert_eq!(DiagnosticCode::ALL.len(), 41);
     assert!(
         DiagnosticCode::ALL
             .iter()

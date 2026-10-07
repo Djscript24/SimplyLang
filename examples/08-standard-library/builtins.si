@@ -5,7 +5,6 @@
 numbers is range(1, 5)
 Sayln numbers
 Sayln length(numbers)
-Sayln count(numbers)
 Sayln length("Simply")
 
 open "imported-values.si" as imported

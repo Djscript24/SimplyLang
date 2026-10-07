@@ -140,15 +140,25 @@ impl Evaluator {
                 let mut function_parameters = definition
                     .fields
                     .iter()
-                    .map(|field| (field.name.clone(), Some(field.field_type.clone()), true))
+                    .map(|field| {
+                        (
+                            field.name.clone(),
+                            Some(field.field_type.clone()),
+                            true,
+                            false,
+                        )
+                    })
                     .collect::<Vec<_>>();
-                function_parameters.extend(parameters.iter().map(|(parameter, typ, mutable)| {
-                    (
-                        parameter.clone(),
-                        typ.as_ref().map(|typ| self.resolve_type_identity(typ)),
-                        *mutable,
-                    )
-                }));
+                function_parameters.extend(parameters.iter().map(
+                    |(parameter, typ, mutable, by_ref)| {
+                        (
+                            parameter.clone(),
+                            typ.as_ref().map(|typ| self.resolve_type_identity(typ)),
+                            *mutable,
+                            *by_ref,
+                        )
+                    },
+                ));
                 let function = self.track_function(FunctionValue {
                     name: None,
                     parameters: function_parameters,

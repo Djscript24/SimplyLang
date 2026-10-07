@@ -1,0 +1,16 @@
+# references.si — explicit collection aliases and read-only ref parameters
+# A ref parameter reads an existing collection through a temporary, zero-copy handle.
+fn first(ref values as List[Int]) gives Int:
+    return values[0]
+end
+
+mut numbers is list [10, 20, 30]
+Sayln first(ref numbers)
+
+numbers[1] -> 99
+Sayln numbers
+
+profile is hash:
+    scores is list [17, 23]
+end
+Sayln first(ref profile["scores"])

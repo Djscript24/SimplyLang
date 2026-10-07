@@ -1,0 +1,17 @@
+# Explainable weighted rules.
+# Each rule is (label, condition, Int weight).
+applicant is hash:
+    income is 72000
+    debt is 12000
+    late_payments is 0
+end
+
+review is score_rules([
+    ("income above 60000", applicant["income"] >= 60000, 3),
+    ("debt below 10000", applicant["debt"] < 10000, 2),
+    ("no late payments", applicant["late_payments"] == 0, 4)
+])
+
+Sayln review["score"]
+Sayln review["matched"]
+Sayln review["unmatched"]

@@ -35,10 +35,10 @@ impl SemanticAnalyzer {
                     _ => Ok(Type::Unknown),
                 }
             }
-            Type::Hash | Type::Tree | Type::HashValues(_) | Type::TreeValues(_) => {
+            Type::Hash | Type::HashValues(_) => {
                 self.require_type(&Type::String, index)?;
                 Ok(match target {
-                    Type::HashValues(value) | Type::TreeValues(value) => (**value).clone(),
+                    Type::HashValues(value) => (**value).clone(),
                     _ => Type::Unknown,
                 })
             }
@@ -73,8 +73,8 @@ impl SemanticAnalyzer {
             }
             Type::Range => Some(Type::Int),
             Type::Tuple(types) => Some(types.first().cloned().unwrap_or(Type::Unknown)),
-            Type::Hash | Type::Tree => Some(Type::Unknown),
-            Type::HashValues(value) | Type::TreeValues(value) => Some((**value).clone()),
+            Type::Hash => Some(Type::Unknown),
+            Type::HashValues(value) => Some((**value).clone()),
             Type::Unknown => Some(Type::Unknown),
             _ => None,
         }
@@ -92,9 +92,7 @@ impl SemanticAnalyzer {
                 | Type::TypedMatrix(_, _, _)
                 | Type::Tuple(_)
                 | Type::Hash
-                | Type::Tree
                 | Type::HashValues(_)
-                | Type::TreeValues(_)
                 | Type::Unknown
         ) {
             Ok(())
@@ -111,10 +109,8 @@ impl SemanticAnalyzer {
             Type::Array(element) | Type::List(element) | Type::Vector(element, _) => {
                 self.require_type(&Type::String, element)
             }
-            Type::Hash | Type::Tree => Ok(()),
-            Type::HashValues(element) | Type::TreeValues(element) => {
-                self.require_type(&Type::String, element)
-            }
+            Type::Hash => Ok(()),
+            Type::HashValues(element) => self.require_type(&Type::String, element),
             Type::Tuple(types) => {
                 for element in types {
                     self.require_type(&Type::String, element)?;
@@ -140,10 +136,8 @@ impl SemanticAnalyzer {
                 }
                 Ok(())
             }
-            Type::Hash | Type::Tree | Type::Unknown => Ok(()),
-            Type::HashValues(element) | Type::TreeValues(element) => {
-                self.require_type(&Type::Bool, element)
-            }
+            Type::Hash | Type::Unknown => Ok(()),
+            Type::HashValues(element) => self.require_type(&Type::Bool, element),
             _ => Err(self.error(
                 DiagnosticCode::SemanticCollection,
                 format!("expected a boolean collection, found {}", typ.name()),
@@ -237,7 +231,7 @@ impl SemanticAnalyzer {
             Type::Array(element) | Type::List(element) | Type::Vector(element, _) => {
                 self.require_numeric(element)
             }
-            Type::HashValues(element) | Type::TreeValues(element) => self.require_numeric(element),
+            Type::HashValues(element) => self.require_numeric(element),
             Type::Unknown => Ok(()),
             _ => Err(self.error(
                 DiagnosticCode::SemanticCollection,

@@ -16,29 +16,309 @@ fn enforces_float_and_matrix_runtime_contracts() {
 }
 
 #[test]
-fn collection_aliases_detach_before_mutation() {
+fn collection_aliases_observe_mutation_through_mutable_bindings() {
     let (success, stdout) = run_source_stdout(
         "values is list [1]\nmut copy is values\ncopy add 2\nSayln values\nSayln copy\n",
     );
     assert!(success);
-    assert_eq!(stdout.lines().collect::<Vec<_>>(), ["[1]", "[1, 2]"]);
+    assert_eq!(stdout.lines().collect::<Vec<_>>(), ["[1, 2]", "[1, 2]"]);
 
     let (success, stdout) = run_source_stdout(
         "profile is hash:\n    name is \"Ada\"\nend\nmut copy is profile\ncopy[\"role\"] -> \"builder\"\nSayln profile\nSayln copy\n",
     );
     assert!(success);
+    assert!(stdout.lines().all(|line| line.contains("role")));
+}
+
+#[test]
+fn ref_markers_are_rejected_outside_function_parameters_and_calls() {
+    for source in [
+        "mut alias is ref values\n",
+        "alias -> ref values\n",
+        "enum Result:\n    Some as List[Int]\nend\nResult::Some(ref values)\n",
+        "on List receive inspect(ref value as List[Int]):\n    return 1\nend\n",
+        "values :: inspect(ref other)\n",
+    ] {
+        let (valid, _, error) = check_source(source);
+        assert!(!valid, "non-function use accepted a `ref` marker");
+        assert!(error.contains("error[E.semantic.ref.invalid]"), "{error}");
+    }
+}
+
+#[test]
+fn nested_collection_mutation_updates_all_aliases() {
+    let source = r#"record is hash:
+    details is hash:
+        scores is list [10, 20]
+    end
+end
+mut copy is record
+copy["details"]["scores"][0] -> 99
+Sayln record["details"]["scores"][0]
+Sayln copy["details"]["scores"][0]
+"#;
+    let (success, output) = run_source_stdout(source);
+    assert!(success, "nested collection mutation failed: {output}");
+    assert_eq!(output, "99\n99\n");
+}
+
+#[test]
+fn ref_collection_parameters_are_paired_read_only_and_non_escaping() {
+    let source = r#"fn first(ref values as List[Int]) gives Int:
+    return values[0]
+end
+items is list [42]
+Sayln first(ref items)
+profile is hash:
+    scores is list [17, 23]
+end
+Sayln first(ref profile["scores"])
+"#;
+    let (success, output) = run_source_stdout(source);
     assert!(
-        stdout
-            .lines()
-            .next()
-            .is_some_and(|line| !line.contains("role"))
+        success,
+        "read-only ref call or nested view failed: {output}"
     );
+    assert_eq!(output, "42\n17\n");
+
+    for source in [
+        "fn first(ref values as List[Int]) gives Int:\n    return values[0]\nend\nitems is list [1]\nfirst(items)\n",
+        "fn first(value as Int) gives Int:\n    return value\nend\nfirst(ref 1)\n",
+    ] {
+        let (valid, _, error) = check_source(source);
+        assert!(!valid, "incorrect ref marker pairing was accepted");
+        assert!(error.contains("error[E.semantic.ref.invalid]"), "{error}");
+        assert!(error.contains("ref"), "{error}");
+    }
+
+    let (valid, _, error) =
+        check_source("fn first(values as List[Int]) gives Int:\n    return values[0]\nend\n");
+    assert!(!valid, "a collection parameter without `ref` was accepted");
+    assert!(error.contains("must be declared `ref`"), "{error}");
+
+    let (valid, _, error) = check_source(
+        "fn first(values) gives Int:\n    return 0\nend\nitems is list [1]\nfirst(items)\n",
+    );
+    assert!(!valid, "an untyped parameter accepted a collection value");
+    assert!(error.contains("requires a `ref` parameter"), "{error}");
+
+    let (valid, _, error) =
+        check_source("fn update(ref values as List[Int]) gives Unit:\n    values[0] -> 7\nend\n");
+    assert!(!valid, "a ref parameter was mutable");
+    assert!(error.contains("error[E.semantic.ref.invalid]"), "{error}");
+    assert!(error.contains("read-only and cannot be mutated"), "{error}");
+
+    for source in [
+        "fn escape(ref values as List[Int]) gives List[Int]:\n    return values\nend\n",
+        "fn escape(ref values as List[Int]) gives Int:\n    copy is values\n    return 0\nend\n",
+        "fn escape(ref values as List[Int]) gives Int:\n    fn nested() gives Int:\n        return values[0]\n    end\n    return 0\nend\n",
+        "fn escape(ref values as List[List[Int]]) gives List[Int]:\n    for item in values:\n        return item\n    end\n    return [0]\nend\n",
+    ] {
+        let (valid, _, error) = check_source(source);
+        assert!(!valid, "a ref parameter escaped its call");
+        assert!(error.contains("error[E.semantic.ref.invalid]"), "{error}");
+        assert!(
+            error.contains("ref parameter") || error.contains("ref` parameter"),
+            "{error}"
+        );
+    }
+
+    let (valid, _, error) = check_source(
+        "mut stash is list []\nfn leak(ref values as List[Int]) gives Unit:\n    stash add values\nend\n",
+    );
+    assert!(!valid, "a ref parameter escaped through list add");
+    assert!(error.contains("error[E.semantic.ref.invalid]"), "{error}");
+    assert!(error.contains("ref` parameter"), "{error}");
+}
+
+#[test]
+fn ref_parameters_allow_nested_functions_that_do_not_capture_them() {
+    let source = r#"fn first_plus_one(ref values as List[Int]) gives Int:
+    fn increment(value as Int) gives Int:
+        return value + 1
+    end
+    return increment(values[0])
+end
+items is list [41]
+Sayln first_plus_one(ref items)
+"#;
+    let (success, output) = run_source_stdout(source);
     assert!(
-        stdout
-            .lines()
-            .nth(1)
-            .is_some_and(|line| line.contains("role"))
+        success,
+        "non-capturing nested function was rejected: {output}"
     );
+    assert_eq!(output, "42\n");
+}
+
+#[test]
+fn ref_values_can_be_used_to_build_independent_key_collections() {
+    let source = r#"fn profile_keys(ref profile as Hash) gives Array[String]:
+    return keys(profile)
+end
+profile is hash:
+    name is "Ada"
+    role is "builder"
+end
+names is profile_keys(ref profile)
+Sayln names
+"#;
+    let (success, output) = run_source_stdout(source);
+    assert!(
+        success,
+        "independent result was rejected as a ref escape: {output}"
+    );
+    assert_eq!(output, "[name, role]\n");
+}
+
+#[test]
+fn ref_scalar_reads_can_be_copied_into_escaping_collections() {
+    let source = r#"fn first_snapshot(ref values as List[Int]) gives List[Int]:
+    return list [values[0]]
+end
+items is list [42, 99]
+snapshot is first_snapshot(ref items)
+Sayln snapshot
+"#;
+    let (success, output) = run_source_stdout(source);
+    assert!(
+        success,
+        "a fresh collection of copied scalar values was rejected: {output}"
+    );
+    assert_eq!(output, "[42]\n");
+
+    let source = r#"fn nested_snapshot(ref values as List[List[Int]]) gives List[List[Int]]:
+    return list [values[0]]
+end
+items is list [list [42]]
+nested_snapshot(ref items)
+"#;
+    let (valid, _, error) = check_source(source);
+    assert!(
+        !valid,
+        "a borrowed nested collection escaped inside a new list"
+    );
+    assert!(error.contains("error[E.semantic.ref.invalid]"), "{error}");
+}
+
+#[test]
+fn ref_can_flow_through_fresh_builtin_collections_without_escaping_nested_handles() {
+    let source = r#"fn reversed(ref values as List[Int]) gives List[Int]:
+    return reverse(values)
+end
+items is list [10, 20, 30]
+Sayln reversed(ref items)
+"#;
+    let (success, output) = run_source_stdout(source);
+    assert!(
+        success,
+        "fresh reversed values were treated as borrowed: {output}"
+    );
+    assert_eq!(output, "[30, 20, 10]\n");
+
+    let source = r#"fn reverse_nested(ref values as List[List[Int]]) gives List[List[Int]]:
+    return reverse(values)
+end
+items is list [list [10]]
+reverse_nested(ref items)
+"#;
+    let (valid, _, error) = check_source(source);
+    assert!(!valid, "reverse let a nested borrowed collection escape");
+    assert!(error.contains("error[E.semantic.ref.invalid]"), "{error}");
+}
+
+#[test]
+fn invalid_ref_usage_uses_one_diagnostic_and_marks_its_source_location() {
+    for (source, line, column, detail) in [
+        (
+            "mut values is list [1]\nvalues is ref values\n",
+            2,
+            11,
+            "`ref` cannot be stored in a binding",
+        ),
+        (
+            "fn invalid() gives List[Int]:\n    return ref values\nend\n",
+            2,
+            12,
+            "`ref` cannot be returned from a function",
+        ),
+        (
+            "fn escape(ref values as List[Int]) gives List[Int]:\n    return values\nend\n",
+            2,
+            5,
+            "cannot escape through a return value",
+        ),
+        (
+            "fn store(ref values as List[Int]) gives Unit:\n    copy is values\nend\n",
+            2,
+            5,
+            "cannot escape through a variable binding",
+        ),
+        (
+            "fn capture(ref values as List[Int]) gives Unit:\n    fn nested() gives Int:\n        return values[0]\n    end\nend\n",
+            2,
+            5,
+            "closure cannot capture `ref` parameter `values`",
+        ),
+        (
+            "fn mutate(ref values as List[Int]) gives Unit:\n    values[0] -> 2\nend\n",
+            2,
+            5,
+            "read-only and cannot be mutated",
+        ),
+        (
+            "fn mutate(ref values as List[Int]) gives Unit:\n    values add 2\nend\n",
+            2,
+            5,
+            "read-only and cannot be mutated",
+        ),
+        (
+            "fn reassign(ref values as List[Int]) gives Unit:\n    values -> list [2]\nend\n",
+            2,
+            5,
+            "read-only and cannot be reassigned",
+        ),
+    ] {
+        let (valid, _, error) = check_source(source);
+        assert!(!valid, "invalid `ref` usage was accepted");
+        assert!(error.contains("error[E.semantic.ref.invalid]"), "{error}");
+        assert!(error.contains("(Semantic error)"), "{error}");
+        assert!(error.contains(&format!(":{line}:{column}")), "{error}");
+        assert!(error.contains(detail), "{error}");
+    }
+}
+
+#[test]
+fn mutable_collection_cycles_remain_safe_in_the_evaluator_arena() {
+    let source = r#"mut first as Hash is hash:
+    value is 1
+end
+mut second as Hash is hash:
+    value is 1
+end
+first["self"] -> first
+second["self"] -> second
+Sayln first == second
+Sayln first
+mut items is [1]
+alias is items
+items[0] -> 2
+Sayln alias[0]
+"#;
+    let (success, output) = run_source_stdout(source);
+    assert!(success, "cyclic collection operations failed: {output}");
+    assert_eq!(output, "true\n{self: <cycle>, value: 1}\n2\n");
+}
+
+#[test]
+fn removing_nested_collections_does_not_hold_a_mutable_arena_borrow() {
+    let source = r#"mut values is list [list [1], list [2]]
+mut target is list [1]
+values remove target
+Sayln values
+"#;
+    let (success, output) = run_source_stdout(source);
+    assert!(success, "removing a nested collection failed: {output}");
+    assert_eq!(output, "[[2]]\n");
 }
 
 #[test]
@@ -91,12 +371,12 @@ fn runs_boolean_and_string_collection_builtins() {
 }
 
 #[test]
-fn hash_and_tree_keys_and_values_follow_deterministic_key_order() {
+fn hash_keys_and_values_follow_deterministic_key_order() {
     let source = "profile is hash:\n\
                       name is \"Ada\"\n\
                       age is 36\n\
                   end\n\
-                  scores is tree:\n\
+                  scores is hash:\n\
                       z is 3\n\
                       a is 1\n\
                   end\n\
@@ -130,8 +410,7 @@ fn hash_and_tree_keys_and_values_follow_deterministic_key_order() {
         let (valid, _, error) = check_source(source);
         assert!(!valid);
         assert!(
-            error.contains("requires a Hash or Tree")
-                || error.contains("expected String, found Int"),
+            error.contains("requires a Hash") || error.contains("expected String, found Int"),
             "{error}"
         );
     }
@@ -175,28 +454,28 @@ fn gets_map_values_or_lazy_defaults_with_type_checks() {
 }
 
 #[test]
-fn without_key_returns_an_independent_map_of_the_same_kind() {
+fn without_key_returns_an_independent_hash() {
     let source = "profile is hash:\n\
                       name is \"Ada\"\n\
                       role is \"builder\"\n\
                   end\n\
                   filtered is without_key(profile, \"role\")\n\
                   missing is without_key(filtered, \"unknown\")\n\
-                  catalog is tree:\n\
+                  catalog is hash:\n\
                       first is 1\n\
                       second is 2\n\
                   end\n\
-                  filtered_tree is without_key(catalog, \"first\")\n\
+                  filtered_map is without_key(catalog, \"first\")\n\
                   Sayln keys(filtered)\n\
                   Sayln keys(profile)\n\
                   Sayln keys(missing)\n\
-                  Sayln type_of(filtered_tree)\n\
-                  Sayln keys(filtered_tree)\n";
+                  Sayln type_of(filtered_map)\n\
+                  Sayln keys(filtered_map)\n";
     let (valid, _, error) = check_source(source);
     assert!(valid, "without_key did not type-check: {error}");
     let (success, output) = run_source_stdout(source);
     assert!(success, "without_key failed: {output}");
-    assert_eq!(output, "[name]\n[name, role]\n[name]\nTree\n[second]\n");
+    assert_eq!(output, "[name]\n[name, role]\n[name]\nHash\n[second]\n");
 
     for source in [
         "without_key([1], \"key\")\n",
@@ -205,37 +484,36 @@ fn without_key_returns_an_independent_map_of_the_same_kind() {
         let (valid, _, error) = check_source(source);
         assert!(!valid);
         assert!(
-            error.contains("requires a Hash or Tree")
-                || error.contains("expected String, found Int"),
+            error.contains("requires a Hash") || error.contains("expected String, found Int"),
             "{error}"
         );
     }
 }
 
 #[test]
-fn select_keys_filters_maps_without_changing_kind_or_source() {
+fn select_keys_filters_maps_without_changing_type_or_source() {
     let source = "profile is hash:\n\
                       name is \"Ada\"\n\
                       role is \"builder\"\n\
                       age is 36\n\
                   end\n\
                   selected is select_keys(profile, [\"role\", \"missing\", \"name\", \"role\"])\n\
-                  catalog is tree:\n\
+                  catalog is hash:\n\
                       first is 1\n\
                       second is 2\n\
                   end\n\
-                  selected_tree is select_keys(catalog, (\"second\", \"missing\"))\n\
+                  selected_map is select_keys(catalog, (\"second\", \"missing\"))\n\
                   Sayln entries(selected)\n\
                   Sayln keys(profile)\n\
-                  Sayln type_of(selected_tree)\n\
-                  Sayln entries(selected_tree)\n";
+                  Sayln type_of(selected_map)\n\
+                  Sayln entries(selected_map)\n";
     let (valid, _, error) = check_source(source);
     assert!(valid, "select_keys did not type-check: {error}");
     let (success, output) = run_source_stdout(source);
     assert!(success, "select_keys failed: {output}");
     assert_eq!(
         output,
-        "[[name, Ada], [role, builder]]\n[age, name, role]\nTree\n[[second, 2]]\n"
+        "[[name, Ada], [role, builder]]\n[age, name, role]\nHash\n[[second, 2]]\n"
     );
 
     for source in [
@@ -246,7 +524,7 @@ fn select_keys_filters_maps_without_changing_kind_or_source() {
         let (valid, _, error) = check_source(source);
         assert!(!valid);
         assert!(
-            error.contains("requires a Hash or Tree")
+            error.contains("requires a Hash")
                 || error.contains("expected String, found Int")
                 || error.contains("expects an array, list, or tuple of strings"),
             "{error}"
@@ -302,12 +580,10 @@ fn runs_collection_utility_builtins() {
 }
 
 #[test]
-fn count_call_remains_a_length_alias_and_is_distinct_from_pipeline_count() {
+fn length_measures_collections_and_pipeline_count_counts_survivors() {
     let source = "values is list [4, 5, 6]\n\
                   Sayln length(values)\n\
-                  Sayln count(values)\n\
                   Sayln length(\"aé\")\n\
-                  Sayln count(\"aé\")\n\
                   selected is pipeline:\n\
                       values\n\
                       where item > 4\n\
@@ -318,7 +594,7 @@ fn count_call_remains_a_length_alias_and_is_distinct_from_pipeline_count() {
     assert!(valid, "size/count distinction did not type-check: {error}");
     let (success, output) = run_source_stdout(source);
     assert!(success, "{output}");
-    assert_eq!(output, "3\n3\n2\n2\n2\n");
+    assert_eq!(output, "3\n2\n2\n");
 }
 
 #[test]
@@ -359,6 +635,29 @@ fn enumerate_checks_arguments_and_preserves_user_function_shadowing() {
     );
     assert!(success, "{output}");
     assert_eq!(output, "5\n");
+}
+
+#[test]
+fn user_functions_shadow_builtins_consistently() {
+    let source = "fn length(value as Int) gives Int:\n\
+                      return value + 2\n\
+                  end\n\
+                  fn count(value as Int) gives Int:\n\
+                      return value + 1\n\
+                  end\n\
+                  values is [3, 4]\n\
+                  Sayln length(5)\n\
+                  Sayln count(5)\n\
+                  selected is pipeline:\n\
+                      values\n\
+                      count\n\
+                  end\n\
+                  Sayln selected\n";
+    let (valid, _, error) = check_source(source);
+    assert!(valid, "shadowed builtin did not type-check: {error}");
+    let (success, output) = run_source_stdout(source);
+    assert!(success, "{output}");
+    assert_eq!(output, "7\n6\n2\n");
 }
 
 #[test]
@@ -680,7 +979,7 @@ fn runs_collection_inspection_builtins() {
     assert!(output.contains("true"));
     assert!(output.contains("false"));
     assert!(output.contains("List"));
-    assert!(output.contains("Printed with the print function"));
+    assert!(output.contains("Output uses Sayln"));
 }
 
 #[test]
@@ -840,34 +1139,33 @@ fn stepped_ranges_are_lazy_and_support_both_directions() {
 }
 
 #[test]
-fn indexes_tree_values_consistently_with_hash_values() {
-    let (success, error) =
-        run_source("profile is tree:\n    name is \"Ada\"\nend\nSayln profile[\"name\"]\n");
-    assert!(success, "unexpected tree index error: {error}");
-}
-
-#[test]
-fn hash_and_tree_values_retain_indexed_value_types() {
-    for source in [
-        "profile is hash:\n    name is \"Ada\"\nend\nSayln profile[\"name\"] + 1\n",
-        "profile is tree:\n    name is \"Ada\"\nend\nSayln profile[\"name\"] + 1\n",
-    ] {
-        let (success, _, error) = check_source(source);
-        assert!(!success, "invalid collection value type was accepted");
-        assert!(
-            error.contains("expected") || error.contains("TypeMismatch"),
-            "{error}"
-        );
-    }
-
-    let (success, _, error) = check_source(
-        "mut profile is tree:\n    name is \"Ada\"\nend\nprofile[\"name\"] -> \"Lin\"\n",
-    );
+fn hash_indexed_writes_follow_binding_mutability() {
+    let source = r#"mut profile is hash:
+    name is "Ada"
+end
+profile["name"] -> "Lin"
+Sayln profile.name
+"#;
+    let (valid, _, error) = check_source(source);
     assert!(
-        !success,
-        "Tree indexed writes must be rejected during checking"
+        valid,
+        "mutable hash write did not type-check:\n{source}\n{error}"
     );
-    assert!(error.contains("is not mutable"), "{error}");
+    let (success, output) = run_source_stdout(source);
+    assert!(success, "{output}");
+    assert_eq!(output, "Lin\n");
+
+    let source = r#"profile is hash:
+    name is "Ada"
+end
+profile["name"] -> "Lin"
+"#;
+    let (valid, _, error) = check_source(source);
+    assert!(!valid, "immutable hash write was accepted");
+    assert!(
+        error.contains("cannot mutate immutable variable"),
+        "{error}"
+    );
 }
 
 #[test]

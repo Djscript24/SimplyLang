@@ -313,7 +313,7 @@ impl Evaluator {
                 ),
             ));
         }
-        for ((parameter, expected, _), value) in function_value.parameters.iter().zip(&values) {
+        for ((parameter, expected, _, _), value) in function_value.parameters.iter().zip(&values) {
             if let Some(expected) = expected {
                 self.ensure_type(value, expected, parameter)?;
             }
@@ -378,11 +378,14 @@ impl Evaluator {
             }
             self.push_scope();
             scopes_pushed += 1;
-            for ((parameter, _, mutable), value) in function_value.parameters.iter().zip(values) {
+            for ((parameter, _, mutable, by_ref), value) in
+                function_value.parameters.iter().zip(values)
+            {
+                let mutable = *mutable && !*by_ref;
                 self.variable_types
-                    .define(parameter.clone(), self.type_of_value(&value), *mutable);
+                    .define(parameter.clone(), self.type_of_value(&value), mutable);
                 self.scopes
-                    .define(parameter.clone(), value, *mutable)
+                    .define(parameter.clone(), value, mutable)
                     .map_err(|error| {
                         self.runtime_error_with_code(DiagnosticCode::DuplicateDeclaration, error)
                     })?;

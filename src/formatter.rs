@@ -181,8 +181,19 @@ impl Formatter {
                 &Expr::Identifier(format!("{} -> {}", render_pattern(pattern), expr(value))),
                 indent,
             ),
-            Stmt::SetIndex { name, index, value } => self.expression_line(
-                &Expr::Identifier(format!("{name}[{}] is {}", expr(index), expr(value))),
+            Stmt::SetIndex {
+                name,
+                indices,
+                value,
+            } => self.expression_line(
+                &Expr::Identifier(format!(
+                    "{name}{} is {}",
+                    indices
+                        .iter()
+                        .map(|index| format!("[{}]", expr(index)))
+                        .collect::<String>(),
+                    expr(value)
+                )),
                 indent,
             ),
             Stmt::Destructure {
@@ -266,7 +277,7 @@ impl Formatter {
                 return_type,
                 body,
             } => {
-                let mut header = format!("fn {name}({})", parameters_text(parameters));
+                let mut header = format!("fn {name}({})", function_parameters_text(parameters));
                 if let Some(typ) = return_type {
                     header.push_str(" gives ");
                     header.push_str(&type_name(typ));
@@ -308,7 +319,7 @@ impl Formatter {
                 self.line(
                     &format!(
                         "on {receiver_type} receive {name}({}):",
-                        parameters_text(parameters)
+                        function_parameters_text(parameters)
                     ),
                     indent,
                     None,
@@ -544,7 +555,6 @@ fn is_match_arm_block_header(line: &str) -> bool {
         "type ",
         "enum ",
         "hash:",
-        "tree:",
         "pipeline:",
         "flow ",
         "partition ",
@@ -564,7 +574,6 @@ fn is_nested_block_header(line: &str) -> bool {
             "type ",
             "enum ",
             "hash:",
-            "tree:",
             "pipeline:",
             "flow ",
             "partition ",
@@ -593,11 +602,13 @@ fn compact_code(line: &str) -> String {
     compact
 }
 
-fn parameters_text(parameters: &[(String, Option<Type>, bool)]) -> String {
+fn function_parameters_text(parameters: &[(String, Option<Type>, bool, bool)]) -> String {
     parameters
         .iter()
-        .map(|(name, typ, mutable)| {
-            let mut text = if *mutable {
+        .map(|(name, typ, mutable, by_ref)| {
+            let mut text = if *by_ref {
+                format!("ref {name}")
+            } else if *mutable {
                 format!("mut {name}")
             } else {
                 name.clone()
@@ -715,6 +726,7 @@ fn expr_prec(expression: &Expr, parent: u8) -> String {
     let (text, own) = match expression {
         Expr::Literal(value) => (literal(value), 10),
         Expr::Identifier(name) => (name.clone(), 10),
+        Expr::Ref(value) => (format!("ref {}", expr_prec(value, 0)), 10),
         Expr::Unary { operator, operand } => {
             let (symbol, precedence) = match operator {
                 UnaryOperator::Not => ("not ", 7),
@@ -802,14 +814,6 @@ fn expr_prec(expression: &Expr, parent: u8) -> String {
         Expr::Field { target, name } => (format!("{}.{}", expr_prec(target, 9), name), 9),
         Expr::Hash(values) => {
             let mut text = String::from("hash:");
-            for (name, value) in values {
-                text.push_str(&format!("\n    {name} is {}", expr(value)));
-            }
-            text.push_str("\nend");
-            (text, 9)
-        }
-        Expr::Tree(values) => {
-            let mut text = String::from("tree:");
             for (name, value) in values {
                 text.push_str(&format!("\n    {name} is {}", expr(value)));
             }
@@ -959,8 +963,19 @@ fn statement_text(statement: &Stmt) -> String {
         Stmt::DestructureReassign { pattern, value } => {
             format!("{} -> {}", render_pattern(pattern), expr(value))
         }
-        Stmt::SetIndex { name, index, value } => {
-            format!("{name}[{}] is {}", expr(index), expr(value))
+        Stmt::SetIndex {
+            name,
+            indices,
+            value,
+        } => {
+            format!(
+                "{name}{} is {}",
+                indices
+                    .iter()
+                    .map(|index| format!("[{}]", expr(index)))
+                    .collect::<String>(),
+                expr(value)
+            )
         }
         Stmt::Destructure {
             pattern,
@@ -1022,7 +1037,7 @@ fn statement_text(statement: &Stmt) -> String {
             return_type,
             body,
         } => {
-            let mut header = format!("fn {name}({})", parameters_text(parameters));
+            let mut header = format!("fn {name}({})", function_parameters_text(parameters));
             if let Some(typ) = return_type {
                 header.push_str(&format!(" gives {}", type_name(typ)));
             }
@@ -1063,7 +1078,7 @@ fn statement_text(statement: &Stmt) -> String {
         } => render_block(
             format!(
                 "on {receiver_type} receive {name}({}):",
-                parameters_text(parameters)
+                function_parameters_text(parameters)
             ),
             body,
         ),

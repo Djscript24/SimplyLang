@@ -152,7 +152,7 @@ pub enum Stmt {
     },
     SetIndex {
         name: String,
-        index: Expr,
+        indices: Vec<Expr>,
         value: Expr,
     },
     Destructure {
@@ -178,7 +178,7 @@ pub enum Stmt {
     },
     Function {
         name: String,
-        parameters: Vec<(String, Option<Type>, bool)>,
+        parameters: Vec<(String, Option<Type>, bool, bool)>,
         return_type: Option<Type>,
         body: Arc<[Stmt]>,
     },
@@ -193,7 +193,7 @@ pub enum Stmt {
     Message {
         receiver_type: String,
         name: String,
-        parameters: Vec<(String, Option<Type>, bool)>,
+        parameters: Vec<(String, Option<Type>, bool, bool)>,
         body: Arc<[Stmt]>,
     },
     Return(Expr),
@@ -215,6 +215,7 @@ pub enum Stmt {
 pub enum Expr {
     Literal(Literal),
     Identifier(String),
+    Ref(Box<Expr>),
     Unary {
         operator: UnaryOperator,
         operand: Box<Expr>,
@@ -254,7 +255,6 @@ pub enum Expr {
         name: String,
     },
     Hash(Vec<(String, Expr)>),
-    Tree(Vec<(String, Expr)>),
     Matrix(Vec<Expr>),
     Pipeline {
         source: Box<Expr>,

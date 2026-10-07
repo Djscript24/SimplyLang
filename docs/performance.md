@@ -5,8 +5,9 @@ Simply is currently an interpreter. The optimization work is intentionally split
 ## Current optimizations
 
 - Function definitions are stored behind `Arc` during invocation, and their AST bodies use shared slices so registration does not clone every statement.
-- Runtime sharing is centralized in `runtime/storage.rs`: `Shared`/`SharedCell` own shared roots and import caches, while `SharedVec`/`SharedMap` provide value-semantic copy-on-write collections. Cloning a collection handle shares its backing store; mutation detaches shared data. Only the storage module selects the reference-counting backend, allowing a future backend change without rewriting evaluator operations.
-- Runtime bindings use a scope-owned generational arena with unique, non-cloneable binding tokens. Scope frames own those tokens; removing a binding or popping its frame consumes the token and releases the slot. The arena rejects stale/cross-arena handles, reuses released slots with a new generation, and retires a slot rather than allowing generation overflow to make an old handle valid again. Closures capture creation-time `Value` snapshots rather than references to lexical slots. Collection backing storage keeps its independent copy-on-write ownership model.
+- Runtime bindings use a scope-owned generational arena with unique, non-cloneable binding tokens. Scope frames own those tokens; removing a binding or popping its frame consumes the token and releases the slot. The arena rejects stale/cross-arena handles, reuses released slots with a new generation, and retires a slot rather than allowing generation overflow to make an old handle valid again. Closures capture creation-time `Value` snapshots rather than references to lexical slots.
+- Mutable Arrays, Lists, and Hashes live in evaluator-owned generational arenas. Values carry weak, generational handles; cloning a value aliases the same collection node, and writes update it in place. Arena slots are intentionally retained until evaluator teardown, so unreachable nodes are not reclaimed during evaluation. Tuples and matrices keep immutable value-like storage.
+- `ref` collection parameters pass those same small handles; they do not clone collection contents. Runtime marker validation inspects parameter metadata in place instead of cloning a function body and capture map before invocation.
 - Parsed imports are cached as shared `Arc<Program>` values. Imported programs are still evaluated in isolated module evaluators, so evaluation side effects are not cached away.
 - Pipeline values are moved into the temporary `item` binding and recovered without cloning each element.
 - `where`/`derive` pipelines ending in `count` or `sum` are fused across multiple stages without materializing intermediate vectors.
@@ -54,7 +55,7 @@ Simply is currently an interpreter. The optimization work is intentionally split
 
 ## Deliberately deferred work
 
-Large `Value` reads and indexed results still produce owned values. Replacing this with references requires an explicit aliasing policy for mutable lists, hashes, and trees. Matrix results still use nested value rows; a flat numeric matrix representation should be introduced only together with a stable matrix type contract.
+Large `Value` reads and indexed results still produce owned snapshots of collection contents. Collection handles themselves are cheap aliases. Matrix results still use nested value rows; a flat numeric matrix representation should be introduced only together with a stable matrix type contract.
 
 Lexical slot resolution, broader lazy pipeline fusion, byte-oriented lexing, and `HashMap`-backed hashes should be benchmarked before changing their current deterministic and readable behavior.
 

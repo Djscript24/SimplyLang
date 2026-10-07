@@ -43,7 +43,7 @@ Simply source files use the `.si` extension. `#` starts a comment outside a stri
   type.
 - `return expression`, `if`, `for`, `while`, `break`, and `continue` provide control flow.
 - `try: ... catch error: ... finally: ... end` handles runtime errors. The `catch` binding
-  receives a tree with `message`, `code`, `category`, `line`, and `column` fields. Multiple
+  receives a Hash with `message`, `code`, `category`, `line`, and `column` fields. Multiple
   `catch` clauses can filter by diagnostic code, for example
   `catch error as E.runtime.numeric.division-by-zero:`.
   `throw expression` raises a user-defined runtime error, and `finally` always runs,
@@ -56,7 +56,7 @@ Simply source files use the `.si` extension. `#` starts a comment outside a stri
   can be imported the same way; struct messages and nominal type identity are
   retained across aliases.
 - Lists support `name add expression` and `name remove expression`.
-- Arrays, lists, tuples, hashes, trees, and matrices support the forms shown in the examples.
+- Arrays, lists, tuples, hashes, and matrices support the forms shown in the examples.
 
 Conditions must be `Bool`. `if` and `for` create local scopes; `while` does not.
 Functions and imports execute with isolated local state. Imported modules
@@ -68,8 +68,7 @@ entries. `check` recursively analyzes modules without executing them, whereas
 runtime imports execute each import occurrence in an isolated evaluator and
 reuse only parsed programs. A function returned by a module retains
 creation-time snapshots of the module bindings it references; each import
-execution creates its own function values and captures. Iterating a hash or
-tree visits its values in deterministic key order.
+execution creates its own function values and captures. Iterating a hash visits its values in deterministic key order.
 
 ## Expressions
 
@@ -269,9 +268,9 @@ and writes through mutable bindings; only lists support `add` and `remove`.
 Tuples are fixed-length, potentially heterogeneous ordered values and cannot
 be mutated. Their indexes are zero-based integers.
 
-Hashes and trees are string-keyed maps backed by sorted keys, so iteration and
-display order are deterministic. Hashes support indexed writes through mutable
-bindings; trees are read-only. Indexing and dot access read a value, and
+Hashes are string-keyed maps backed by sorted keys, so iteration and display
+order are deterministic. Indexed writes require a mutable binding. Indexing
+and dot access read a value, and
 `contains(map, value)` searches map values, not keys. Both can contain nested
 collections.
 
@@ -300,27 +299,25 @@ The built-ins are:
 - `range(start, end[, step])` for lazy integer sequences. They support indexing,
   `length`, `for`, and pipelines like arrays without allocating every element
   up front; operations that return a collection materialize the result.
-- `length(value)` for collection or string sizes. `count(value)` is a
-  compatibility alias for this function; prefer `length` when measuring a
-  collection to distinguish it from the pipeline `count` terminal, which counts
-  items reaching the end of a transformed pipeline.
+- `length(value)` for collection or string sizes. In a pipeline, the `count`
+  terminal counts items reaching the end of the transformed source.
 - `assert(condition[, message])` requires a Bool condition and optionally a
   String message. It returns `Unit` when true; when false, it raises a runtime
   diagnostic with the message or `assertion failed`. The optional message is
   evaluated only when the condition is false.
 - `contains(collection, value)` for membership and string substrings.
-- `has_key(map, key)` checks whether a Hash or Tree contains a string key;
+- `has_key(map, key)` checks whether a Hash contains a string key;
   unlike `contains(map, value)`, it searches keys rather than values.
 - `get(map, key, default)` returns a map value or the default when the string
   key is absent. The default is evaluated only on a miss and must match the
   map's inferred value type when that type is known.
-- `without_key(map, key)` returns a copy of a Hash or Tree without the named
+- `without_key(map, key)` returns a copy of a Hash without the named
   string key. The input is unchanged, and removing a missing key is a no-op.
 - `select_keys(map, keys)` returns a copy containing only keys from an
   Array, List, or Tuple of strings. Missing and repeated requested keys are
   ignored; output order follows the map's deterministic key order.
-- `keys(map)`, `values(map)`, and `entries(map)` return arrays for a Hash or
-  Tree, all in deterministic key order. Keys are strings, values retain their
+- `keys(map)`, `values(map)`, and `entries(map)` return arrays for a Hash,
+  all in deterministic key order. Keys are strings, values retain their
   inferred element type, and entries are `(key, value)` tuples.
 - `text[index]` returns one Unicode scalar value as a `String`; indexes are
   zero-based and out-of-range access is a runtime error. Combining marks are
@@ -346,6 +343,22 @@ The built-ins are:
   to the process working directory. File access and invalid UTF-8 failures are
   reported as runtime diagnostics; `open` retains its separate module-import
   behavior.
+- `parse_json(text)` converts JSON null, booleans, numbers, strings, arrays, and
+  objects to `Unit`, primitive values, Arrays, and Hashes. `to_json(value)` and
+  `to_json_pretty(value)` serialize those values (and Lists, Tuples, Matrices,
+  and Hashes) compactly or with indentation; values with no JSON representation,
+  such as Ranges and functions, produce a runtime diagnostic.
+- `read_json(path)` reads and parses a UTF-8 JSON file. `write_json(path, value)`
+  and `write_json_pretty(path, value)` atomically write compact or indented JSON
+  respectively, returning `Unit`; file and conversion failures produce runtime
+  diagnostics.
+- `read_json_lines(path)` parses each non-empty line of a UTF-8 JSON Lines file
+  into an Array. `write_json_lines(path, sequence)` writes an Array, List, or
+  Tuple as one compact JSON value per line, with a trailing newline for each
+  value. `append_json_line(path, value)` adds one compact JSON value, inserting
+  a line break first if the existing file has no final newline. Blank input
+  lines are ignored; invalid lines report their line number. Reading materializes
+  the records in memory; use `csv_rows` and a pipeline for lazy CSV processing.
 - `Ask("prompt")` writes a prompt and reads one line as a `String`.
   `Ask("prompt", Int)`, `Ask("prompt", Float)`, `Ask("prompt", String)`, and
   `Ask("prompt", Bool)` parse the line into the requested primitive type.
@@ -356,11 +369,25 @@ The built-ins are:
   function forms inspect an existing collection; the pipeline/Flow terminal
   forms can reduce filtered or derived items and short-circuit lazy sources.
 - `join(collection, separator)` for string collections.
-- `total(collection)` for numeric arrays, lists, tuples, and ranges. Ranges are
-  summed incrementally without first materializing their values. Unlike the
-  pipeline `sum` terminal, `total` does not apply pipeline transformations and
-  does not accept a CSV stream.
+- `total(collection)` for numeric arrays, lists, tuples, and ranges. It sums an
+  existing collection without pipeline transformations; the pipeline `sum`
+  terminal also accepts transformed values and CSV streams.
+- `mean(collection)` computes the mean of an existing numeric collection; the
+  pipeline `average` terminal computes the mean of values reaching that stage.
 - `trim`, `split`, `replace`, `starts_with`, and `ends_with` for strings.
+  `replace` matches literal text; use `regex_replace` when the pattern should
+  use regular-expression syntax.
+- `regex_find_all(text, pattern)` returns all non-overlapping matches as an
+  `Array[String]`; `regex_replace(text, pattern, replacement)` replaces every
+  match. Patterns use Rust's Unicode-aware regular-expression syntax. Invalid
+  patterns produce runtime diagnostics.
+- `score_rules(rules)` evaluates an Array, List, or Tuple of
+  `(label, condition, weight)` tuples. Each label is a String, condition a Bool,
+  and weight an Int. It returns a Hash with the sum of weights for true
+  conditions under `score`, plus ordered `matched` and `unmatched` label Arrays.
+  Conditions are ordinary expressions evaluated eagerly before the function
+  receives the sequence, not deferred callbacks. Total-score overflow and
+  malformed rule tuples are runtime diagnostics.
 - `is_empty(value)` for collections and strings.
 - `reverse(sequence)` for arrays, lists, tuples, and ranges. Reversing a range
   materializes and returns an Array.
@@ -467,7 +494,7 @@ The built-ins are:
   or streamed values.
 - Pipeline terminals `average`, `min`, and `max` aggregate numeric streams in a
   single pass.
-- `type_of(value)` and `print(value)` for inspection and output.
+- `type_of(value)` for runtime inspection. Use `Say` or `Sayln` for output.
 
 Argument counts and supported value types are checked before execution when statically knowable. Dynamic values remain runtime-validated.
 

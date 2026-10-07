@@ -37,12 +37,14 @@ rest_target    = "..." name ;
 say            = "Say" expression | "Sayln" expression ;
 function       = "fn" name "(" [ parameters ] ")" [ "gives" type ] ":"
                  newline { statement newline } "end" ;
+call           = name "(" [ call_arguments ] ")" ;
+message_call   = expression "::" name [ "(" [ expressions ] ")" ] ;
 enum           = "enum" name ":" newline
                  { name [ "as" type ] newline } "end" ;
 struct         = "type" name ":" newline
                  { struct_field } "end" ;
 struct_field   = name "as" type newline ;
-message        = "on" name "receive" name [ "(" [ parameters ] ")" ] ":"
+message        = "on" name "receive" name [ "(" [ message_parameters ] ")" ] ":"
                  newline { statement newline } "end" ;
 conditional    = "if" expression ":" newline { statement newline }
                  conditional_tail ;
@@ -64,8 +66,14 @@ imported_name  = name [ "as" name ] ;
 diagnostic_code = name { "." name { "-" name } } ;
 export         = "export" name { "," name } ;
 collection_op  = name ( "add" | "remove" ) expression ;
-parameters     = [ "mut" ] name [ "as" type ] { "," [ "mut" ] name [ "as" type ] } ;
-type           = "String" | "Int" | "Float" | "Bool" | "Hash" | "Tree"
+parameters     = parameter { "," parameter } ;
+parameter      = [ "mut" | "ref" ] name [ "as" type ] ;
+message_parameters = message_parameter { "," message_parameter } ;
+message_parameter = [ "mut" ] name [ "as" type ] ;
+call_arguments = call_argument { "," call_argument } ;
+call_argument  = [ "ref" ] expression ;
+expressions    = expression { "," expression } ;
+type           = "String" | "Int" | "Float" | "Bool" | "Hash"
                | "Matrix" | name | "Array" "[" type "]" | "List" "[" type "]"
                | "Vector" "[" type [ "," dimension ] "]"
                | "Matrix" "[" type [ "," dimension "," dimension ] "]"
@@ -100,6 +108,13 @@ rest_pattern   = "..." name ;
 hash_pattern   = "{" [ hash_entry { "," hash_entry } [ "," ] ] "}" ;
 hash_entry     = ( string | name ) ":" pattern ;
 ```
+
+`ref` is allowed only on function parameters and corresponding function-call arguments,
+for example `fn first(ref values as List[Int]) ...` and `first(ref numbers)`.
+It applies to collection parameters, including collection expressions such as
+`ref profile["scores"]`. A `ref` parameter is a read-only, temporary view of
+the collection handle; it does not copy collection contents and cannot escape
+the call. Assignment and reassignment do not accept a `ref` marker.
 
 Match patterns are parsed in match-arm context, separately from tuple expressions.
 They recursively match tuple elements, enum payloads, and Struct fields.
@@ -161,7 +176,12 @@ Messages are declared with `on Person receive greet:` and invoked with
 `person :: greet`; explicit message parameters use the ordinary function
 parameter grammar.
 
-Expressions also include array/list literals, tuples, named hash/tree blocks, matrix literals, indexing with `[]`, hash/tree field access with `.`, function calls, and pipeline blocks. Dot access is not struct field access.
+`ref` marks a read-only Array, List, or Hash parameter and must also appear
+before the matching call argument, for example `inspect(ref values)`. A ref
+parameter requires an explicit collection type. It cannot be mutated, stored,
+returned, or used while declaring a nested function.
+
+Expressions also include array/list literals, tuples, named Hash blocks, matrix literals, indexing with `[]`, Hash field access with `.`, function calls, and pipeline blocks. Dot access is not struct field access.
 
 Message dispatch is an expression suffix on a postfix receiver. It is not
 chainable without explicit parentheses:
@@ -222,23 +242,23 @@ Struct and enum payloads retain their nominal type; struct payloads preserve
 the shared instance and its state. Enum values do not support message
 dispatch.
 
-Built-in calls use the same call syntax as user functions. `Ask("prompt")`
+Built-in calls use the same call syntax as user functions. A user-defined
+function with the same name takes precedence over a built-in. `Ask("prompt")`
 reads a line as a String; `Ask("prompt", Int)`, `Ask("prompt", Float)`,
 `Ask("prompt", String)`, and `Ask("prompt", Bool)` parse input as the selected
 primitive type. Invalid typed input is a runtime error. The standard library
 includes collection operations such as `range`, `length`, `count`, `contains`,
 `any`, `all`, `join`, `total`, `is_empty`, and `reverse`, plus string
 operations such as `trim`, `split`, `replace`, `starts_with`, and `ends_with`.
-In call syntax, `count(collection)` is an alias for `length(collection)`;
-the pipeline terminal `count` instead counts items after pipeline transforms.
+`length(collection)` returns a collection's size; the pipeline terminal `count`
+counts items after pipeline transforms.
 Strings support scalar-value indexing, `substring(text, start, length)`,
 `characters(text)` for one-pass scalar materialization, and the character
 predicates `is_ascii_alpha`, `is_ascii_digit`, and `is_whitespace`.
 `read_file(path)` and `write_file(path, content)` provide UTF-8 text file I/O
 without changing the separate meaning of module imports. Pipeline terminals
 include `sum`, `count`, `average`, `min`, `max`, and `write_csv(path)`.
-Here `count` counts pipeline items; this terminal is distinct from the
-collection-size function `count(collection)`. `mean(collection)` is the
+Here `count` counts pipeline items. `mean(collection)` is the
 statistical function for an existing collection; `average` aggregates values
 reaching a pipeline terminal.
 `csv_rows(path)` creates a lazy CSV pipeline source; `to_float(text)`,

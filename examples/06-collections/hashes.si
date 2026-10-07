@@ -1,17 +1,19 @@
-# hash-tree.si — hash and tree example
+# hashes.si — hash example
 # Demonstrates named fields, string indexing, and nested collection values.
-# Key components: profile hash and catalog tree.
-# Hashes and trees support fields, string indexing, and nesting
+# Key components: typed values and map built-ins.
 profile is hash:
     name is "Ada"
     role is "builder"
 end
 
-catalog is tree:
+
+
+catalog is hash:
     featured is profile
 end
 
 Sayln profile.name
+Sayln profile["name"]
 Sayln profile["role"]
 Sayln catalog["featured"].name
 Sayln keys(profile)
@@ -24,3 +26,15 @@ Sayln get(profile, "missing", "unknown")
 Sayln keys(without_key(profile, "role"))
 Sayln keys(profile)
 Sayln entries(select_keys(profile, ["role", "name"]))
+
+# Nested writes update the shared hash, visible through every alias.
+mut updated is catalog
+updated["featured"]["role"] -> "designer"
+Sayln catalog["featured"]["role"]
+Sayln updated["featured"]["role"]
+
+mut replacement is hash:
+    featured is profile
+end
+updated -> replacement
+Sayln updated["featured"]["role"]

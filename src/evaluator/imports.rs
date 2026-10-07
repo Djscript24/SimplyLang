@@ -142,7 +142,7 @@ impl Evaluator {
                             let function = module.tracked_function(behavior.function)?;
                             let mut dependencies =
                                 closure_dependencies(&function.body, &function.parameters);
-                            for (parameter, _, _) in &function.parameters {
+                            for (parameter, _, _, _) in &function.parameters {
                                 dependencies.remove(parameter);
                             }
                             let captures = module.scopes.values_for(&dependencies);

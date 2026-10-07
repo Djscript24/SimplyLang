@@ -185,6 +185,12 @@ impl Parser {
         }
 
         if self.match_kind(TokenKind::Return) {
+            if self.check(TokenKind::Ref) {
+                return Err(self.invalid_ref_at(
+                    self.peek().span.clone(),
+                    "`ref` cannot be returned from a function",
+                ));
+            }
             return Ok(Stmt::Return(self.expression()?));
         }
 
@@ -300,8 +306,6 @@ impl Parser {
         let token = self.advance().clone();
         let name = match token.kind {
             TokenKind::Identifier(name) => name,
-            TokenKind::Count => "count".into(),
-            TokenKind::Tree => "tree".into(),
             _ => return Err(self.error_at(token.span, "expected a statement")),
         };
         {
@@ -311,11 +315,17 @@ impl Parser {
                 None
             };
             if self.match_kind(TokenKind::Is) {
+                if self.check(TokenKind::Ref) {
+                    return Err(self.invalid_ref_at(
+                        self.peek().span.clone(),
+                        "`ref` cannot be stored in a binding",
+                    ));
+                }
                 return Ok(Stmt::Assign {
                     name,
                     mutable,
                     declared_type,
-                    value: self.assignment_value()?,
+                    value: self.expression()?,
                 });
             }
             if self.match_kind(TokenKind::Arrow) {
@@ -330,6 +340,12 @@ impl Parser {
                         ),
                     });
                 }
+                if self.check(TokenKind::Ref) {
+                    return Err(self.invalid_ref_at(
+                        self.peek().span.clone(),
+                        "`ref` cannot be stored by reassignment",
+                    ));
+                }
                 return Ok(Stmt::Reassign {
                     name,
                     value: self.expression()?,
@@ -342,21 +358,25 @@ impl Parser {
                     declared_type.name()
                 )));
             }
-            if self.match_kind(TokenKind::LeftBracket) {
-                let first = self.expression()?;
-                let index = if self.match_kind(TokenKind::Comma) {
-                    let second = self.expression()?;
-                    Expr::Tuple(vec![first, second])
-                } else {
-                    first
-                };
-                self.expect(TokenKind::RightBracket, "expected `]`")?;
+            if self.check(TokenKind::LeftBracket) {
+                let mut indices = Vec::new();
+                while self.match_kind(TokenKind::LeftBracket) {
+                    let first = self.expression()?;
+                    let index = if self.match_kind(TokenKind::Comma) {
+                        let second = self.expression()?;
+                        Expr::Tuple(vec![first, second])
+                    } else {
+                        first
+                    };
+                    self.expect(TokenKind::RightBracket, "expected `]`")?;
+                    indices.push(index);
+                }
                 if !self.match_kind(TokenKind::Arrow) && !self.match_kind(TokenKind::Is) {
                     return Err(self.error_here("expected `->` or `is` after index"));
                 }
                 return Ok(Stmt::SetIndex {
                     name,
-                    index,
+                    indices,
                     value: self.expression()?,
                 });
             }
@@ -385,7 +405,7 @@ impl Parser {
     fn function_statement(&mut self) -> Result<Stmt, SimplyError> {
         let name = self.expect_identifier("expected function name")?;
         self.expect(TokenKind::LeftParen, "expected `(` after function name")?;
-        let parameters = self.parameter_list()?;
+        let parameters = self.parameter_list(true)?;
         let return_type = if self.match_kind(TokenKind::Gives) {
             Some(self.type_name()?)
         } else {
@@ -403,12 +423,28 @@ impl Parser {
         })
     }
 
-    fn parameter_list(&mut self) -> Result<Vec<(String, Option<Type>, bool)>, SimplyError> {
+    fn parameter_list(
+        &mut self,
+        allow_ref: bool,
+    ) -> Result<Vec<(String, Option<Type>, bool, bool)>, SimplyError> {
         let mut parameters = Vec::new();
         let mut names = std::collections::HashSet::new();
         if !self.check(TokenKind::RightParen) {
             loop {
                 let mutable = self.match_kind(TokenKind::Mut);
+                let by_ref = self.match_kind(TokenKind::Ref);
+                if by_ref && !allow_ref {
+                    return Err(self.invalid_ref_at(
+                        self.tokens[self.current - 1].span.clone(),
+                        "`ref` parameters are only allowed in functions",
+                    ));
+                }
+                if mutable && by_ref {
+                    return Err(self.invalid_ref_at(
+                        self.tokens[self.current - 1].span.clone(),
+                        "a `ref` parameter cannot also be `mut`",
+                    ));
+                }
                 let parameter = self.expect_identifier("expected parameter name")?;
                 if !names.insert(parameter.clone()) {
                     return Err(SimplyError::Parse {
@@ -422,7 +458,7 @@ impl Parser {
                 } else {
                     None
                 };
-                parameters.push((parameter, parameter_type, mutable));
+                parameters.push((parameter, parameter_type, mutable, by_ref));
                 if !self.match_kind(TokenKind::Comma) {
                     break;
                 }
@@ -950,7 +986,7 @@ impl Parser {
         self.expect(TokenKind::Receive, "expected `receive` after receiver type")?;
         let name = self.expect_identifier("expected a message name after `receive`")?;
         let parameters = if self.match_kind(TokenKind::LeftParen) {
-            self.parameter_list()?
+            self.parameter_list(false)?
         } else {
             Vec::new()
         };
@@ -1200,7 +1236,6 @@ impl Parser {
             TokenKind::Array => "Array".into(),
             TokenKind::List => "List".into(),
             TokenKind::Hash => "Hash".into(),
-            TokenKind::Tree => "Tree".into(),
             TokenKind::Matrix => "Matrix".into(),
             _ => return Err(self.error_at(token.span, "expected a supported type")),
         };
@@ -1216,7 +1251,6 @@ impl Parser {
             "List" => Type::List(Box::new(Type::Int)),
             "Vector" => Type::Vector(Box::new(Type::Unknown), None),
             "Hash" => Type::Hash,
-            "Tree" => Type::Tree,
             "Matrix" => Type::Matrix,
             "Tuple" => Type::Tuple(Vec::new()),
             _ if self.enum_names.contains(&name) => Type::Enum(DeclarationIdentity::unresolved(
@@ -1359,11 +1393,9 @@ impl Parser {
                 self.expect(TokenKind::LeftBracket, "expected `[` after matrix")?;
                 Ok(Expr::Matrix(self.expression_list(TokenKind::RightBracket)?))
             }
-            TokenKind::Hash => Ok(Expr::Hash(self.named_block(TokenKind::Hash)?)),
+            TokenKind::Hash => Ok(Expr::Hash(self.named_block()?)),
             TokenKind::Pipeline => self.pipeline_expression(),
             TokenKind::Match => self.match_expression(),
-            TokenKind::Tree => Ok(Expr::Identifier("tree".into())),
-            TokenKind::Count => Ok(Expr::Identifier("count".into())),
             TokenKind::LeftParen => {
                 let values = self.expression_list(TokenKind::RightParen)?;
                 if values.len() == 1 {
@@ -1372,6 +1404,10 @@ impl Parser {
                     Ok(Expr::Tuple(values))
                 }
             }
+            TokenKind::Ref => Err(self.invalid_ref_at(
+                token.span,
+                "`ref` is only allowed on function parameters and call arguments",
+            )),
             _ => Err(SimplyError::Parse {
                 span: token.span,
                 code: DiagnosticCode::ExpectedExpression,
@@ -1415,18 +1451,31 @@ impl Parser {
         }
         if self.match_kind(TokenKind::DoubleColon) {
             let message = self.expect_message_name()?;
+            let enum_name = match &expression {
+                Expr::Identifier(name)
+                    if self.enum_names.contains(name)
+                        || name.chars().next().is_some_and(char::is_uppercase) =>
+                {
+                    Some(name.clone())
+                }
+                _ => None,
+            };
             let arguments = if self.check(TokenKind::LeftParen) {
                 self.advance();
-                self.argument_list()?
+                self.argument_list(
+                    false,
+                    if enum_name.is_some() {
+                        "`ref` cannot be used as an enum payload"
+                    } else {
+                        "`ref` arguments are only allowed in function calls"
+                    },
+                )?
             } else {
                 Vec::new()
             };
-            if let Expr::Identifier(enum_name) = &expression
-                && (self.enum_names.contains(enum_name)
-                    || enum_name.chars().next().is_some_and(char::is_uppercase))
-            {
+            if let Some(enum_name) = enum_name {
                 expression = Expr::EnumVariant {
-                    enum_name: enum_name.clone(),
+                    enum_name,
                     variant_name: message,
                     arguments,
                 };
@@ -1457,14 +1506,7 @@ impl Parser {
         Ok(values)
     }
 
-    fn assignment_value(&mut self) -> Result<Expr, SimplyError> {
-        if self.match_kind(TokenKind::Tree) {
-            return Ok(Expr::Tree(self.named_block(TokenKind::Tree)?));
-        }
-        self.expression()
-    }
-
-    fn named_block(&mut self, _kind: TokenKind) -> Result<Vec<(String, Expr)>, SimplyError> {
+    fn named_block(&mut self) -> Result<Vec<(String, Expr)>, SimplyError> {
         self.expect(TokenKind::Colon, "expected `:` after collection type")?;
         self.consume_newlines();
         let mut entries = Vec::new();
@@ -1474,7 +1516,7 @@ impl Parser {
                 return Err(self.error_here("duplicate field in named collection"));
             }
             self.expect(TokenKind::Is, "expected `is` after field name")?;
-            entries.push((name, self.assignment_value()?));
+            entries.push((name, self.expression()?));
             self.expect(TokenKind::Newline, "expected a new line after field")?;
             self.consume_newlines();
         }
@@ -1522,7 +1564,7 @@ impl Parser {
             } else if self.match_kind(TokenKind::Sum) {
                 steps.push(PipelineStep::Sum);
                 terminal = true;
-            } else if self.match_kind(TokenKind::Count) {
+            } else if self.match_word("count") {
                 steps.push(PipelineStep::Count);
                 terminal = true;
             } else if self.match_kind(TokenKind::Average) {
@@ -1601,7 +1643,7 @@ impl Parser {
             } else if self.match_kind(TokenKind::Sum) {
                 steps.push(PipelineStep::Sum);
                 terminal = true;
-            } else if self.match_kind(TokenKind::Count) {
+            } else if self.match_word("count") {
                 steps.push(PipelineStep::Count);
                 terminal = true;
             } else if self.match_kind(TokenKind::Average) {
@@ -1727,16 +1769,32 @@ impl Parser {
 
     fn call_expression(&mut self, name: String) -> Result<Expr, SimplyError> {
         self.expect(TokenKind::LeftParen, "expected `(` after function name")?;
-        let arguments = self.argument_list()?;
+        let arguments = self.argument_list(true, "")?;
         Ok(Expr::Call { name, arguments })
     }
 
-    fn argument_list(&mut self) -> Result<Vec<Expr>, SimplyError> {
+    fn argument_list(
+        &mut self,
+        allow_ref: bool,
+        invalid_ref_message: &str,
+    ) -> Result<Vec<Expr>, SimplyError> {
         let mut arguments = Vec::new();
         self.consume_newlines();
         if !self.check(TokenKind::RightParen) {
             loop {
-                arguments.push(self.expression()?);
+                let by_ref = self.match_kind(TokenKind::Ref);
+                if by_ref && !allow_ref {
+                    return Err(self.invalid_ref_at(
+                        self.tokens[self.current - 1].span.clone(),
+                        invalid_ref_message,
+                    ));
+                }
+                let argument = self.expression()?;
+                arguments.push(if by_ref {
+                    Expr::Ref(Box::new(argument))
+                } else {
+                    argument
+                });
                 self.consume_newlines();
                 if !self.match_kind(TokenKind::Comma) {
                     break;
@@ -1852,6 +1910,14 @@ impl Parser {
         SimplyError::Parse {
             span,
             code: DiagnosticCode::UnexpectedToken,
+            message: message.into(),
+        }
+    }
+
+    fn invalid_ref_at(&self, span: Span, message: &str) -> SimplyError {
+        SimplyError::Semantic {
+            span,
+            code: DiagnosticCode::InvalidRefUsage,
             message: message.into(),
         }
     }

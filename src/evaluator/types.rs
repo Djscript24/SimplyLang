@@ -49,9 +49,8 @@ impl Evaluator {
         }
         let sequence = self.evaluate(&arguments[0])?;
         let pairs = match sequence {
-            Value::Array(values) | Value::List(values) | Value::Tuple(values) => {
-                enumerate_values(values.iter().cloned())
-            }
+            Value::Array(values) | Value::List(values) => enumerate_values(values.iter()),
+            Value::Tuple(values) => enumerate_values(values.iter().cloned()),
             Value::Range { start, end, step } => {
                 enumerate_values(Value::range_values(start, end, step))
             }
@@ -66,7 +65,7 @@ impl Evaluator {
             }
         }
         .map_err(|message| self.runtime_error_with_code(DiagnosticCode::RuntimeLimit, message))?;
-        Ok(Value::Array(shared_values(pairs)))
+        Ok(self.make_array(pairs))
     }
 
     pub(super) fn evaluate_zip(&mut self, arguments: &[Expr]) -> Result<Value, SimplyError> {
@@ -80,7 +79,7 @@ impl Evaluator {
         let pairs = zip_values(left, right).map_err(|message| {
             self.runtime_error_with_code(DiagnosticCode::RuntimeLimit, message)
         })?;
-        Ok(Value::Array(shared_values(pairs)))
+        Ok(self.make_array(pairs))
     }
 
     pub(super) fn evaluate_map_keys_or_values(
@@ -96,7 +95,9 @@ impl Evaluator {
             }
             let collection = self.evaluate(&arguments[0])?;
             let keys = match self.evaluate(&arguments[1])? {
-                Value::Array(keys) | Value::List(keys) | Value::Tuple(keys) => keys,
+                value @ (Value::Array(_) | Value::List(_) | Value::Tuple(_)) => {
+                    value.sequence_snapshot().unwrap_or_default()
+                }
                 _ => {
                     return Err(self.runtime_type_error(
                         "`select_keys` expects an array, list, or tuple of strings",
@@ -108,24 +109,16 @@ impl Evaluator {
                 let Value::String(key) = key else {
                     return Err(self.runtime_type_error("`select_keys` keys must be strings"));
                 };
-                selected.insert(key.as_str());
+                selected.insert(key.clone());
             }
             return match collection {
-                Value::Hash(entries) => Ok(Value::Hash(shared_map(
+                Value::Hash(entries) => Ok(self.make_hash(
                     entries
                         .iter()
-                        .filter(|(key, _)| selected.contains(key.as_str()))
-                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .filter(|(key, _)| selected.contains(key))
                         .collect(),
-                ))),
-                Value::Tree(entries) => Ok(Value::Tree(shared_map(
-                    entries
-                        .iter()
-                        .filter(|(key, _)| selected.contains(key.as_str()))
-                        .map(|(key, value)| (key.clone(), value.clone()))
-                        .collect(),
-                ))),
-                _ => Err(self.runtime_type_error("`select_keys` requires a Hash or Tree")),
+                )),
+                _ => Err(self.runtime_type_error("`select_keys` requires a Hash")),
             };
         }
         if name == "without_key" {
@@ -139,16 +132,11 @@ impl Evaluator {
             };
             return match collection {
                 Value::Hash(entries) => {
-                    let mut entries = (*entries).clone();
+                    let mut entries = entries.get_cloned().unwrap_or_default();
                     entries.remove(&key);
-                    Ok(Value::Hash(shared_map(entries)))
+                    Ok(self.make_hash(entries))
                 }
-                Value::Tree(entries) => {
-                    let mut entries = (*entries).clone();
-                    entries.remove(&key);
-                    Ok(Value::Tree(shared_map(entries)))
-                }
-                _ => Err(self.runtime_type_error("`without_key` requires a Hash or Tree")),
+                _ => Err(self.runtime_type_error("`without_key` requires a Hash")),
             };
         }
         if name == "get" {
@@ -163,8 +151,8 @@ impl Evaluator {
                 _ => return Err(self.runtime_type_error("`get` key must be a string")),
             };
             let entries = match collection {
-                Value::Hash(entries) | Value::Tree(entries) => entries,
-                _ => return Err(self.runtime_type_error("`get` requires a Hash or Tree")),
+                Value::Hash(entries) => entries,
+                _ => return Err(self.runtime_type_error("`get` requires a Hash")),
             };
             if let Some(value) = entries.get(&key) {
                 return Ok(value.clone());
@@ -181,8 +169,8 @@ impl Evaluator {
                 _ => return Err(self.runtime_type_error("`has_key` key must be a string")),
             };
             let result = match collection {
-                Value::Hash(entries) | Value::Tree(entries) => entries.contains_key(&key),
-                _ => return Err(self.runtime_type_error("`has_key` requires a Hash or Tree")),
+                Value::Hash(entries) => entries.contains_key(&key),
+                _ => return Err(self.runtime_type_error("`has_key` requires a Hash")),
             };
             return Ok(Value::Bool(result));
         }
@@ -191,24 +179,17 @@ impl Evaluator {
         }
         let collection = self.evaluate(&arguments[0])?;
         let result = match collection {
-            Value::Hash(entries) | Value::Tree(entries) if name == "keys" => {
-                entries.keys().cloned().map(Value::String).collect()
-            }
-            Value::Hash(entries) | Value::Tree(entries) if name == "entries" => entries
+            Value::Hash(entries) if name == "keys" => entries.keys().map(Value::String).collect(),
+            Value::Hash(entries) if name == "entries" => entries
                 .iter()
-                .map(|(key, value)| {
-                    Value::Tuple(shared_values(vec![
-                        Value::String(key.clone()),
-                        value.clone(),
-                    ]))
-                })
+                .map(|(key, value)| Value::Tuple(shared_values(vec![Value::String(key), value])))
                 .collect(),
-            Value::Hash(entries) | Value::Tree(entries) => entries.values().cloned().collect(),
+            Value::Hash(entries) => entries.values().collect(),
             _ => {
-                return Err(self.runtime_type_error(format!("`{name}` requires a Hash or Tree")));
+                return Err(self.runtime_type_error(format!("`{name}` requires a Hash")));
             }
         };
-        Ok(Value::Array(shared_values(result)))
+        Ok(self.make_array(result))
     }
 
     pub(super) fn runtime_error_with_code(
@@ -298,7 +279,6 @@ impl Evaluator {
             Value::List(_) => "List".into(),
             Value::Tuple(_) => "Tuple".into(),
             Value::Hash(_) => "Hash".into(),
-            Value::Tree(_) => "Tree".into(),
             Value::Matrix(_) => "Matrix".into(),
             Value::Function(_) => "Function".into(),
             Value::Struct(instance) => instance
@@ -318,13 +298,16 @@ impl Evaluator {
             | (Value::Bool(_), Type::Bool)
             | (Value::Unit, Type::Unit)
             | (Value::Hash(_), Type::Hash)
-            | (Value::Tree(_), Type::Tree)
             | (Value::Function(_), Type::Function { .. }) => true,
-            (Value::Matrix(rows) | Value::Array(rows) | Value::List(rows), Type::Matrix) => {
+            (Value::Matrix(_) | Value::Array(_) | Value::List(_), Type::Matrix) => {
+                let rows = value.sequence_snapshot().unwrap_or_default();
                 let mut expected_columns = None;
                 !rows.is_empty()
                     && rows.iter().all(|row| match row {
-                        Value::Array(values) | Value::List(values) if !values.is_empty() => {
+                        Value::Array(_) | Value::List(_)
+                            if !row.sequence_snapshot().unwrap_or_default().is_empty() =>
+                        {
+                            let values = row.sequence_snapshot().unwrap_or_default();
                             if expected_columns.is_some_and(|columns| columns != values.len()) {
                                 return false;
                             }
@@ -337,29 +320,35 @@ impl Evaluator {
                     })
             }
             (
-                Value::Matrix(rows) | Value::Array(rows) | Value::List(rows),
+                Value::Matrix(_) | Value::Array(_) | Value::List(_),
                 Type::TypedMatrix(element, expected_rows, expected_columns),
             ) => {
+                let rows = value.sequence_snapshot().unwrap_or_default();
                 !rows.is_empty()
                     && rows.iter().all(|row| {
-                        matches!(row, Value::Array(values) | Value::List(values)
-                            if !values.is_empty()
-                                && values.iter().all(|value| self.value_matches_type(value, element)))
+                        matches!(row, Value::Array(_) | Value::List(_))
+                            && row.sequence_snapshot().is_some_and(|values| {
+                                !values.is_empty()
+                                    && values
+                                        .iter()
+                                        .all(|value| self.value_matches_type(value, element))
+                            })
                     })
                     && expected_rows.is_none_or(|expected| rows.len() == expected)
                     && expected_columns.is_none_or(|expected| {
-                        rows.first().is_some_and(|row| match row {
-                            Value::Array(values) | Value::List(values) => values.len() == expected,
-                            _ => false,
+                        rows.first().is_some_and(|row| {
+                            row.sequence_snapshot()
+                                .is_some_and(|values| values.len() == expected)
                         })
                     })
                     && rows.first().is_some_and(|first_row| {
-                        let width = match first_row {
-                            Value::Array(values) | Value::List(values) => values.len(),
-                            _ => return false,
+                        let Some(first_values) = first_row.sequence_snapshot() else {
+                            return false;
                         };
+                        let width = first_values.len();
                         rows.iter().all(|row| {
-                            matches!(row, Value::Array(values) | Value::List(values) if values.len() == width)
+                            row.sequence_snapshot()
+                                .is_some_and(|values| values.len() == width)
                         })
                     })
             }
@@ -379,19 +368,19 @@ impl Evaluator {
             (Value::Array(values), Type::Array(element))
             | (Value::List(values), Type::List(element)) => values
                 .iter()
-                .all(|value| self.value_matches_type(value, element)),
-            (Value::Array(values), Type::Vector(element, expected_length))
-            | (Value::List(values), Type::Vector(element, expected_length))
-            | (Value::Tuple(values), Type::Vector(element, expected_length)) => {
+                .all(|value| self.value_matches_type(&value, element)),
+            (Value::Array(_), Type::Vector(element, expected_length))
+            | (Value::List(_), Type::Vector(element, expected_length))
+            | (Value::Tuple(_), Type::Vector(element, expected_length)) => {
+                let values = value.sequence_snapshot().unwrap_or_default();
                 expected_length.is_none_or(|expected| values.len() == expected)
                     && values
                         .iter()
                         .all(|value| self.value_matches_type(value, element))
             }
-            (Value::Hash(values), Type::HashValues(element))
-            | (Value::Tree(values), Type::TreeValues(element)) => values
-                .values()
-                .all(|value| **element == Type::Unknown || self.value_matches_type(value, element)),
+            (Value::Hash(values), Type::HashValues(element)) => values.values().all(|value| {
+                **element == Type::Unknown || self.value_matches_type(&value, element)
+            }),
             (Value::Tuple(values), Type::Tuple(types)) => {
                 values.len() == types.len()
                     && values
@@ -415,7 +404,7 @@ impl Evaluator {
                 Box::new(
                     values
                         .first()
-                        .map(|value| self.type_of_value(value))
+                        .map(|value| self.type_of_value(&value))
                         .unwrap_or(Type::Unknown),
                 ),
                 Some(values.len()),
@@ -423,7 +412,7 @@ impl Evaluator {
             Value::List(values) => Type::List(Box::new(
                 values
                     .first()
-                    .map(|value| self.type_of_value(value))
+                    .map(|value| self.type_of_value(&value))
                     .unwrap_or(Type::Unknown),
             )),
             Value::Tuple(values) => Type::Tuple(
@@ -433,7 +422,7 @@ impl Evaluator {
                     .collect(),
             ),
             Value::Hash(values) => {
-                let mut types = values.values().map(|value| self.type_of_value(value));
+                let mut types = values.values().map(|value| self.type_of_value(&value));
                 let first = types.next().unwrap_or(Type::Unknown);
                 if types.all(|typ| typ.compatible_with(&first)) {
                     Type::HashValues(Box::new(first))
@@ -441,21 +430,11 @@ impl Evaluator {
                     Type::HashValues(Box::new(Type::Unknown))
                 }
             }
-            Value::Tree(values) => {
-                let mut types = values.values().map(|value| self.type_of_value(value));
-                let first = types.next().unwrap_or(Type::Unknown);
-                if types.all(|typ| typ.compatible_with(&first)) {
-                    Type::TreeValues(Box::new(first))
-                } else {
-                    Type::TreeValues(Box::new(Type::Unknown))
-                }
-            }
             Value::Matrix(rows) => {
                 let mut element_type = Type::Unknown;
                 for row in rows.iter() {
-                    let values = match row {
-                        Value::Array(values) | Value::List(values) => values,
-                        _ => return Type::Matrix,
+                    let Some(values) = row.sequence_snapshot() else {
+                        return Type::Matrix;
                     };
                     for value in values.iter() {
                         let value_type = self.type_of_value(value);
@@ -473,10 +452,9 @@ impl Evaluator {
                 Type::TypedMatrix(
                     Box::new(element_type),
                     Some(rows.len()),
-                    rows.first().and_then(|row| match row {
-                        Value::Array(values) | Value::List(values) => Some(values.len()),
-                        _ => None,
-                    }),
+                    rows.first()
+                        .and_then(Value::sequence_snapshot)
+                        .map(|values| values.len()),
                 )
             }
             Value::Struct(instance) => instance
@@ -492,7 +470,7 @@ impl Evaluator {
                     parameters: function
                         .parameters
                         .iter()
-                        .map(|(_, typ, _)| typ.clone().map(Box::new))
+                        .map(|(_, typ, _, _)| typ.clone().map(Box::new))
                         .collect(),
                     return_type: function
                         .return_type
@@ -579,6 +557,7 @@ impl Evaluator {
                 Literal::Float(_) => Type::Float,
                 Literal::Bool(_) => Type::Bool,
             },
+            Expr::Ref(inner) => self.runtime_expression_type(inner, item_type),
             Expr::Identifier(name) if name == "item" => item_type.cloned().unwrap_or(Type::Unknown),
             Expr::Identifier(name) => self
                 .variable_types
@@ -631,10 +610,14 @@ impl Evaluator {
                 match name.as_str() {
                     "to_float" | "sqrt" | "exp" | "log" | "log10" | "sin" | "cos" | "tan"
                     | "floor" | "ceil" | "pow" | "norm" | "distance" | "mean" => Type::Float,
-                    "to_int" | "sign" | "length" | "count" => Type::Int,
-                    "type_of" | "read_file" | "trim" | "substring" | "replace" | "join" => {
-                        Type::String
-                    }
+                    "to_int" | "sign" | "length" => Type::Int,
+                    "type_of" | "read_file" | "to_json" | "to_json_pretty" | "trim"
+                    | "substring" | "replace" | "regex_replace" | "join" => Type::String,
+                    "regex_find_all" => Type::Array(Box::new(Type::String)),
+                    "score_rules" => Type::Hash,
+                    "parse_json" => Type::Unknown,
+                    "read_json" => Type::Unknown,
+                    "read_json_lines" => Type::Array(Box::new(Type::Unknown)),
                     "range" => Type::Range,
                     "csv_rows" => Type::CsvStream,
                     "total" if arguments.len() == 1 => self.sequence_sum_type(&arguments[0]),
@@ -704,8 +687,7 @@ impl Evaluator {
             | Expr::EnumVariant { .. }
             | Expr::Match { .. }
             | Expr::Field { .. }
-            | Expr::Hash(_)
-            | Expr::Tree(_) => Type::Unknown,
+            | Expr::Hash(_) => Type::Unknown,
         }
     }
 

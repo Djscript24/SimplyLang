@@ -26,12 +26,12 @@ use crate::{
         arena::{Arena, ArenaRef, Handle},
         collections, files,
         heap::RuntimeHeap,
-        limits, operations,
+        json, limits, operations,
         scope::ScopeStack,
         storage::SharedCell,
         value::{
             CsvStreamVersion, EnumValue, FunctionValue, SourceContext, SourceText, StructInstance,
-            Value, owned_map_values, owned_values, shared_map, shared_values,
+            Value, owned_map_values, owned_values, shared_values,
         },
     },
     types::{DeclarationIdentity, DeclarationKind, Type},
@@ -56,14 +56,10 @@ fn enumerate_values(values: impl Iterator<Item = Value>) -> Result<Vec<Value>, S
 
 fn sequence_values(value: Value) -> Result<Box<dyn Iterator<Item = Value>>, String> {
     match value {
-        Value::Array(values) | Value::List(values) | Value::Tuple(values) => {
-            let mut index = 0usize;
-            Ok(Box::new(std::iter::from_fn(move || {
-                let value = values.get(index)?.clone();
-                index += 1;
-                Some(value)
-            })))
-        }
+        Value::Array(values) | Value::List(values) => Ok(Box::new(
+            values.get_cloned().unwrap_or_default().into_iter(),
+        )),
+        Value::Tuple(values) => Ok(Box::new(values.to_vec().into_iter())),
         Value::Range { start, end, step } => Ok(Box::new(Value::range_values(start, end, step))),
         Value::String(text) => {
             let mut byte_index = 0usize;
@@ -150,6 +146,7 @@ fn clamp_numeric(
 }
 
 fn evaluate_math_builtin(
+    heap: &RuntimeHeap,
     name: &str,
     arguments: &[Value],
     span: Option<&Span>,
@@ -185,6 +182,7 @@ fn evaluate_math_builtin(
         "vector_add" | "vector_subtract" => {
             require_count(2)?;
             Some(operations::vector_add(
+                heap,
                 &arguments[0],
                 &arguments[1],
                 name == "vector_subtract",
@@ -194,6 +192,7 @@ fn evaluate_math_builtin(
         "vector_scale" => {
             require_count(2)?;
             Some(operations::vector_scale(
+                heap,
                 &arguments[0],
                 &arguments[1],
                 span,
@@ -201,11 +200,17 @@ fn evaluate_math_builtin(
         }
         "dot" => {
             require_count(2)?;
-            Some(operations::vector_dot(&arguments[0], &arguments[1], span)?)
+            Some(operations::vector_dot(
+                heap,
+                &arguments[0],
+                &arguments[1],
+                span,
+            )?)
         }
         "cross" => {
             require_count(2)?;
             Some(operations::vector_cross(
+                heap,
                 &arguments[0],
                 &arguments[1],
                 span,
@@ -225,7 +230,7 @@ fn evaluate_math_builtin(
         }
         "normalize" => {
             require_count(1)?;
-            Some(operations::vector_normalize(&arguments[0], span)?)
+            Some(operations::vector_normalize(heap, &arguments[0], span)?)
         }
         "shape" => {
             require_count(1)?;
@@ -242,6 +247,7 @@ fn evaluate_math_builtin(
         "matvec" => {
             require_count(2)?;
             Some(operations::matrix_vector_multiply(
+                heap,
                 &arguments[0],
                 &arguments[1],
                 span,
@@ -253,23 +259,24 @@ fn evaluate_math_builtin(
         }
         "inverse" => {
             require_count(1)?;
-            Some(operations::matrix_inverse(&arguments[0], span)?)
+            Some(operations::matrix_inverse(heap, &arguments[0], span)?)
         }
         "lu" => {
             require_count(1)?;
-            Some(operations::matrix_lu(&arguments[0], span)?)
+            Some(operations::matrix_lu(heap, &arguments[0], span)?)
         }
         "qr" => {
             require_count(1)?;
-            Some(operations::matrix_qr(&arguments[0], span)?)
+            Some(operations::matrix_qr(heap, &arguments[0], span)?)
         }
         "cholesky" => {
             require_count(1)?;
-            Some(operations::matrix_cholesky(&arguments[0], span)?)
+            Some(operations::matrix_cholesky(heap, &arguments[0], span)?)
         }
         "solve" => {
             require_count(2)?;
             Some(operations::matrix_solve(
+                heap,
                 &arguments[0],
                 &arguments[1],
                 span,
@@ -278,6 +285,7 @@ fn evaluate_math_builtin(
         "least_squares" => {
             require_count(2)?;
             Some(operations::matrix_least_squares(
+                heap,
                 &arguments[0],
                 &arguments[1],
                 span,
@@ -285,11 +293,16 @@ fn evaluate_math_builtin(
         }
         "transpose" => {
             require_count(1)?;
-            Some(operations::matrix_transpose_value(&arguments[0], span)?)
+            Some(operations::matrix_transpose_value(
+                heap,
+                &arguments[0],
+                span,
+            )?)
         }
         "matrix_add" | "matrix_subtract" => {
             require_count(2)?;
             Some(operations::matrix_add_values(
+                heap,
                 &arguments[0],
                 &arguments[1],
                 name == "matrix_subtract",
@@ -299,6 +312,7 @@ fn evaluate_math_builtin(
         "matrix_scale" => {
             require_count(2)?;
             Some(operations::matrix_scale(
+                heap,
                 &arguments[0],
                 &arguments[1],
                 span,
@@ -307,6 +321,7 @@ fn evaluate_math_builtin(
         "multiply" => {
             require_count(2)?;
             Some(operations::matrix_multiply_values(
+                heap,
                 &arguments[0],
                 &arguments[1],
                 span,
@@ -330,7 +345,7 @@ fn evaluate_math_builtin(
                     });
                 }
             };
-            Some(operations::matrix_identity(size, span)?)
+            Some(operations::matrix_identity(heap, size, span)?)
         }
         "mean" | "median" | "variance" | "stddev" | "percentile" => {
             require_count(if name == "percentile" { 2 } else { 1 })?;
@@ -441,8 +456,14 @@ impl SumAccumulator {
         }
     }
 
-    fn add(&mut self, value: Value, span: Option<&Span>) -> Result<(), SimplyError> {
-        self.total = operations::binary(self.total.clone(), &BinaryOperator::Add, value, span)?;
+    fn add(
+        &mut self,
+        heap: &RuntimeHeap,
+        value: Value,
+        span: Option<&Span>,
+    ) -> Result<(), SimplyError> {
+        self.total =
+            operations::binary(heap, self.total.clone(), &BinaryOperator::Add, value, span)?;
         self.has_values = true;
         Ok(())
     }
@@ -463,12 +484,12 @@ fn empty_partition_categories(rules: &[PartitionRule]) -> BTreeMap<String, Vec<V
         .collect()
 }
 
-fn partition_result(categories: BTreeMap<String, Vec<Value>>) -> Value {
+fn partition_result(heap: &RuntimeHeap, categories: BTreeMap<String, Vec<Value>>) -> Value {
     let categories = categories
         .into_iter()
-        .map(|(name, values)| (name, Value::List(shared_values(values))))
+        .map(|(name, values)| (name, Value::List(heap.insert_sequence(values))))
         .collect();
-    Value::Hash(shared_map(categories))
+    Value::Hash(heap.insert_hash(categories))
 }
 
 fn update_extreme(
@@ -524,13 +545,13 @@ fn update_extreme(
     Ok(())
 }
 
-fn closure_dependencies(
+pub(crate) fn closure_dependencies(
     body: &[Stmt],
-    parameters: &[(String, Option<Type>, bool)],
+    parameters: &[(String, Option<Type>, bool, bool)],
 ) -> HashSet<String> {
     let mut bound = parameters
         .iter()
-        .map(|(name, _, _)| name.clone())
+        .map(|(name, _, _, _)| name.clone())
         .collect::<HashSet<_>>();
     let mut dependencies = HashSet::new();
     collect_statement_dependencies(body, &mut bound, &mut dependencies);
@@ -588,12 +609,17 @@ fn collect_statement_dependencies(
                 bound.insert(name.clone());
             }
             Stmt::SetIndex {
-                name, index, value, ..
+                name,
+                indices,
+                value,
+                ..
             } => {
                 if !bound.contains(name) {
                     dependencies.insert(name.clone());
                 }
-                collect_expression_dependencies(index, bound, dependencies);
+                for index in indices {
+                    collect_expression_dependencies(index, bound, dependencies);
+                }
                 collect_expression_dependencies(value, bound, dependencies);
             }
             Stmt::Destructure { pattern, value, .. } => {
@@ -685,7 +711,7 @@ fn collect_expression_dependencies(
                 dependencies.insert(name.clone());
             }
         }
-        Expr::Unary { operand, .. } => {
+        Expr::Unary { operand, .. } | Expr::Ref(operand) => {
             collect_expression_dependencies(operand, bound, dependencies)
         }
         Expr::Binary { left, right, .. } => {
@@ -805,7 +831,7 @@ fn collect_expression_dependencies(
             collect_expression_dependencies(index, bound, dependencies);
         }
         Expr::Field { target, .. } => collect_expression_dependencies(target, bound, dependencies),
-        Expr::Hash(entries) | Expr::Tree(entries) => {
+        Expr::Hash(entries) => {
             for (_, value) in entries {
                 collect_expression_dependencies(value, bound, dependencies);
             }
@@ -1020,6 +1046,18 @@ impl Default for TypeScopes {
 }
 
 impl Evaluator {
+    pub(super) fn make_array(&self, values: Vec<Value>) -> Value {
+        Value::Array(self.heap.insert_sequence(values))
+    }
+
+    pub(super) fn make_list(&self, values: Vec<Value>) -> Value {
+        Value::List(self.heap.insert_sequence(values))
+    }
+
+    pub(super) fn make_hash(&self, values: BTreeMap<String, Value>) -> Value {
+        Value::Hash(self.heap.insert_hash(values))
+    }
+
     fn identity(&self, name: &str, kind: DeclarationKind) -> DeclarationIdentity {
         DeclarationIdentity::new(self.module_identity.clone(), name, kind)
     }
@@ -1050,9 +1088,6 @@ impl Evaluator {
             ),
             Type::HashValues(element) => {
                 Type::HashValues(Box::new(self.resolve_type_identity(element)))
-            }
-            Type::TreeValues(element) => {
-                Type::TreeValues(Box::new(self.resolve_type_identity(element)))
             }
             Type::Function {
                 parameters,
@@ -1269,7 +1304,7 @@ enum Flow {
 
 #[derive(Clone)]
 struct Function {
-    parameters: Vec<(String, Option<Type>, bool)>,
+    parameters: Vec<(String, Option<Type>, bool, bool)>,
     return_type: Option<Type>,
     body: Arc<[Stmt]>,
     source: Option<SourceContext>,

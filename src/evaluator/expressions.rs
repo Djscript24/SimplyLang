@@ -9,8 +9,14 @@ impl Evaluator {
                 Literal::Float(value) => Value::Float(*value),
                 Literal::Bool(value) => Value::Bool(*value),
             }),
-            Expr::Array(values) => Ok(Value::Array(shared_values(self.evaluate_values(values)?))),
-            Expr::List(values) => Ok(Value::List(shared_values(self.evaluate_values(values)?))),
+            Expr::Array(values) => {
+                let values = self.evaluate_values(values)?;
+                Ok(self.make_array(values))
+            }
+            Expr::List(values) => {
+                let values = self.evaluate_values(values)?;
+                Ok(self.make_list(values))
+            }
             Expr::Tuple(values) => Ok(Value::Tuple(shared_values(self.evaluate_values(values)?))),
             Expr::Matrix(values) => Ok(Value::Matrix(shared_values(self.evaluate_values(values)?))),
             Expr::Hash(entries) => {
@@ -18,14 +24,7 @@ impl Evaluator {
                 for (name, expression) in entries {
                     values.insert(name.clone(), self.evaluate(expression)?);
                 }
-                Ok(Value::Hash(shared_map(values)))
-            }
-            Expr::Tree(entries) => {
-                let mut values = BTreeMap::new();
-                for (name, expression) in entries {
-                    values.insert(name.clone(), self.evaluate(expression)?);
-                }
-                Ok(Value::Tree(shared_map(values)))
+                Ok(self.make_hash(values))
             }
             Expr::Pipeline { source, steps } => {
                 let sum_type = self.pipeline_sum_type(source, steps);
@@ -46,9 +45,11 @@ impl Evaluator {
                     Value::Range { start, end, step } => {
                         self.evaluate_range_pipeline(start, end, step, steps, sum_type.clone())?
                     }
-                    Value::Array(values) | Value::List(values) => {
-                        self.evaluate_pipeline(owned_values(values), steps, sum_type.clone())?
-                    }
+                    Value::Array(values) | Value::List(values) => self.evaluate_pipeline(
+                        values.get_cloned().unwrap_or_default(),
+                        steps,
+                        sum_type.clone(),
+                    )?,
                     _ => {
                         return Err(self
                             .runtime_collection_error("pipeline source must be an array or list"));
@@ -62,9 +63,10 @@ impl Evaluator {
                     format!("unknown variable `{name}`"),
                 )
             }),
+            Expr::Ref(inner) => self.evaluate(inner),
             Expr::Unary { operator, operand } => {
                 let value = self.evaluate(operand)?;
-                operations::unary(value, operator, self.current_span.as_ref())
+                operations::unary(&self.heap, value, operator, self.current_span.as_ref())
             }
             Expr::Binary {
                 left,
@@ -80,12 +82,44 @@ impl Evaluator {
                     return Ok(Value::Bool(value));
                 }
                 let right = self.evaluate(right)?;
-                operations::binary(left, operator, right, self.current_span.as_ref())
+                operations::binary(
+                    &self.heap,
+                    left,
+                    operator,
+                    right,
+                    self.current_span.as_ref(),
+                )
             }
             Expr::Call { name, arguments } => {
                 if let Some(definition) = self.lookup_struct(name).cloned() {
                     let values = self.evaluate_values(arguments)?;
                     return self.construct_struct(name, &definition, values);
+                }
+                if matches!(self.lookup(name), Some(Value::Function(_))) {
+                    if let Some(Value::Function(function)) = self.lookup(name) {
+                        let mismatch = self.heap.with_function(*function, |function| {
+                            arguments.iter().enumerate().find_map(|(index, argument)| {
+                                let expected = function
+                                    .parameters
+                                    .get(index)
+                                    .is_some_and(|(_, _, _, by_ref)| *by_ref);
+                                let marked = matches!(argument, Expr::Ref(_));
+                                (expected != marked).then_some((index, expected))
+                            })
+                        });
+                        if let Some(Some((index, expected))) = mismatch {
+                            return Err(self.runtime_error_with_code(
+                                DiagnosticCode::RuntimeArgument,
+                                format!(
+                                    "argument {} to `{name}` {} `ref`",
+                                    index + 1,
+                                    if expected { "requires" } else { "must not use" }
+                                ),
+                            ));
+                        }
+                    }
+                    let values = self.evaluate_values(arguments)?;
+                    return self.invoke_function(name, values);
                 }
                 if name == "Ask" {
                     if !(1..=2).contains(&arguments.len()) {
@@ -183,23 +217,15 @@ impl Evaluator {
                         .iter()
                         .map(|argument| self.evaluate(argument))
                         .collect::<Result<Vec<_>, _>>()?;
-                    return evaluate_math_builtin(name, &values, self.current_span.as_ref())?
-                        .ok_or_else(|| {
-                            self.runtime_error(format!("unknown numerical builtin `{name}`"))
-                        });
-                }
-                if name == "print" {
-                    if arguments.len() != 1 {
-                        return Err(self.runtime_error_with_code(
-                            DiagnosticCode::RuntimeArgument,
-                            "`print` expects one argument",
-                        ));
-                    }
-                    let value = self.evaluate(&arguments[0])?;
-                    if self.output_enabled {
-                        print_value(&value, true);
-                    }
-                    return Ok(Value::Unit);
+                    return evaluate_math_builtin(
+                        &self.heap,
+                        name,
+                        &values,
+                        self.current_span.as_ref(),
+                    )?
+                    .ok_or_else(|| {
+                        self.runtime_error(format!("unknown numerical builtin `{name}`"))
+                    });
                 }
                 if name == "assert" {
                     if !(1..=2).contains(&arguments.len()) {
@@ -254,7 +280,6 @@ impl Evaluator {
                         Value::List(_) => "List",
                         Value::Tuple(_) => "Tuple",
                         Value::Hash(_) => "Hash",
-                        Value::Tree(_) => "Tree",
                         Value::Matrix(_) => "Matrix",
                         Value::Function(_) => "Function",
                         Value::Struct(instance) => {
@@ -290,6 +315,217 @@ impl Evaluator {
                                 format!("could not read file `{path}`: {error}"),
                             )
                         });
+                }
+                if name == "parse_json" {
+                    if arguments.len() != 1 {
+                        return Err(self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeArgument,
+                            "`parse_json` expects one string",
+                        ));
+                    }
+                    let source = match self.evaluate(&arguments[0])? {
+                        Value::String(source) => source,
+                        _ => {
+                            return Err(self.runtime_error_with_code(
+                                DiagnosticCode::RuntimeTypeMismatch,
+                                "`parse_json` expects a string",
+                            ));
+                        }
+                    };
+                    return json::parse(&self.heap, &source).map_err(|error| {
+                        self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeConversion,
+                            format!("could not parse JSON: {error}"),
+                        )
+                    });
+                }
+                if name == "read_json" {
+                    if arguments.len() != 1 {
+                        return Err(self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeArgument,
+                            "`read_json` expects one path",
+                        ));
+                    }
+                    let path = match self.evaluate(&arguments[0])? {
+                        Value::String(path) => path,
+                        _ => {
+                            return Err(self.runtime_error_with_code(
+                                DiagnosticCode::RuntimeTypeMismatch,
+                                "`read_json` path must be a string",
+                            ));
+                        }
+                    };
+                    let source = fs::read_to_string(&path).map_err(|error| {
+                        self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeIo,
+                            format!("could not read JSON file `{path}`: {error}"),
+                        )
+                    })?;
+                    return json::parse(&self.heap, &source).map_err(|error| {
+                        self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeConversion,
+                            format!("could not parse JSON file `{path}`: {error}"),
+                        )
+                    });
+                }
+                if name == "read_json_lines" {
+                    if arguments.len() != 1 {
+                        return Err(self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeArgument,
+                            "`read_json_lines` expects one path",
+                        ));
+                    }
+                    let path = match self.evaluate(&arguments[0])? {
+                        Value::String(path) => path,
+                        _ => {
+                            return Err(self.runtime_error_with_code(
+                                DiagnosticCode::RuntimeTypeMismatch,
+                                "`read_json_lines` path must be a string",
+                            ));
+                        }
+                    };
+                    let source = fs::read_to_string(&path).map_err(|error| {
+                        self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeIo,
+                            format!("could not read JSON Lines file `{path}`: {error}"),
+                        )
+                    })?;
+                    return json::parse_lines(&self.heap, &source).map_err(|error| {
+                        self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeConversion,
+                            format!("could not parse JSON Lines file `{path}`: {error}"),
+                        )
+                    });
+                }
+                if name == "to_json" {
+                    if arguments.len() != 1 {
+                        return Err(self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeArgument,
+                            "`to_json` expects one value",
+                        ));
+                    }
+                    let value = self.evaluate(&arguments[0])?;
+                    return json::serialize(&value).map(Value::String).map_err(|error| {
+                        self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeConversion,
+                            format!("could not serialize value as JSON: {error}"),
+                        )
+                    });
+                }
+                if name == "to_json_pretty" {
+                    if arguments.len() != 1 {
+                        return Err(self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeArgument,
+                            "`to_json_pretty` expects one value",
+                        ));
+                    }
+                    let value = self.evaluate(&arguments[0])?;
+                    return json::serialize_pretty(&value)
+                        .map(Value::String)
+                        .map_err(|error| {
+                            self.runtime_error_with_code(
+                                DiagnosticCode::RuntimeConversion,
+                                format!("could not serialize value as JSON: {error}"),
+                            )
+                        });
+                }
+                if name == "write_json" || name == "write_json_pretty" {
+                    if arguments.len() != 2 {
+                        return Err(self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeArgument,
+                            format!("`{name}` expects a path and a value"),
+                        ));
+                    }
+                    let path = match self.evaluate(&arguments[0])? {
+                        Value::String(path) => path,
+                        _ => {
+                            return Err(self.runtime_error_with_code(
+                                DiagnosticCode::RuntimeTypeMismatch,
+                                format!("`{name}` path must be a string"),
+                            ));
+                        }
+                    };
+                    let value = self.evaluate(&arguments[1])?;
+                    let serialized = if name == "write_json_pretty" {
+                        json::serialize_pretty(&value)
+                    } else {
+                        json::serialize(&value)
+                    };
+                    let source = serialized.map_err(|error| {
+                        self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeConversion,
+                            format!("could not serialize value as JSON: {error}"),
+                        )
+                    })?;
+                    files::atomic_write(Path::new(&path), source.as_bytes()).map_err(|error| {
+                        self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeIo,
+                            format!("could not write JSON file `{path}`: {error}"),
+                        )
+                    })?;
+                    return Ok(Value::Unit);
+                }
+                if name == "write_json_lines" {
+                    if arguments.len() != 2 {
+                        return Err(self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeArgument,
+                            "`write_json_lines` expects a path and an Array, List, or Tuple",
+                        ));
+                    }
+                    let path = match self.evaluate(&arguments[0])? {
+                        Value::String(path) => path,
+                        _ => {
+                            return Err(self.runtime_error_with_code(
+                                DiagnosticCode::RuntimeTypeMismatch,
+                                "`write_json_lines` path must be a string",
+                            ));
+                        }
+                    };
+                    let value = self.evaluate(&arguments[1])?;
+                    let source = json::serialize_lines(&value).map_err(|error| {
+                        self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeConversion,
+                            format!("could not serialize JSON Lines: {error}"),
+                        )
+                    })?;
+                    files::atomic_write(Path::new(&path), source.as_bytes()).map_err(|error| {
+                        self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeIo,
+                            format!("could not write JSON Lines file `{path}`: {error}"),
+                        )
+                    })?;
+                    return Ok(Value::Unit);
+                }
+                if name == "append_json_line" {
+                    if arguments.len() != 2 {
+                        return Err(self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeArgument,
+                            "`append_json_line` expects a path and a JSON value",
+                        ));
+                    }
+                    let path = match self.evaluate(&arguments[0])? {
+                        Value::String(path) => path,
+                        _ => {
+                            return Err(self.runtime_error_with_code(
+                                DiagnosticCode::RuntimeTypeMismatch,
+                                "`append_json_line` path must be a string",
+                            ));
+                        }
+                    };
+                    let value = self.evaluate(&arguments[1])?;
+                    let source = json::serialize(&value).map_err(|error| {
+                        self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeConversion,
+                            format!("could not serialize JSON Lines value: {error}"),
+                        )
+                    })?;
+                    files::append_line(Path::new(&path), source.as_bytes()).map_err(|error| {
+                        self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeIo,
+                            format!("could not append JSON Lines file `{path}`: {error}"),
+                        )
+                    })?;
+                    return Ok(Value::Unit);
                 }
                 if name == "write_file" {
                     if arguments.len() != 2 {
@@ -382,12 +618,12 @@ impl Evaluator {
                             return Err(self.runtime_type_error("`characters` expects a string"));
                         }
                     };
-                    return Ok(Value::Array(shared_values(
+                    return Ok(self.make_array(
                         value
                             .chars()
                             .map(|character| Value::String(character.to_string()))
                             .collect(),
-                    )));
+                    ));
                 }
                 if matches!(
                     name.as_str(),
@@ -417,9 +653,10 @@ impl Evaluator {
                             Value::String(searched) => value.contains(&searched),
                             _ => false,
                         },
-                        Value::Array(values) | Value::List(values) | Value::Tuple(values) => {
-                            values.iter().any(|value| value == &searched)
+                        Value::Array(values) | Value::List(values) => {
+                            values.iter().any(|value| value == searched)
                         }
+                        Value::Tuple(values) => values.iter().any(|value| value == &searched),
                         Value::Range { start, end, step } => {
                             matches!(searched, Value::Int(value)
                                 if (step > 0 && value >= start && value < end
@@ -428,9 +665,7 @@ impl Evaluator {
                                         % i128::from(step)
                                         == 0)
                         }
-                        Value::Hash(values) | Value::Tree(values) => {
-                            values.values().any(|value| value == &searched)
-                        }
+                        Value::Hash(values) => values.values().any(|value| value == searched),
                         _ => {
                             return Err(self.runtime_collection_error(
                                 "`contains` requires a collection or string",
@@ -458,10 +693,11 @@ impl Evaluator {
                     }
                     let collection = self.evaluate(&arguments[0])?;
                     let values = match collection {
-                        Value::Array(values) | Value::List(values) | Value::Tuple(values) => values,
-                        Value::Hash(values) | Value::Tree(values) => {
-                            shared_values(values.values().cloned().collect())
+                        Value::Array(values) | Value::List(values) => {
+                            values.get_cloned().unwrap_or_default()
                         }
+                        Value::Tuple(values) => values.to_vec(),
+                        Value::Hash(values) => values.values().collect(),
                         _ => {
                             return Err(self.runtime_collection_error(format!(
                                 "`{name}` requires a collection"
@@ -496,10 +732,11 @@ impl Evaluator {
                         }
                     };
                     let values = match collection {
-                        Value::Array(values) | Value::List(values) | Value::Tuple(values) => values,
-                        Value::Hash(values) | Value::Tree(values) => {
-                            shared_values(values.values().cloned().collect())
+                        Value::Array(values) | Value::List(values) => {
+                            values.get_cloned().unwrap_or_default()
                         }
+                        Value::Tuple(values) => values.to_vec(),
+                        Value::Hash(values) => values.values().collect(),
                         _ => {
                             return Err(self.runtime_collection_error(
                                 "`join` requires an array, list, or tuple",
@@ -525,10 +762,17 @@ impl Evaluator {
                     let collection = self.evaluate(&arguments[0])?;
                     let span = self.current_span.clone();
                     let mut total = SumAccumulator::new(sum_type);
-                    let mut add_value =
-                        |value| -> Result<(), SimplyError> { total.add(value, span.as_ref()) };
+                    let heap = &self.heap;
+                    let mut add_value = |value| -> Result<(), SimplyError> {
+                        total.add(heap, value, span.as_ref())
+                    };
                     match collection {
-                        Value::Array(values) | Value::List(values) | Value::Tuple(values) => {
+                        Value::Array(values) | Value::List(values) => {
+                            for value in values.iter() {
+                                add_value(value)?;
+                            }
+                        }
+                        Value::Tuple(values) => {
                             for value in values.iter() {
                                 add_value(value.clone())?;
                             }
@@ -681,12 +925,12 @@ impl Evaluator {
                             );
                         }
                     };
-                    return Ok(Value::List(shared_values(
+                    return Ok(self.make_list(
                         value
                             .split(&separator)
                             .map(|part| Value::String(part.into()))
                             .collect(),
-                    )));
+                    ));
                 }
                 if name == "replace" {
                     if arguments.len() != 3 {
@@ -707,6 +951,144 @@ impl Evaluator {
                         _ => return Err(self.runtime_type_error("`replace` expects strings")),
                     };
                     return Ok(Value::String(value.replace(&from, &to)));
+                }
+                if name == "regex_find_all" {
+                    if arguments.len() != 2 {
+                        return Err(self.runtime_argument_error(
+                            "`regex_find_all` expects text and a pattern",
+                        ));
+                    }
+                    let value = match self.evaluate(&arguments[0])? {
+                        Value::String(value) => value,
+                        _ => {
+                            return Err(self.runtime_type_error("`regex_find_all` expects strings"));
+                        }
+                    };
+                    let pattern = match self.evaluate(&arguments[1])? {
+                        Value::String(pattern) => pattern,
+                        _ => {
+                            return Err(self.runtime_type_error("`regex_find_all` expects strings"));
+                        }
+                    };
+                    let regex = regex::Regex::new(&pattern).map_err(|error| {
+                        self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeConversion,
+                            format!("invalid regular expression: {error}"),
+                        )
+                    })?;
+                    return Ok(self.make_array(
+                        regex
+                            .find_iter(&value)
+                            .map(|matched| Value::String(matched.as_str().into()))
+                            .collect(),
+                    ));
+                }
+                if name == "regex_replace" {
+                    if arguments.len() != 3 {
+                        return Err(self.runtime_argument_error(
+                            "`regex_replace` expects text, a pattern, and a replacement",
+                        ));
+                    }
+                    let value = match self.evaluate(&arguments[0])? {
+                        Value::String(value) => value,
+                        _ => return Err(self.runtime_type_error("`regex_replace` expects strings")),
+                    };
+                    let pattern = match self.evaluate(&arguments[1])? {
+                        Value::String(pattern) => pattern,
+                        _ => return Err(self.runtime_type_error("`regex_replace` expects strings")),
+                    };
+                    let replacement = match self.evaluate(&arguments[2])? {
+                        Value::String(replacement) => replacement,
+                        _ => return Err(self.runtime_type_error("`regex_replace` expects strings")),
+                    };
+                    let regex = regex::Regex::new(&pattern).map_err(|error| {
+                        self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeConversion,
+                            format!("invalid regular expression: {error}"),
+                        )
+                    })?;
+                    return Ok(Value::String(
+                        regex.replace_all(&value, replacement.as_str()).into_owned(),
+                    ));
+                }
+                if name == "score_rules" {
+                    if arguments.len() != 1 {
+                        return Err(self.runtime_argument_error(
+                            "`score_rules` expects one sequence of rule tuples",
+                        ));
+                    }
+                    let rules = self.evaluate(&arguments[0])?;
+                    let rules = match rules {
+                        Value::Array(values) | Value::List(values) => {
+                            values.get_cloned().unwrap_or_default()
+                        }
+                        Value::Tuple(values) => values.to_vec(),
+                        _ => {
+                            return Err(self.runtime_collection_error(
+                                "`score_rules` expects an Array, List, or Tuple",
+                            ));
+                        }
+                    };
+                    let mut score = 0i64;
+                    let mut matched = Vec::new();
+                    let mut unmatched = Vec::new();
+                    for (index, rule) in rules.iter().enumerate() {
+                        let Value::Tuple(fields) = rule else {
+                            return Err(self.runtime_collection_error(format!(
+                                "`score_rules` rule {} must be a (label, condition, weight) tuple",
+                                index + 1
+                            )));
+                        };
+                        if fields.len() != 3 {
+                            return Err(self.runtime_collection_error(format!(
+                                "`score_rules` rule {} must contain three values",
+                                index + 1
+                            )));
+                        }
+                        let label = match &fields[0] {
+                            Value::String(label) => label.clone(),
+                            _ => {
+                                return Err(self.runtime_type_error(format!(
+                                    "`score_rules` label in rule {} must be a String",
+                                    index + 1
+                                )));
+                            }
+                        };
+                        let condition = match &fields[1] {
+                            Value::Bool(condition) => *condition,
+                            _ => {
+                                return Err(self.runtime_type_error(format!(
+                                    "`score_rules` condition in rule {} must be a Bool",
+                                    index + 1
+                                )));
+                            }
+                        };
+                        let weight = match &fields[2] {
+                            Value::Int(weight) => *weight,
+                            _ => {
+                                return Err(self.runtime_type_error(format!(
+                                    "`score_rules` weight in rule {} must be an Int",
+                                    index + 1
+                                )));
+                            }
+                        };
+                        if condition {
+                            score = score.checked_add(weight).ok_or_else(|| {
+                                self.runtime_error_with_code(
+                                    DiagnosticCode::RuntimeConversion,
+                                    "`score_rules` total score exceeds the Int range",
+                                )
+                            })?;
+                            matched.push(Value::String(label));
+                        } else {
+                            unmatched.push(Value::String(label));
+                        }
+                    }
+                    let mut result = BTreeMap::new();
+                    result.insert("score".into(), Value::Int(score));
+                    result.insert("matched".into(), self.make_array(matched));
+                    result.insert("unmatched".into(), self.make_array(unmatched));
+                    return Ok(self.make_hash(result));
                 }
                 if name == "starts_with" || name == "ends_with" {
                     if arguments.len() != 2 {
@@ -743,13 +1125,12 @@ impl Evaluator {
                     }
                     let value = self.evaluate(&arguments[0])?;
                     let result = match value {
-                        Value::Array(values) | Value::List(values) | Value::Tuple(values) => {
-                            values.is_empty()
-                        }
+                        Value::Array(values) | Value::List(values) => values.is_empty(),
+                        Value::Tuple(values) => values.is_empty(),
                         Value::Range { start, end, step } => {
                             Value::range_len(start, end, step) == Some(0)
                         }
-                        Value::Hash(values) | Value::Tree(values) => values.is_empty(),
+                        Value::Hash(values) => values.is_empty(),
                         Value::String(value) => value.is_empty(),
                         _ => {
                             return Err(self
@@ -765,14 +1146,14 @@ impl Evaluator {
                     let value = self.evaluate(&arguments[0])?;
                     return Ok(match value {
                         Value::Array(values) => {
-                            let mut values = owned_values(values);
+                            let mut values = values.get_cloned().unwrap_or_default();
                             values.reverse();
-                            Value::Array(shared_values(values))
+                            self.make_array(values)
                         }
                         Value::List(values) => {
-                            let mut values = owned_values(values);
+                            let mut values = values.get_cloned().unwrap_or_default();
                             values.reverse();
-                            Value::List(shared_values(values))
+                            self.make_list(values)
                         }
                         Value::Tuple(values) => {
                             let mut values = owned_values(values);
@@ -797,7 +1178,7 @@ impl Evaluator {
                             })?;
                             values.extend(Value::range_values(start, end, step));
                             values.reverse();
-                            Value::Array(shared_values(values))
+                            self.make_array(values)
                         }
                         _ => {
                             return Err(self.runtime_type_error(
@@ -812,16 +1193,17 @@ impl Evaluator {
                 if name == "zip" && !matches!(self.lookup(name), Some(Value::Function(_))) {
                     return self.evaluate_zip(arguments);
                 }
-                if name == "length" || name == "count" {
+                if name == "length" {
                     if arguments.len() != 1 {
                         return Err(
                             self.runtime_argument_error(format!("`{name}` expects one argument"))
                         );
                     }
                     return match self.evaluate(&arguments[0])? {
-                        Value::Array(values) | Value::List(values) | Value::Tuple(values) => {
+                        Value::Array(values) | Value::List(values) => {
                             Ok(Value::Int(values.len() as i64))
                         }
+                        Value::Tuple(values) => Ok(Value::Int(values.len() as i64)),
                         Value::Range { start, end, step } => Value::range_len(start, end, step)
                             .map(Value::Int)
                             .ok_or_else(|| {
@@ -830,9 +1212,7 @@ impl Evaluator {
                                     "range length exceeds the Int range",
                                 )
                             }),
-                        Value::Hash(values) | Value::Tree(values) => {
-                            Ok(Value::Int(values.len() as i64))
-                        }
+                        Value::Hash(values) => Ok(Value::Int(values.len() as i64)),
                         Value::String(value) => Ok(Value::Int(value.chars().count() as i64)),
                         _ => Err(self.runtime_type_error(format!(
                             "`{name}` requires a collection or string"
@@ -885,7 +1265,7 @@ impl Evaluator {
                         .iter()
                         .map(|argument| self.evaluate(argument))
                         .collect::<Result<Vec<_>, _>>()?;
-                    return Ok(Value::List(shared_values(values)));
+                    return Ok(self.make_list(values));
                 }
                 let values = arguments
                     .iter()
@@ -969,11 +1349,9 @@ impl Evaluator {
                 collections::index(&target, &index_value, self.current_span.as_ref())
             }
             Expr::Field { target, name } => match self.evaluate(target)? {
-                Value::Hash(values) | Value::Tree(values) => {
-                    values.get(name).cloned().ok_or_else(|| {
-                        self.runtime_collection_error(format!("unknown field `{name}`"))
-                    })
-                }
+                Value::Hash(values) => values.get(name).ok_or_else(|| {
+                    self.runtime_collection_error(format!("unknown field `{name}`"))
+                }),
                 _ => Err(self.runtime_type_error("value has no fields")),
             },
         }

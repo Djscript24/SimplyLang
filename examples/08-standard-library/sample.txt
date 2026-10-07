@@ -1,0 +1,2 @@
+SimplyLang 2026 makes text easy to inspect.
+Words, letters, and numbers: 42.

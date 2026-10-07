@@ -598,7 +598,7 @@ fn checks_math_argument_types_before_execution() {
     assert!(success, "{error}");
 
     let (success, _, error) = check_source(
-        "fn fit(values as Array[Float]) gives Array[Float]:\n\
+        "fn fit(ref values as Array[Float]) gives Array[Float]:\n\
              return least_squares([[1, 0], [0, 1], [1, 1]], values)\n\
          end\n",
     );
@@ -609,10 +609,10 @@ fn checks_math_argument_types_before_execution() {
 fn checks_vector_and_matrix_element_types_statically() {
     let source = "mat as Matrix[Float] is [[1.0, 2.0], [3.0, 4.0]]\n\
          vec as Vector[Float] is [5.0, 6.0]\n\
-         fn transform(m as Matrix[Float], v as Vector[Float]) gives Array[Float]:\n\
+         fn transform(m as Matrix[Float], ref v as Vector[Float]) gives Array[Float]:\n\
              return matvec(m, v)\n\
          end\n\
-         Sayln transform(mat, vec)\n\
+         Sayln transform(mat, ref vec)\n\
          Sayln mat[0, 1]\n\
          Sayln mat + mat\n\
          Sayln vec[1]\n";
@@ -635,7 +635,7 @@ fn checks_vector_and_matrix_element_types_statically() {
             "expected Vector[String], found Vector[Int, 2]",
         ),
         (
-            "fn invalid(values as Vector[String]) gives Float:\n\
+            "fn invalid(ref values as Vector[String]) gives Float:\n\
                  return norm(values)\n\
              end\n",
             "expected a number, found String",

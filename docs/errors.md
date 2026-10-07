@@ -41,6 +41,7 @@ expose the canonical code in `error.code`.
 | `E.syntax.expression.missing` | `E0104` | `E.syntax.expression` | Required expression missing | Parser |
 | `E.semantic.name.undefined` | `E0001` | `E.semantic.name` | Name is not defined or visible | Semantic analysis |
 | `E.semantic.type.mismatch` | `E0003` | `E.semantic.type` | Value does not satisfy required type | Semantic analysis |
+| `E.semantic.ref.invalid` | `E0020` | `E.semantic.ref` | `ref` is outside its allowed function-call lifetime or violates read-only rules | Parser and semantic analysis |
 | `E.semantic.binding.reassignment` | `E0105` | `E.semantic.binding` | Invalid reassignment | Semantic analysis |
 | `E.semantic.declaration.duplicate` | `E0017` | `E.semantic.declaration` | Duplicate declaration | Semantic analysis |
 | `E.semantic.call.invalid` | `E0002` | `E.semantic.call` | Invalid function or constructor call | Semantic analysis |
@@ -75,7 +76,7 @@ expose the canonical code in `error.code`.
 | `E.runtime.binding.immutable` | `E0210` | `E.runtime.binding` | Runtime mutation violates binding mutability | Evaluator |
 | `E.cli.usage` | `E0301` | `E.cli` | Invalid command-line usage | CLI |
 
-The canonical registry currently contains 40 diagnostic identities. Common
+The canonical registry currently contains 41 diagnostic identities. Common
 argument, assertion, file-I/O, resource-limit, unknown-name, invalid-control,
 and unknown-enum-variant failures have dedicated runtime codes.
 `E.runtime.operation.failed` remains a fallback for runtime failures without a
@@ -118,7 +119,7 @@ end
 ```
 
 `throw` accepts enum values only. A caught user-defined enum is bound directly
-to the name after `catch`; built-in runtime failures bind a structured tree
+to the name after `catch`; built-in runtime failures bind a structured Hash
 with `message`, `code`, `category`, `line`, and `column` fields. Uncaught
 user-defined errors are rendered as runtime diagnostics under
 `E.runtime.operation.failed`. `finally` runs after the `try`/`catch` path,

@@ -31,9 +31,20 @@ impl SemanticAnalyzer {
             let saved_loop_depth = self.loop_depth;
             self.saw_return = false;
             self.loop_depth = 0;
+            let mut pushed_ref_scope = false;
             let branch_result = (|| {
+                let carries_borrow = !self.ref_parameter_scopes.is_empty()
+                    && self.expression_contains_ref_parameter(value, &self.ref_parameter_scopes);
+                let mut borrowed_bindings = HashSet::new();
                 for (binding, binding_type) in bindings {
+                    if carries_borrow && Self::type_may_contain_collection(&binding_type) {
+                        borrowed_bindings.insert(binding.clone());
+                    }
                     self.define_variable(binding, binding_type, false)?;
+                }
+                if !borrowed_bindings.is_empty() {
+                    self.ref_parameter_scopes.push(borrowed_bindings);
+                    pushed_ref_scope = true;
                 }
                 if let Some(guard) = &arm.guard {
                     let guard_type = self.analyze_expression(guard)?;
@@ -55,6 +66,9 @@ impl SemanticAnalyzer {
                         .unwrap_or(Ok(Type::Unit))
                 }
             })();
+            if pushed_ref_scope {
+                self.ref_parameter_scopes.pop();
+            }
             self.variables.truncate(frame_start);
             self.function_scopes.pop();
             self.loop_depth = saved_loop_depth;

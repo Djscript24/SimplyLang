@@ -1,5 +1,5 @@
 //! runtime/collections.rs — collection operations
-//! Implements indexing and mutation behavior for Simply arrays, lists, tuples, hashes, trees, and matrices.
+//! Implements indexing and mutation behavior for Simply arrays, lists, tuples, hashes, and matrices.
 //! Key component: collection index and mutation helpers.
 use crate::{
     ast::CollectionOperation,
@@ -12,11 +12,7 @@ pub(crate) fn index(
     index: &Value,
     span: Option<&Span>,
 ) -> Result<Value, SimplyError> {
-    if let (
-        Value::Matrix(rows) | Value::Array(rows) | Value::List(rows),
-        Value::Tuple(coordinates),
-    ) = (target, index)
-    {
+    if let (Value::Matrix(rows), Value::Tuple(coordinates)) = (target, index) {
         if coordinates.len() != 2 {
             return Err(error(span, "matrix index requires row and column"));
         }
@@ -25,17 +21,32 @@ pub(crate) fn index(
         return match rows.get(row) {
             Some(Value::Array(values)) | Some(Value::List(values)) => values
                 .get(column)
-                .cloned()
                 .ok_or_else(|| error(span, "matrix index out of bounds")),
             Some(_) => Err(error(span, "matrix row is not an array or list")),
             None => Err(error(span, "matrix index out of bounds")),
         };
     }
-    if let Value::Hash(values) | Value::Tree(values) = target {
+    if let (Value::Array(rows) | Value::List(rows), Value::Tuple(coordinates)) = (target, index) {
+        if coordinates.len() != 2 {
+            return Err(error(span, "matrix index requires row and column"));
+        }
+        let row = coordinate(&coordinates[0], span)?;
+        let column = coordinate(&coordinates[1], span)?;
+        let row_value = rows
+            .get(row)
+            .ok_or_else(|| error(span, "matrix index out of bounds"))?;
+        return match row_value {
+            Value::Array(values) | Value::List(values) => values
+                .get(column)
+                .ok_or_else(|| error(span, "matrix index out of bounds")),
+            _ => Err(error(span, "matrix row is not an array or list")),
+        };
+    }
+    if let Value::Hash(values) = target {
         if let Value::String(key) = index {
             return values
-                .get(key)
-                .cloned()
+                .with(|values| values.get(key).cloned())
+                .flatten()
                 .ok_or_else(|| error(span, format!("unknown key `{key}`")));
         }
         return Err(error(span, "hash key must be a string"));
@@ -70,10 +81,11 @@ pub(crate) fn index(
             .nth(index)
             .map(|character| Value::String(character.to_string()))
             .ok_or_else(|| error(span, "string index out of bounds")),
-        Value::Array(values)
-        | Value::List(values)
-        | Value::Tuple(values)
-        | Value::Matrix(values) => values
+        Value::Array(values) | Value::List(values) => values
+            .with(|values| values.get(index).cloned())
+            .flatten()
+            .ok_or_else(|| error(span, "collection index out of bounds")),
+        Value::Tuple(values) | Value::Matrix(values) => values
             .get(index)
             .cloned()
             .ok_or_else(|| error(span, "collection index out of bounds")),
@@ -88,21 +100,51 @@ pub(crate) fn set_index(
     span: Option<&Span>,
 ) -> Result<(), SimplyError> {
     if let (Value::Hash(values), Value::String(key)) = (&mut *target, &index) {
-        values.make_mut().insert(key.clone(), value);
-        return Ok(());
+        return values
+            .with_mut(|values| values.insert(key.clone(), value))
+            .map(|_| ())
+            .ok_or_else(|| error(span, "hash storage is no longer available"));
     }
     let index = collection_index(&index, span)?;
     match target {
-        Value::Array(values) | Value::List(values) => {
-            let slot = values
-                .make_mut()
-                .get_mut(index)
-                .ok_or_else(|| error(span, "collection index out of bounds"))?;
-            *slot = value;
-            Ok(())
-        }
+        Value::Array(values) | Value::List(values) => values
+            .with_mut(|values| values.get_mut(index).map(|slot| *slot = value))
+            .flatten()
+            .ok_or_else(|| error(span, "collection index out of bounds")),
         _ => Err(error(span, "value is not a mutable collection")),
     }
+}
+
+pub(crate) fn set_index_path(
+    target: &mut Value,
+    indices: Vec<Value>,
+    value: Value,
+    span: Option<&Span>,
+) -> Result<(), SimplyError> {
+    let Some((index, remaining)) = indices.split_first() else {
+        return Err(error(span, "missing collection index"));
+    };
+    if remaining.is_empty() {
+        return set_index(target, index.clone(), value, span);
+    }
+
+    let nested = match (&*target, index) {
+        (Value::Hash(values), Value::String(key)) => values
+            .with(|values| values.get(key).cloned())
+            .flatten()
+            .ok_or_else(|| error(span, format!("unknown key `{key}`")))?,
+        (Value::Hash(_), _) => return Err(error(span, "hash key must be a string")),
+        (Value::Array(values) | Value::List(values), index) => {
+            let index = collection_index(index, span)?;
+            values
+                .with(|values| values.get(index).cloned())
+                .flatten()
+                .ok_or_else(|| error(span, "collection index out of bounds"))?
+        }
+        _ => return Err(error(span, "value is not a mutable collection")),
+    };
+    let mut nested = nested;
+    set_index_path(&mut nested, remaining.to_vec(), value, span)
 }
 
 pub(crate) fn mutate_list(
@@ -113,18 +155,27 @@ pub(crate) fn mutate_list(
     span: Option<&Span>,
 ) -> Result<(), SimplyError> {
     match target {
-        Value::List(values) => {
-            let values = values.make_mut();
-            match operation {
-                CollectionOperation::Add => values.push(value),
-                CollectionOperation::Remove => {
-                    if let Some(position) = values.iter().position(|item| item == &value) {
-                        values.remove(position);
-                    }
+        Value::List(values) => match operation {
+            CollectionOperation::Add => values
+                .with_mut(|values| values.push(value))
+                .map(|()| ())
+                .ok_or_else(|| error(span, "list storage is no longer available")),
+            CollectionOperation::Remove => {
+                let position = values
+                    .get_cloned()
+                    .and_then(|values| values.iter().position(|item| item == &value));
+                if let Some(position) = position {
+                    values
+                        .with_mut(|values| {
+                            if position < values.len() {
+                                values.remove(position);
+                            }
+                        })
+                        .ok_or_else(|| error(span, "list storage is no longer available"))?;
                 }
+                Ok(())
             }
-            Ok(())
-        }
+        },
         _ => Err(SimplyError::Runtime {
             span: span.cloned().unwrap_or_else(|| Span::new(0, 0)),
             code: crate::error::DiagnosticCode::RuntimeCollection,
