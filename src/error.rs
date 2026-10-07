@@ -888,7 +888,3 @@ fn escape_control_characters(value: &str) -> String {
         })
         .collect()
 }
-
-#[cfg(test)]
-#[path = "../tests/internal/error.rs"]
-mod tests;

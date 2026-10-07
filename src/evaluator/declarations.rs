@@ -5,10 +5,7 @@ impl Evaluator {
         Self {
             scopes: ScopeStack::new(),
             variable_types: TypeScopes::new(),
-            function_values: SharedCell::new(Arena::new()),
-            struct_values: SharedCell::new(Arena::new()),
-            enum_values: SharedCell::new(Arena::new()),
-            source_values: SharedCell::new(Arena::new()),
+            heap: RuntimeHeap::default(),
             function_arena: Arena::new(),
             function_scopes: vec![HashMap::new()],
             struct_scopes: vec![HashMap::new()],

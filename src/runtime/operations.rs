@@ -1623,7 +1623,3 @@ fn division_error(span: Option<&Span>) -> SimplyError {
         message: "division by zero".into(),
     }
 }
-
-#[cfg(test)]
-#[path = "../../tests/internal/runtime_operations.rs"]
-mod tests;

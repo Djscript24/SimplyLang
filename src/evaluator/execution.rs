@@ -141,10 +141,7 @@ impl Evaluator {
         let program = Parser::new(tokens).parse()?;
         self.current_file = Some(resolved.clone());
         self.module_identity = resolved.display().to_string();
-        self.current_source = Some(ArenaRef::insert(
-            self.source_values.clone(),
-            SourceText { text: source },
-        ));
+        self.current_source = Some(self.heap.insert_source(SourceText { text: source }));
         self.import_stack = vec![resolved];
         self.module_is_imported = false;
         self.run(&program)

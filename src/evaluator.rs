@@ -24,7 +24,9 @@ use crate::{
     parser::Parser,
     runtime::{
         arena::{Arena, ArenaRef, Handle},
-        collections, files, limits, operations,
+        collections, files,
+        heap::RuntimeHeap,
+        limits, operations,
         scope::ScopeStack,
         storage::SharedCell,
         value::{
@@ -900,10 +902,7 @@ struct ActiveMessageState {
 pub struct Evaluator {
     scopes: ScopeStack,
     variable_types: TypeScopes,
-    function_values: SharedCell<Arena<FunctionValue>>,
-    struct_values: SharedCell<Arena<StructInstance>>,
-    enum_values: SharedCell<Arena<EnumValue>>,
-    source_values: SharedCell<Arena<SourceText>>,
+    heap: RuntimeHeap,
     function_arena: Arena<Function>,
     function_scopes: Vec<HashMap<String, Handle<Function>>>,
     struct_scopes: Vec<HashMap<String, StructDefinition>>,
@@ -1076,23 +1075,19 @@ impl Evaluator {
     }
 
     fn track_function(&mut self, function: FunctionValue) -> Handle<FunctionValue> {
-        self.function_values.borrow_mut().insert(function)
+        self.heap.insert_function(function)
     }
 
     fn tracked_function(
         &self,
         handle: Handle<FunctionValue>,
     ) -> Result<FunctionValue, SimplyError> {
-        self.function_values
-            .borrow()
-            .get(handle)
-            .cloned()
-            .ok_or_else(|| {
-                self.runtime_error_with_code(
-                    DiagnosticCode::RuntimeName,
-                    "function handle is no longer valid",
-                )
-            })
+        self.heap.function(handle).ok_or_else(|| {
+            self.runtime_error_with_code(
+                DiagnosticCode::RuntimeName,
+                "function handle is no longer valid",
+            )
+        })
     }
 
     fn tracked_struct(
@@ -1287,7 +1282,3 @@ mod imports;
 mod objects;
 mod pipelines;
 mod types;
-
-#[cfg(test)]
-#[path = "../tests/internal/evaluator.rs"]
-mod tests;

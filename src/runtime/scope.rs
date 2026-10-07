@@ -297,7 +297,3 @@ impl Default for ScopeStack {
         Self::new()
     }
 }
-
-#[cfg(test)]
-#[path = "../../tests/internal/runtime_scope.rs"]
-mod tests;

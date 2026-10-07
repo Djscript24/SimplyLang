@@ -4,6 +4,7 @@
 pub(crate) mod arena;
 pub(crate) mod collections;
 pub(crate) mod files;
+pub(crate) mod heap;
 pub(crate) mod limits;
 pub(crate) mod operations;
 pub(crate) mod scope;

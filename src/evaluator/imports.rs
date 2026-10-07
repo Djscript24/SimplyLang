@@ -42,7 +42,7 @@ impl Evaluator {
                 .parse()
                 .map_err(|error| error.in_source(resolved.display().to_string(), source.clone()))?;
             let program = Arc::new(program);
-            let source = ArenaRef::insert(self.source_values.clone(), SourceText { text: source });
+            let source = self.heap.insert_source(SourceText { text: source });
             self.import_cache
                 .borrow_mut()
                 .insert(resolved.clone(), (Arc::clone(&program), source.clone()));
@@ -58,10 +58,7 @@ impl Evaluator {
             current_file: Some(resolved.clone()),
             module_identity: resolved.display().to_string(),
             current_source: Some(source.clone()),
-            function_values: self.function_values.clone(),
-            struct_values: self.struct_values.clone(),
-            enum_values: self.enum_values.clone(),
-            source_values: self.source_values.clone(),
+            heap: self.heap.clone(),
             import_stack: self
                 .import_stack
                 .iter()
@@ -124,11 +121,11 @@ impl Evaluator {
                             }
                             let captures = module.scopes.values_for(&dependencies);
                             module
-                                .function_values
-                                .borrow_mut()
-                                .get_mut(*function)
-                                .expect("tracked function remains in its arena")
-                                .captures = captures;
+                                .heap
+                                .with_function_mut(*function, |function| {
+                                    function.captures = captures;
+                                })
+                                .expect("tracked function remains in its heap");
                         }
                     }
                     exports.insert(name, value);
@@ -150,11 +147,11 @@ impl Evaluator {
                             }
                             let captures = module.scopes.values_for(&dependencies);
                             module
-                                .function_values
-                                .borrow_mut()
-                                .get_mut(behavior.function)
-                                .expect("tracked message function remains in its arena")
-                                .captures = captures;
+                                .heap
+                                .with_function_mut(behavior.function, |function| {
+                                    function.captures = captures;
+                                })
+                                .expect("tracked message function remains in its heap");
                             Ok((key.clone(), behavior))
                         })
                         .collect::<Result<HashMap<_, _>, SimplyError>>()?;

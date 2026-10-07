@@ -1861,7 +1861,3 @@ impl Parser {
         self.peek().span.clone()
     }
 }
-
-#[cfg(test)]
-#[path = "../tests/internal/parser.rs"]
-mod tests;

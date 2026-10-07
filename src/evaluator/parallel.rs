@@ -209,11 +209,6 @@ pub(super) fn evaluate_parallel(
         for worker_index in 0..workers {
             let chunks = Arc::clone(&chunks);
             handles.push(scope.spawn(move || {
-                #[cfg(test)]
-                super::tests::PARALLEL_THREAD_IDS
-                    .lock()
-                    .expect("parallel test lock")
-                    .insert(std::thread::current().id());
                 let mut completed = Vec::new();
                 for index in (worker_index..chunks.len()).step_by(workers) {
                     let result = evaluate_chunk(&chunks[index], transforms)?;

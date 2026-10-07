@@ -103,7 +103,6 @@ can read and write files and otherwise access resources available to the
 operating-system process running it. Only run programs from sources you trust;
 Simply does not restrict filesystem access to the project or source directory.
 
-
 ## Language Basics
 
 Simply statements are normally separated by newlines, and blocks close with
@@ -303,8 +302,8 @@ an optional single payload pattern, plus positional Struct patterns. For
 example, `(left, (right, _))` matches nested tuples,
 `Result::Ok((left, right))` destructures a tuple payload, and
 `Person(name, Address(city))` matches Struct fields in declaration order.
-Struct patterns require the nominal type and exact field count; named-field
-patterns are not supported.
+Struct patterns require the nominal type. Positional patterns require the
+exact field count; named-field patterns can select fields by name.
 Identifier bindings exist only within their selected arm; a failed nested
 pattern does not expose any partial bindings.
 Enum payloads preserve nominal Struct and Enum values; a Struct stored in a
@@ -402,15 +401,14 @@ The evaluator fuses supported `where`/`derive` chains ending in `sum` or
 
 ### Compiler foundations
 
-Strings can be indexed and sliced by Unicode scalar position, traversed in
-linear time after one `characters(text)` conversion, and inspected with
-`is_ascii_alpha`, `is_ascii_digit`, and `is_whitespace`, read from or written
-to text files with `read_file` and `write_file`, and request user input with
-`Ask(prompt)` or `Ask(prompt, Int|Float|String|Bool)`. The
-`examples/11-compiler-foundations/mini-lexer.si` example demonstrates reading a
-Simply source file, scanning it one character at a time, and building
-token-like values. These capabilities provide the foundation for future
-self-hosted compiler development; Simply is not self-hosted.
+Strings support Unicode-scalar indexing and slicing, linear-time traversal
+after one `characters(text)` conversion, and inspection with `is_ascii_alpha`,
+`is_ascii_digit`, and `is_whitespace`. `read_file` and `write_file` handle text
+files; `Ask(prompt[, type])` reads user input. The
+`examples/11-compiler-foundations/mini-lexer.si` example reads a Simply source
+file, scans it one character at a time, and builds token-like values. These
+features support future self-hosted compiler development; Simply is not
+self-hosted.
 
 ### Imports
 
@@ -497,8 +495,8 @@ simply fmt <file.si>       # Format source text
 simply tokens <file.si>    # Print lexer tokens
 simply ast <file.si>       # Print the parsed AST
 simply bench <file.si>     # Measure front-end and runtime phases
-simply explain <file.si>       # Explain program structure and runtime model
-simply explain-flow <file.si>  # Print a Flow execution plan
+simply explain <file.si>      # Explain program structure and runtime model
+simply explain-flow <file.si> # Print a Flow execution plan
 simply test                # Run direct tests/*.si files
 simply repl                # Start the interactive evaluator
 simply --help              # Show command usage
@@ -549,52 +547,58 @@ The implementation follows a conventional interpreter pipeline:
 5. Runtime modules implement values, operations, collections, and scopes.
 
 Collections use reference-counted copy-on-write storage. Sharing a collection
-is cheap; a mutation detaches storage when another binding still references it.
+is cheap; a mutation detaches storage when another value still shares it.
 Function bodies and imported programs use shared storage where appropriate.
 
 ## Repository Layout
 
 ```text
 .
-├── src/                    # Rust interpreter implementation
-├── docs/                   # Language, semantics, project, and performance docs
-├── examples/               # Programs, module fixtures, and benchmarks
-│   ├── 01-basics/           # Basic language examples
-│   ├── 02-variables/        # Bindings and types
-│   ├── 03-operators/        # Operators and expressions
-│   ├── 04-control-flow/     # Control flow and error handling
-│   ├── 05-functions/        # Functions and closures
-│   ├── 06-collections/      # Collection operations
-│   ├── 07-pipelines/        # Collection pipelines
-│   ├── 08-standard-library/ # Standard-library examples and fixtures
-│   ├── 09-quality/          # Diagnostics and quality examples
-│   ├── 10-flow/             # Declarative Flow, CSV, and resume demos
-│   ├── 11-compiler-foundations/ # String, file, and miniature lexer examples
-│   ├── 12-mathematics/      # Scalar, vector, matrix, and statistics examples
-│   ├── 13-objects/          # Structs and type-specific messages
-│   ├── 14-enums/            # Enum declarations and values
-│   ├── 17-modules/          # Imports and module fixtures
-│   ├── 15-patterns/         # Structural pattern matching
-│   ├── 16-user-input/       # Interactive input examples
-│   ├── 99-bench/            # Benchmark programs and large input fixtures
-│   └── 99-smoke/            # Small smoke program
-├── tests/                  # Native Simply fixtures and Rust integration tests
-├── Cargo.toml              # Rust package metadata
-└── LICENSE                 # MIT license
+├── src/
+├── docs/
+├── examples/
+│   ├── 01-basics/
+│   ├── 02-variables/
+│   ├── 03-operators/
+│   ├── 04-control-flow/
+│   ├── 05-functions/
+│   ├── 06-collections/
+│   ├── 07-pipelines/
+│   ├── 08-standard-library/
+│   ├── 09-quality/
+│   ├── 10-flow/
+│   ├── 11-compiler-foundations/
+│   ├── 12-mathematics/
+│   ├── 13-objects/
+│   ├── 14-enums/
+│   ├── 15-patterns/
+│   ├── 16-user-input/
+│   ├── 17-modules/
+│   ├── 99-bench/
+│   └── 99-smoke/
+├── tests/
+├── Cargo.toml
+└── LICENSE
 ```
+
+`src/` contains the Rust interpreter, `docs/` contains the language and
+developer documentation, and `examples/` groups sample programs by topic.
+`tests/` contains Rust integration tests and Simply fixtures.
 
 ## Documentation
 
-- [Project documentation](docs/project.md) — project overview and layout.
 - [Language reference](docs/language.md) — statements, expressions, operators,
   built-ins, and language behavior.
 - [Type system](docs/types.md) — inference, annotations, compatibility, and
   numeric/matrix rules.
 - [Grammar](docs/grammar.md) — implementation-oriented syntax summary.
 - [Semantics](docs/semantics.md) — scopes, mutability, imports, and evaluation.
+- [Memory model](docs/memory-model.md) — sharing, copy-on-write, closure
+  capture, equality, and value lifetimes.
 - [Errors and diagnostics](docs/errors.md) — error categories and stable codes.
 - [Performance](docs/performance.md) — optimizations and benchmark workloads.
-- [Project contract](docs/project.md) — project layout and test discovery.
+- [Project contract](docs/project.md) — project layout, imports, and test
+  discovery.
 - [Examples](examples/) — runnable programs organized by feature.
 - [Tests](tests/) — native fixtures and Rust integration tests.
 

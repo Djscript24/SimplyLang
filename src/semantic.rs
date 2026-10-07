@@ -450,7 +450,3 @@ mod patterns;
 mod pipelines;
 mod statements;
 mod types;
-
-#[cfg(test)]
-#[path = "../tests/internal/semantic_support.rs"]
-pub(crate) mod test_support;

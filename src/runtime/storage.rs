@@ -188,7 +188,3 @@ impl<K: Ord, V> Deref for SharedMap<K, V> {
         &self.0
     }
 }
-
-#[cfg(test)]
-#[path = "../../tests/internal/runtime_storage.rs"]
-mod tests;

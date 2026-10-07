@@ -227,14 +227,11 @@ impl Evaluator {
             self.ensure_type(&value, &field.field_type, &field.name)?;
             fields.insert(field.name.clone(), value);
         }
-        Ok(Value::Struct(ArenaRef::insert(
-            self.struct_values.clone(),
-            StructInstance {
-                identity: definition.identity.clone(),
-                type_name: name.into(),
-                fields,
-            },
-        )))
+        Ok(Value::Struct(self.heap.insert_struct(StructInstance {
+            identity: definition.identity.clone(),
+            type_name: name.into(),
+            fields,
+        })))
     }
 
     pub(super) fn invoke_function(

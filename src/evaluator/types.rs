@@ -486,9 +486,8 @@ impl Evaluator {
                 .with(|value| Type::Enum(value.identity.clone()))
                 .unwrap_or(Type::Unknown),
             Value::Function(function) => self
-                .function_values
-                .borrow()
-                .get(*function)
+                .heap
+                .function(*function)
                 .map(|function| Type::Function {
                     parameters: function
                         .parameters

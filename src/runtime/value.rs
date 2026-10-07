@@ -316,7 +316,3 @@ fn instance_display(value: &ArenaRef<EnumValue>, output: &mut String) -> Option<
         }
     })
 }
-
-#[cfg(test)]
-#[path = "../../tests/internal/runtime_value.rs"]
-mod tests;

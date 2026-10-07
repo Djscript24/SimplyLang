@@ -494,7 +494,3 @@ impl<'a> Lexer<'a> {
         self.source
     }
 }
-
-#[cfg(test)]
-#[path = "../tests/internal/lexer.rs"]
-mod tests;

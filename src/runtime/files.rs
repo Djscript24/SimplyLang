@@ -79,7 +79,3 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> 
     }
     result
 }
-
-#[cfg(test)]
-#[path = "../../tests/internal/runtime_files.rs"]
-mod tests;

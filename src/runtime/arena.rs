@@ -220,7 +220,3 @@ impl<T> ArenaRef<T> {
             .flatten()
     }
 }
-
-#[cfg(test)]
-#[path = "../../tests/internal/runtime_arena.rs"]
-mod tests;

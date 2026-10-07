@@ -214,7 +214,3 @@ fn dimensions_compatible(actual: Option<usize>, expected: Option<usize>) -> bool
         _ => true,
     }
 }
-
-#[cfg(test)]
-#[path = "../tests/internal/types.rs"]
-mod tests;

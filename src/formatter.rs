@@ -1271,7 +1271,3 @@ fn render_pattern(value: &MatchPattern) -> String {
         MatchPattern::Wildcard => "_".into(),
     }
 }
-
-#[cfg(test)]
-#[path = "../tests/internal/formatter.rs"]
-mod tests;

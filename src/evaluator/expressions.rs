@@ -946,15 +946,12 @@ impl Evaluator {
                             ));
                         }
                     };
-                    Ok(Value::Enum(ArenaRef::insert(
-                        self.enum_values.clone(),
-                        EnumValue {
-                            enum_name: enum_name.clone(),
-                            identity: definition.identity,
-                            variant_name: variant_name.clone(),
-                            payload,
-                        },
-                    )))
+                    Ok(Value::Enum(self.heap.insert_enum(EnumValue {
+                        enum_name: enum_name.clone(),
+                        identity: definition.identity,
+                        variant_name: variant_name.clone(),
+                        payload,
+                    })))
                 } else {
                     Err(self.runtime_error_with_code(
                         DiagnosticCode::RuntimeMessage,
