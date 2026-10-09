@@ -46,6 +46,8 @@ pub(crate) struct ScopeStack {
     scopes: Vec<HashMap<String, BindingToken>>,
     bindings: HashMap<String, Vec<usize>>,
     mutability: HashMap<String, Vec<bool>>,
+    references: HashMap<String, Vec<bool>>,
+    exclusive_borrows: HashMap<String, Vec<bool>>,
     reusable_scopes: Vec<HashMap<String, BindingToken>>,
 }
 
@@ -56,6 +58,8 @@ impl ScopeStack {
             scopes: vec![HashMap::new()],
             bindings: HashMap::new(),
             mutability: HashMap::new(),
+            references: HashMap::new(),
+            exclusive_borrows: HashMap::new(),
             reusable_scopes: Vec::new(),
         }
     }
@@ -65,6 +69,17 @@ impl ScopeStack {
         name: String,
         value: Value,
         mutable: bool,
+    ) -> Result<(), String> {
+        self.define_with_borrow_mode(name, value, mutable, false, false)
+    }
+
+    pub(crate) fn define_with_borrow_mode(
+        &mut self,
+        name: String,
+        value: Value,
+        mutable: bool,
+        reference: bool,
+        exclusive_borrow: bool,
     ) -> Result<(), String> {
         let current = self
             .scopes
@@ -81,7 +96,18 @@ impl ScopeStack {
             .entry(name.clone())
             .or_default()
             .push(self.scopes.len() - 1);
-        self.mutability.entry(name).or_default().push(mutable);
+        self.mutability
+            .entry(name.clone())
+            .or_default()
+            .push(mutable);
+        self.references
+            .entry(name.clone())
+            .or_default()
+            .push(reference);
+        self.exclusive_borrows
+            .entry(name)
+            .or_default()
+            .push(exclusive_borrow);
         Ok(())
     }
 
@@ -114,7 +140,12 @@ impl ScopeStack {
                 .entry(name.clone())
                 .or_default()
                 .push(scope_index);
-            self.mutability.entry(name).or_default().push(mutable);
+            self.mutability
+                .entry(name.clone())
+                .or_default()
+                .push(mutable);
+            self.references.entry(name.clone()).or_default().push(false);
+            self.exclusive_borrows.entry(name).or_default().push(false);
         }
         Ok(())
     }
@@ -142,6 +173,22 @@ impl ScopeStack {
 
     pub(crate) fn is_mutable(&self, name: &str) -> bool {
         self.mutability
+            .get(name)
+            .and_then(|values| values.last())
+            .copied()
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn is_exclusive_borrow(&self, name: &str) -> bool {
+        self.exclusive_borrows
+            .get(name)
+            .and_then(|values| values.last())
+            .copied()
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn is_reference(&self, name: &str) -> bool {
+        self.references
             .get(name)
             .and_then(|values| values.last())
             .copied()
@@ -240,6 +287,18 @@ impl ScopeStack {
                     self.mutability.remove(name);
                 }
             }
+            if let Some(values) = self.exclusive_borrows.get_mut(name) {
+                values.pop();
+                if values.is_empty() {
+                    self.exclusive_borrows.remove(name);
+                }
+                if let Some(values) = self.references.get_mut(name) {
+                    values.pop();
+                    if values.is_empty() {
+                        self.references.remove(name);
+                    }
+                }
+            }
         }
         Some(value)
     }
@@ -282,6 +341,18 @@ impl ScopeStack {
                         values.pop();
                         if values.is_empty() {
                             self.mutability.remove(&name);
+                        }
+                    }
+                    if let Some(values) = self.exclusive_borrows.get_mut(&name) {
+                        values.pop();
+                        if values.is_empty() {
+                            self.exclusive_borrows.remove(&name);
+                        }
+                        if let Some(values) = self.references.get_mut(&name) {
+                            values.pop();
+                            if values.is_empty() {
+                                self.references.remove(&name);
+                            }
                         }
                     }
                 }

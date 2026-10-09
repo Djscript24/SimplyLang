@@ -22,6 +22,7 @@ use crate::{
 struct FunctionSignature {
     parameters: Vec<Option<Type>>,
     ref_parameters: Vec<bool>,
+    mut_ref_parameters: Vec<bool>,
     return_type: Option<Type>,
 }
 
@@ -29,6 +30,7 @@ struct FunctionSignature {
 struct MessageSignature {
     parameters: Vec<Option<Type>>,
     ref_parameters: Vec<bool>,
+    mut_ref_parameters: Vec<bool>,
     return_type: Option<Type>,
 }
 
@@ -80,6 +82,7 @@ pub struct SemanticAnalyzer {
     function_depth: usize,
     function_capture_frames: Vec<(usize, bool)>,
     ref_parameter_scopes: Vec<HashSet<String>>,
+    mut_ref_parameter_scopes: Vec<HashSet<String>>,
     function_return: Option<Type>,
     inferred_return: Option<Type>,
     saw_return: bool,
@@ -95,6 +98,23 @@ struct ScopeStack {
     scopes: Vec<HashMap<String, Type>>,
     bindings: HashMap<String, Vec<usize>>,
     mutability: HashMap<String, Vec<bool>>,
+    ref_modes: HashMap<String, Vec<Option<bool>>>,
+    vector_provenance: HashMap<String, Vec<VectorProvenance>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VectorProvenance {
+    TupleBacked,
+    ArrayBacked,
+    Unknown,
+}
+
+type VectorProvenanceSnapshot = HashMap<String, Vec<VectorProvenance>>;
+
+impl VectorProvenance {
+    fn join(self, other: Self) -> Self {
+        if self == other { self } else { Self::Unknown }
+    }
 }
 
 fn resolve_import_path(current_file: Option<&Path>, path: &str) -> Result<PathBuf, SimplyError> {
@@ -119,6 +139,8 @@ impl ScopeStack {
             scopes: vec![HashMap::new()],
             bindings: HashMap::new(),
             mutability: HashMap::new(),
+            ref_modes: HashMap::new(),
+            vector_provenance: HashMap::new(),
         }
     }
 
@@ -156,7 +178,15 @@ impl ScopeStack {
             .entry(name.clone())
             .or_default()
             .push(self.scopes.len() - 1);
-        self.mutability.entry(name).or_default().push(mutable);
+        self.mutability
+            .entry(name.clone())
+            .or_default()
+            .push(mutable);
+        self.ref_modes.entry(name.clone()).or_default().push(None);
+        self.vector_provenance
+            .entry(name.clone())
+            .or_default()
+            .push(VectorProvenance::Unknown);
         Ok(previous)
     }
 
@@ -193,7 +223,15 @@ impl ScopeStack {
             .entry(name.clone())
             .or_default()
             .push(self.scopes.len() - 1);
-        self.mutability.entry(name).or_default().push(mutable);
+        self.mutability
+            .entry(name.clone())
+            .or_default()
+            .push(mutable);
+        self.ref_modes.entry(name.clone()).or_default().push(None);
+        self.vector_provenance
+            .entry(name.clone())
+            .or_default()
+            .push(VectorProvenance::Unknown);
         Ok(())
     }
 
@@ -224,6 +262,74 @@ impl ScopeStack {
             .unwrap_or(false)
     }
 
+    fn is_reference(&self, name: &str) -> bool {
+        self.ref_modes
+            .get(name)
+            .and_then(|modes| modes.last())
+            .is_some_and(Option::is_some)
+    }
+
+    fn is_exclusive_reference(&self, name: &str) -> bool {
+        self.ref_modes
+            .get(name)
+            .and_then(|modes| modes.last())
+            .copied()
+            .flatten()
+            .unwrap_or(false)
+    }
+
+    fn mark_reference(&mut self, name: &str, exclusive: bool) {
+        if let Some(mode) = self
+            .ref_modes
+            .get_mut(name)
+            .and_then(|modes| modes.last_mut())
+        {
+            *mode = Some(exclusive);
+        }
+    }
+
+    fn vector_provenance(&self, name: &str) -> VectorProvenance {
+        self.vector_provenance
+            .get(name)
+            .and_then(|values| values.last())
+            .copied()
+            .unwrap_or(VectorProvenance::Unknown)
+    }
+
+    fn set_vector_provenance(&mut self, name: &str, provenance: VectorProvenance) {
+        if let Some(value) = self
+            .vector_provenance
+            .get_mut(name)
+            .and_then(|values| values.last_mut())
+        {
+            *value = provenance;
+        }
+    }
+
+    fn snapshot_vector_provenance(&self) -> VectorProvenanceSnapshot {
+        self.vector_provenance.clone()
+    }
+
+    fn restore_vector_provenance(&mut self, snapshot: &VectorProvenanceSnapshot) {
+        self.vector_provenance.clone_from(snapshot);
+    }
+
+    fn merge_vector_provenance(&mut self, snapshots: &[VectorProvenanceSnapshot]) {
+        for (name, values) in &mut self.vector_provenance {
+            for (index, value) in values.iter_mut().enumerate() {
+                *value = snapshots.iter().fold(*value, |merged, snapshot| {
+                    merged.join(
+                        snapshot
+                            .get(name)
+                            .and_then(|values| values.get(index))
+                            .copied()
+                            .unwrap_or(VectorProvenance::Unknown),
+                    )
+                });
+            }
+        }
+    }
+
     fn binding_scope(&self, name: &str) -> Option<usize> {
         self.bindings.get(name)?.last().copied()
     }
@@ -243,6 +349,18 @@ impl ScopeStack {
                 values.pop();
                 if values.is_empty() {
                     self.mutability.remove(name);
+                }
+                if let Some(values) = self.ref_modes.get_mut(name) {
+                    values.pop();
+                    if values.is_empty() {
+                        self.ref_modes.remove(name);
+                    }
+                }
+                if let Some(values) = self.vector_provenance.get_mut(name) {
+                    values.pop();
+                    if values.is_empty() {
+                        self.vector_provenance.remove(name);
+                    }
                 }
             }
         }
@@ -266,6 +384,18 @@ impl ScopeStack {
                         values.pop();
                         if values.is_empty() {
                             self.mutability.remove(name);
+                        }
+                        if let Some(values) = self.ref_modes.get_mut(name) {
+                            values.pop();
+                            if values.is_empty() {
+                                self.ref_modes.remove(name);
+                            }
+                        }
+                        if let Some(values) = self.vector_provenance.get_mut(name) {
+                            values.pop();
+                            if values.is_empty() {
+                                self.vector_provenance.remove(name);
+                            }
                         }
                     }
                 }
@@ -292,6 +422,36 @@ impl SemanticAnalyzer {
 
     fn identity(&self, name: &str, kind: DeclarationKind) -> DeclarationIdentity {
         DeclarationIdentity::new(self.module_identity.clone(), name, kind)
+    }
+
+    fn expression_vector_provenance(
+        &self,
+        expression: &Expr,
+        actual: &Type,
+        expected: &Type,
+    ) -> VectorProvenance {
+        if !matches!(expected, Type::Vector(_, _)) {
+            return VectorProvenance::Unknown;
+        }
+        match expression {
+            Expr::Identifier(name) => self.variables.vector_provenance(name),
+            Expr::Array(_) | Expr::List(_) => VectorProvenance::ArrayBacked,
+            Expr::Tuple(_) => VectorProvenance::TupleBacked,
+            _ if matches!(actual, Type::Tuple(_)) => VectorProvenance::TupleBacked,
+            _ => VectorProvenance::Unknown,
+        }
+    }
+
+    fn pattern_matches_known_bool(pattern: &MatchPattern, value: bool) -> bool {
+        match pattern {
+            MatchPattern::Literal(Literal::Bool(pattern_value)) => *pattern_value == value,
+            MatchPattern::Wildcard | MatchPattern::Identifier(_) => true,
+            MatchPattern::Alias { pattern, .. } => Self::pattern_matches_known_bool(pattern, value),
+            MatchPattern::Or(patterns) => patterns
+                .iter()
+                .any(|pattern| Self::pattern_matches_known_bool(pattern, value)),
+            _ => false,
+        }
     }
 
     fn enum_name_for_identity(&self, identity: &DeclarationIdentity) -> Option<&String> {

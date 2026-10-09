@@ -321,3 +321,473 @@ fn nested_collection_mutations_in_message_state_persist() {
     assert!(success, "nested collection state did not persist: {output}");
     assert_eq!(output, "[1, 2]\n");
 }
+
+#[test]
+fn message_receivers_respect_borrows_of_collection_fields() {
+    let source = r#"type Box:
+    items as List[Int]
+end
+on Box receive first:
+    return items[0]
+end
+on Box receive add(item as Int):
+    items add item
+end
+mut values is list [1]
+box is Box(values)
+fn read_while_exclusive(mut ref active as List[Int]):
+    return box :: first
+end
+Sayln read_while_exclusive(values)
+"#;
+    let (success, error) = run_source(source);
+    assert!(
+        !success,
+        "a message read bypassed an exclusive borrow of a field alias"
+    );
+    assert!(
+        error.contains("error[E.semantic.ref.invalid]"),
+        "missing borrow-conflict diagnostic: {error}"
+    );
+
+    let source = r#"type Box:
+    items as List[Int]
+end
+on Box receive add(item as Int):
+    items add item
+end
+mut values is list [1]
+box is Box(values)
+fn mutate_while_shared(ref active as List[Int]):
+    box :: add(2)
+end
+mutate_while_shared(values)
+"#;
+    let (success, error) = run_source(source);
+    assert!(
+        !success,
+        "a mutating message bypassed a shared borrow of a field alias"
+    );
+    assert!(
+        error.contains("error[E.semantic.ref.invalid]"),
+        "missing borrow-conflict diagnostic: {error}"
+    );
+}
+
+#[test]
+fn struct_fields_can_be_borrowed_through_bracket_paths() {
+    let source = r#"type Stats:
+    score as Int
+end
+type Profile:
+    name as String
+    stats as Stats
+    scores as List[Int]
+end
+mut profile is Profile("Ada", Stats(7), list [2, 3])
+name is ref profile["name"]
+mut score is ref profile["stats"]["score"]
+mut first_score is ref profile["scores"][0]
+Sayln name
+score -> 9
+first_score -> 8
+Sayln profile["stats"]["score"]
+Sayln profile["scores"][0]
+"#;
+    let (success, output) = run_source_stdout(source);
+    assert!(success, "nested Struct field borrowing failed: {output}");
+    assert_eq!(output, "Ada\n9\n8\n");
+}
+
+#[test]
+fn struct_field_borrows_detect_aliases_and_block_message_mutation() {
+    let source = r#"type Person:
+    age as Int
+end
+mut person is Person(1)
+mut alias is person
+fn conflict():
+    mut first is ref person["age"]
+    mut second is ref alias["age"]
+end
+conflict()
+"#;
+    let (success, error) = run_source(source);
+    assert!(
+        !success,
+        "aliased Struct fields were borrowed exclusively twice"
+    );
+    assert!(error.contains("error[E.semantic.ref.invalid]"), "{error}");
+    assert!(error.contains("conflicting borrow"), "{error}");
+    assert!(
+        error.contains("8:5"),
+        "diagnostic must locate the conflicting borrow: {error}"
+    );
+
+    let source = r#"type Person:
+    age as Int
+end
+on Person receive set_age(next as Int):
+    age -> next
+end
+mut person is Person(1)
+age is ref person["age"]
+person :: set_age(4)
+"#;
+    let (success, error) = run_source(source);
+    assert!(!success, "message mutation bypassed a shared field borrow");
+    assert!(error.contains("error[E.semantic.ref.invalid]"), "{error}");
+    assert!(error.contains("mutation of Struct field `age`"), "{error}");
+    assert!(
+        error.contains("5:5"),
+        "diagnostic must locate the conflicting field mutation: {error}"
+    );
+
+    let source = r#"type Person:
+    name as String
+    age as Int
+end
+on Person receive rename(next as String):
+    name -> next
+end
+on Person receive read_name:
+    return name
+end
+mut person is Person("Ada", 37)
+age is ref person["age"]
+Sayln person :: read_name
+person :: rename("Grace")
+Sayln age
+Sayln person["name"]
+"#;
+    let (success, output) = run_source_stdout(source);
+    assert!(
+        success,
+        "disjoint field message access conflicted with a shared field borrow: {output}"
+    );
+    assert_eq!(output, "Ada\n37\nGrace\n");
+}
+
+#[test]
+fn struct_field_borrows_allow_disjoint_fields_and_reject_whole_object_overlap() {
+    let source = r#"type Person:
+    age as Int
+    score as Int
+end
+mut person is Person(1, 10)
+mut age is ref person["age"]
+mut score is ref person["score"]
+age -> 2
+score -> 20
+Sayln person["age"]
+Sayln person["score"]
+"#;
+    let (success, output) = run_source_stdout(source);
+    assert!(
+        success,
+        "disjoint Struct fields could not be borrowed simultaneously: {output}"
+    );
+    assert_eq!(output, "2\n20\n");
+
+    let source = r#"type Person:
+    age as Int
+end
+mut person is Person(1)
+mut whole is ref person
+mut age is ref person["age"]
+"#;
+    let (success, error) = run_source(source);
+    assert!(!success, "whole-Struct and field borrows did not conflict");
+    assert!(error.contains("error[E.semantic.ref.invalid]"), "{error}");
+
+    let source = r#"type Stats:
+    score as Int
+end
+type Profile:
+    stats as Stats
+end
+mut profile is Profile(Stats(1))
+mut stats is profile["stats"]
+fn conflict():
+    mut first is ref profile["stats"]["score"]
+    mut second is ref stats["score"]
+end
+conflict()
+"#;
+    let (success, error) = run_source(source);
+    assert!(
+        !success,
+        "aliases reaching the same nested Struct field through different paths did not conflict"
+    );
+    assert!(error.contains("error[E.semantic.ref.invalid]"), "{error}");
+}
+
+#[test]
+fn message_field_access_is_conservative_for_exclusive_and_specific_for_shared_borrows() {
+    let source = r#"type Pair:
+    a as Int
+    b as Int
+end
+on Pair receive read_a:
+    return a
+end
+on Pair receive read_b:
+    return b
+end
+on Pair receive set_a(value as Int):
+    a -> value
+end
+on Pair receive set_b(value as Int):
+    b -> value
+end
+on Pair receive nested_read_a:
+    return pair :: read_a
+end
+on Pair receive nested_write_a:
+    pair :: set_a(8)
+end
+mut pair is Pair(1, 2)
+a is ref pair["a"]
+Sayln pair :: read_b
+pair :: set_b(3)
+Sayln a
+Sayln pair["b"]
+Sayln pair :: nested_read_a
+"#;
+    let (success, output) = run_source_stdout(source);
+    assert!(
+        success,
+        "shared field borrow should permit unrelated field accesses: {output}"
+    );
+    assert_eq!(output, "2\n1\n3\n1\n");
+
+    let source = r#"type Pair:
+    a as Int
+    b as Int
+end
+on Pair receive read_b:
+    return b
+end
+mut pair is Pair(1, 2)
+mut a is ref pair["a"]
+pair :: read_b
+"#;
+    let (success, error) = run_source(source);
+    assert!(
+        !success,
+        "Struct message dispatch should conservatively reject an exclusive field borrow"
+    );
+    assert!(error.contains("error[E.semantic.ref.invalid]"), "{error}");
+    assert!(error.contains("active exclusive borrow"), "{error}");
+
+    let source = r#"type Pair:
+    a as Int
+    b as Int
+end
+on Pair receive set_a(value as Int):
+    a -> value
+end
+on Pair receive nested_write_a:
+    pair :: set_a(8)
+end
+mut pair is Pair(1, 2)
+a is ref pair["a"]
+pair :: nested_write_a
+"#;
+    let (success, error) = run_source(source);
+    assert!(
+        !success,
+        "nested message mutation bypassed a shared borrow of the same field"
+    );
+    assert!(error.contains("error[E.semantic.ref.invalid]"), "{error}");
+    assert!(error.contains("mutation of Struct field `a`"), "{error}");
+
+    let source = r#"type Pair:
+    items as List[Int]
+    count as Int
+end
+on Pair receive read_count:
+    return count
+end
+on Pair receive set_count(value as Int):
+    count -> value
+end
+mut pair is Pair(list [1], 2)
+items is ref pair["items"]
+Sayln pair :: read_count
+pair :: set_count(3)
+Sayln items[0]
+Sayln pair["count"]
+"#;
+    let (success, output) = run_source_stdout(source);
+    assert!(
+        success,
+        "shared nested-collection borrow should permit unrelated field access: {output}"
+    );
+    assert_eq!(output, "2\n1\n3\n");
+
+    let source = r#"type Pair:
+    items as List[Int]
+    count as Int
+end
+on Pair receive read_count:
+    return count
+end
+mut pair is Pair(list [1], 2)
+mut items is ref pair["items"]
+pair :: read_count
+"#;
+    let (success, error) = run_source(source);
+    assert!(
+        !success,
+        "an unrelated message bypassed the receiver identity of an exclusive nested borrow"
+    );
+    assert!(error.contains("error[E.semantic.ref.invalid]"), "{error}");
+    assert!(error.contains("active exclusive borrow"), "{error}");
+}
+
+#[test]
+fn whole_object_field_borrows_block_replacement_and_allow_field_local_mutation() {
+    let source = r#"type Box:
+    items as List[Int]
+end
+fn append(mut ref items as List[Int]):
+    items add 3
+end
+mut box is Box(list [1])
+mut items is ref box["items"]
+items :: append
+Sayln box["items"]
+"#;
+    let (success, output) = run_source_stdout(source);
+    assert!(
+        success,
+        "forwarding a Struct-field collection borrow failed: {output}"
+    );
+    assert_eq!(output, "[1, 3]\n");
+
+    let source = r#"type Box:
+    items as List[Int]
+end
+mut box is Box(list [1])
+mut items is ref box["items"]
+items add 2
+Sayln box["items"]
+"#;
+    let (success, output) = run_source_stdout(source);
+    assert!(
+        success,
+        "exclusive collection field borrow failed: {output}"
+    );
+    assert_eq!(output, "[1, 2]\n");
+
+    let source = r#"type Person:
+    age as Int
+end
+mut person is Person(1)
+age is ref person["age"]
+person -> Person(2)
+"#;
+    let (success, error) = run_source(source);
+    assert!(!success, "borrowed Struct owner was reassigned");
+    assert!(error.contains("error[E.semantic.ref.invalid]"), "{error}");
+
+    let source = r#"type Box:
+    items as List[Int]
+end
+mut box is Box(list [1])
+mut items is ref box["items"]
+mut first is ref box["items"][0]
+"#;
+    let (success, error) = run_source(source);
+    assert!(!success, "whole-field and descendant borrows overlapped");
+    assert!(error.contains("error[E.semantic.ref.invalid]"), "{error}");
+
+    let source = r#"type Box:
+    items as List[Int]
+end
+on Box receive add(item as Int):
+    items add item
+end
+mut box is Box(list [1])
+mut slot is ref box["items"][0]
+box :: add(2)
+"#;
+    let (success, error) = run_source(source);
+    assert!(!success, "message mutation bypassed a nested field borrow");
+    assert!(error.contains("error[E.semantic.ref.invalid]"), "{error}");
+}
+
+#[test]
+fn struct_field_borrow_paths_reject_missing_fields_and_cleanup_on_errors() {
+    let (success, _, error) = check_source(
+        "type Person:\n    age as Int\nend\nperson is Person(1)\nvalue is person[\"missing\"]\n",
+    );
+    assert!(!success, "unknown Struct field passed semantic checking");
+    assert!(error.contains("has no field `missing`"), "{error}");
+
+    let runtime_missing = r#"type Person:
+    age as Int
+end
+person is Person(1)
+key is "missing"
+Sayln person[key]
+"#;
+    let (success, error) = run_source(runtime_missing);
+    assert!(!success, "unknown dynamic Struct field was accepted");
+    assert!(error.contains("unknown field `missing`"), "{error}");
+
+    let source = r#"type Person:
+    age as Int
+end
+mut person is Person(1)
+fn update():
+    mut age is ref person["age"]
+    try:
+        age -> "wrong"
+    catch error:
+        age -> 2
+    end
+end
+update()
+Sayln person["age"]
+"#;
+    let (success, output) = run_source_stdout(source);
+    assert!(
+        success,
+        "failed write damaged the field borrow or its cleanup: {output}"
+    );
+    assert_eq!(output, "2\n");
+
+    let source = r#"enum Fault:
+    Failed
+end
+type Person:
+    age as Int
+end
+on Person receive fail:
+    throw Fault::Failed
+end
+on Person receive set_age(next as Int):
+    age -> next
+end
+mut person is Person(1)
+fn scoped():
+    age is ref person["age"]
+    try:
+        person :: fail
+    catch error:
+        Sayln age
+    end
+end
+scoped()
+person :: set_age(4)
+Sayln person["age"]
+"#;
+    let (success, output) = run_source_stdout(source);
+    assert!(
+        success,
+        "message error or scope exit left a field borrow active: {output}"
+    );
+    assert_eq!(output, "1\n4\n");
+}

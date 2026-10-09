@@ -1,0 +1,43 @@
+ages is 13..18
+Sayln ages
+Sayln 15 in ages
+Sayln 18 in ages
+numbers is 1..5
+Sayln numbers
+Sayln 4 in numbers
+Sayln 5 in numbers
+
+fn allowed_scores() gives Range:
+    return 10..20
+end
+
+fn contains_score(score as Int, allowed as Range) gives Bool:
+    return score in allowed
+end
+
+Sayln contains_score(15, allowed_scores())
+
+for number in 1..5:
+    Sayln number
+end
+
+match 4:
+    1..5:
+        Sayln "4 is inside 1..5"
+    _:
+        Sayln "4 is outside 1..5"
+end
+
+match 5:
+    1..5:
+        Sayln "5 is inside 1..5"
+    _:
+        Sayln "5 is excluded from 1..5"
+end
+
+match 5:
+    1..=5:
+        Sayln "inclusive pattern includes 5"
+    _:
+        Sayln "inclusive pattern excludes 5"
+end

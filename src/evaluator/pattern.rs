@@ -31,7 +31,11 @@ impl Evaluator {
                 };
                 literal.eq(value).then(Vec::new)
             }
-            MatchPattern::Range { start, end } => {
+            MatchPattern::Range {
+                start,
+                end,
+                inclusive_end,
+            } => {
                 let Value::Int(value) = value else {
                     return Ok(None);
                 };
@@ -40,12 +44,13 @@ impl Evaluator {
                     Some(_) => return Ok(None),
                     None => true,
                 };
-                let ends_after_or_at = match end {
-                    Some(Literal::Int(end)) => *value <= *end,
+                let ends_before = match end {
+                    Some(Literal::Int(end)) if *inclusive_end => *value <= *end,
+                    Some(Literal::Int(end)) => *value < *end,
                     Some(_) => return Ok(None),
                     None => true,
                 };
-                (starts_before_or_at && ends_after_or_at).then(Vec::new)
+                (starts_before_or_at && ends_before).then(Vec::new)
             }
             MatchPattern::Or(alternatives) => {
                 let mut bindings = None;
@@ -57,7 +62,9 @@ impl Evaluator {
                 }
                 bindings
             }
-            MatchPattern::Identifier(name) => Some(vec![(name.clone(), value.clone())]),
+            MatchPattern::Identifier(name) | MatchPattern::ReferenceIdentifier(name) => {
+                Some(vec![(name.clone(), value.clone())])
+            }
             MatchPattern::Alias { name, pattern } => {
                 let Some(mut bindings) = self.match_value_pattern(pattern, value)? else {
                     return Ok(None);

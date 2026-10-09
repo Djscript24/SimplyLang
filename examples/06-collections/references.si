@@ -1,16 +1,56 @@
-# references.si — explicit collection aliases and read-only ref parameters
-# A ref parameter reads an existing collection through a temporary, zero-copy handle.
+# references.si — call-scoped shared and exclusive collection borrows
+# Borrow parameters pass existing collection handles without copying contents.
 fn first(ref values as List[Int]) gives Int:
     return values[0]
 end
 
-mut numbers is list [10, 20, 30]
-Sayln first(ref numbers)
+fn first_through(ref values as List[Int]) gives Int:
+    return first(values)
+end
 
-numbers[1] -> 99
+fn replace_second(mut ref values as List[Int]):
+    values[1] -> 99
+end
+
+mut numbers is list [10, 20, 30]
+Sayln first(numbers)
+Sayln first_through(numbers)
+
+replace_second(numbers)
 Sayln numbers
 
-profile is hash:
+mut second is ref numbers[1]
+second -> 21
+Sayln second
+Sayln numbers
+
+mut profile is hash:
+    name is "Ada"
     scores is list [17, 23]
 end
-Sayln first(ref profile["scores"])
+Sayln first(profile["scores"])
+mut profile_name is ref profile["name"]
+profile_name -> "Grace"
+Sayln profile["name"]
+
+# Shared reference iteration reads nested values without granting mutation.
+# The borrow covers the source and reachable nested collections until the loop ends.
+mut groups is list [list [2, 3], list [5, 7]]
+mut total is 0
+for ref group in groups:
+    total -> total + group[0] + group[1]
+end
+Sayln total
+
+# The loop is read-only through aliases too; the source can be changed afterward.
+mut rejected is false
+for ref group in groups:
+    try:
+        groups add list [11, 13]
+    catch error:
+        rejected -> true
+    end
+end
+Sayln rejected
+groups add list [11, 13]
+Sayln groups

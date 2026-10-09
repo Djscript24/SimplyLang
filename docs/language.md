@@ -154,13 +154,16 @@ domains and require a wildcard or identifier for exhaustive matching.
 Guards on literal patterns have the same scope and conservative coverage
 behavior as other guards.
 
-Int range patterns use inclusive integer bounds: `0..10` matches both endpoints,
-`10..` has no upper bound, and `..10` has no lower bound. At least one bound is
-required; bounds must be Int literals, and a closed range whose lower bound
-exceeds its upper bound is invalid. Int literals are singleton intervals for
-usefulness analysis. Overlapping or adjacent ranges combine for exhaustiveness,
-but gaps remain uncovered. Ranges compose with nested patterns and
-OR-patterns, and guarded ranges do not contribute to exhaustiveness.
+Int range patterns use the same half-open bounds as range expressions:
+`0..10` includes 0 but excludes 10, `10..` has no upper bound, and `..10`
+excludes 10. Use `..=` for an inclusive upper bound; `0..=10` preserves the
+former inclusive behavior of `0..10`. Existing patterns that relied on
+inclusive `..` endpoints must use `..=`. At least one bound is required and
+bounds must be Int literals. Equal or reversed `..` bounds match nothing;
+reversed closed `..=` bounds are invalid. Int literals are singleton intervals
+for usefulness analysis. Overlapping or adjacent ranges combine for
+exhaustiveness, but gaps remain uncovered. Ranges compose with nested patterns
+and OR-patterns, and guarded ranges do not contribute to exhaustiveness.
 Sequence patterns recursively participate in usefulness analysis. Fixed-length
 patterns cover only their exact lengths. A rest pattern covers every length at
 least as large as its prefix; for example, `[]` plus `[head, ...tail]` covers

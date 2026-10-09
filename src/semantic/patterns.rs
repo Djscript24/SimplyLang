@@ -7,10 +7,67 @@ impl SemanticAnalyzer {
         arms: &[crate::ast::MatchArm],
     ) -> Result<Type, SimplyError> {
         let value_type = self.analyze_expression(value)?;
+        let provenance_before_arms = self.variables.snapshot_vector_provenance();
+        let mut provenance_paths = Vec::new();
+        let mut arm_provenance_paths = Vec::new();
         let mut coverage_matrix = Vec::<Vec<MatchPattern>>::new();
         let mut result_type: Option<Type> = None;
 
         for arm in arms {
+            self.variables
+                .restore_vector_provenance(&provenance_before_arms);
+            let reference_binding = match &arm.pattern {
+                MatchPattern::ReferenceIdentifier(name) => Some(name.clone()),
+                _ if Self::pattern_contains_reference(&arm.pattern) => {
+                    return Err(self.error(
+                        DiagnosticCode::InvalidRefUsage,
+                        "`ref` match binding is supported only as a top-level identifier pattern",
+                    ));
+                }
+                _ => None,
+            };
+            if reference_binding.is_some() {
+                if !matches!(value, Expr::Identifier(_)) {
+                    return Err(self.error(
+                        DiagnosticCode::InvalidRefUsage,
+                        "`ref` match binding requires a named collection scrutinee",
+                    ));
+                }
+                if matches!(value_type, Type::Vector(_, _)) {
+                    let provenance = match value {
+                        Expr::Identifier(name) => self.variables.vector_provenance(name),
+                        _ => self.expression_vector_provenance(value, &value_type, &value_type),
+                    };
+                    if provenance != VectorProvenance::ArrayBacked {
+                        let message = match provenance {
+                            VectorProvenance::TupleBacked => {
+                                "`ref` match binding does not support tuple-backed Vector values"
+                            }
+                            VectorProvenance::Unknown | VectorProvenance::ArrayBacked => {
+                                "`ref` match binding requires a Vector with statically known Array-backed storage"
+                            }
+                        };
+                        return Err(self.error(DiagnosticCode::InvalidRefUsage, message));
+                    }
+                }
+                if !matches!(
+                    value_type,
+                    Type::Array(_)
+                        | Type::List(_)
+                        | Type::Vector(_, _)
+                        | Type::Hash
+                        | Type::HashValues(_)
+                        | Type::Unknown
+                ) {
+                    return Err(self.error(
+                        DiagnosticCode::InvalidRefUsage,
+                        format!(
+                            "`ref` match binding requires an Array, List, or Hash, found {}",
+                            value_type.name()
+                        ),
+                    ));
+                }
+            }
             let mut bindings = Vec::new();
             self.validate_match_pattern(&arm.pattern, &value_type, &mut bindings)?;
             if !self.pattern_is_useful(&coverage_matrix, &arm.pattern, &value_type) {
@@ -37,13 +94,25 @@ impl SemanticAnalyzer {
                     && self.expression_contains_ref_parameter(value, &self.ref_parameter_scopes);
                 let mut borrowed_bindings = HashSet::new();
                 for (binding, binding_type) in bindings {
-                    if carries_borrow && Self::type_may_contain_collection(&binding_type) {
+                    let binding_provenance = if matches!(
+                        arm.pattern,
+                        MatchPattern::Identifier(_) | MatchPattern::ReferenceIdentifier(_)
+                    ) {
+                        self.expression_vector_provenance(value, &value_type, &binding_type)
+                    } else {
+                        VectorProvenance::Unknown
+                    };
+                    if (carries_borrow || reference_binding.as_deref() == Some(binding.as_str()))
+                        && Self::type_may_contain_collection(&binding_type)
+                    {
                         borrowed_bindings.insert(binding.clone());
                     }
-                    self.define_variable(binding, binding_type, false)?;
+                    self.define_variable(binding.clone(), binding_type, false)?;
+                    self.variables
+                        .set_vector_provenance(&binding, binding_provenance);
                 }
                 if !borrowed_bindings.is_empty() {
-                    self.ref_parameter_scopes.push(borrowed_bindings);
+                    self.ref_parameter_scopes.push(borrowed_bindings.clone());
                     pushed_ref_scope = true;
                 }
                 if let Some(guard) = &arm.guard {
@@ -60,10 +129,15 @@ impl SemanticAnalyzer {
                     }
                     .unwrap_or(Type::Unit))
                 } else {
-                    arm.result
-                        .as_ref()
-                        .map(|result| self.analyze_expression(result))
-                        .unwrap_or(Ok(Type::Unit))
+                    if let Some(result) = &arm.result {
+                        let result_type = self.analyze_expression(result)?;
+                        if !borrowed_bindings.is_empty() {
+                            self.reject_borrow_escape(result, &result_type, "a match result")?;
+                        }
+                        Ok(result_type)
+                    } else {
+                        Ok(Type::Unit)
+                    }
                 }
             })();
             if pushed_ref_scope {
@@ -71,6 +145,12 @@ impl SemanticAnalyzer {
             }
             self.variables.truncate(frame_start);
             self.function_scopes.pop();
+            let arm_provenance = self.variables.snapshot_vector_provenance();
+            arm_provenance_paths.push(arm_provenance.clone());
+            if arm.guard.is_some() {
+                provenance_paths.push(provenance_before_arms.clone());
+            }
+            provenance_paths.push(arm_provenance);
             self.loop_depth = saved_loop_depth;
             self.saw_return = saved_saw_return;
             self.inferred_return = saved_inferred_return;
@@ -87,6 +167,19 @@ impl SemanticAnalyzer {
                     );
                 }
             }
+        }
+
+        let selected_bool_arm = match value {
+            Expr::Literal(Literal::Bool(value)) => arms.iter().position(|arm| {
+                arm.guard.is_none() && Self::pattern_matches_known_bool(&arm.pattern, *value)
+            }),
+            _ => None,
+        };
+        if let Some(index) = selected_bool_arm {
+            self.variables
+                .restore_vector_provenance(&arm_provenance_paths[index]);
+        } else {
+            self.variables.merge_vector_provenance(&provenance_paths);
         }
 
         if self.pattern_is_useful(&coverage_matrix, &MatchPattern::Wildcard, &value_type) {
@@ -135,6 +228,35 @@ impl SemanticAnalyzer {
         Ok(result_type.unwrap_or(Type::Unit))
     }
 
+    fn pattern_contains_reference(pattern: &MatchPattern) -> bool {
+        match pattern {
+            MatchPattern::ReferenceIdentifier(_) => true,
+            MatchPattern::Or(patterns) | MatchPattern::Tuple(patterns) => {
+                patterns.iter().any(Self::pattern_contains_reference)
+            }
+            MatchPattern::Sequence { patterns, .. }
+            | MatchPattern::Struct {
+                fields: patterns, ..
+            } => patterns.iter().any(Self::pattern_contains_reference),
+            MatchPattern::Hash(entries) => entries
+                .iter()
+                .any(|(_, pattern)| Self::pattern_contains_reference(pattern)),
+            MatchPattern::Alias { pattern, .. }
+            | MatchPattern::EnumVariant {
+                payload: Some(pattern),
+                ..
+            } => Self::pattern_contains_reference(pattern),
+            MatchPattern::NamedStruct { fields, .. } => fields
+                .iter()
+                .any(|(_, pattern)| Self::pattern_contains_reference(pattern)),
+            MatchPattern::Identifier(_)
+            | MatchPattern::Literal(_)
+            | MatchPattern::Range { .. }
+            | MatchPattern::EnumVariant { payload: None, .. }
+            | MatchPattern::Wildcard => false,
+        }
+    }
+
     pub(super) fn pattern_is_useful(
         &self,
         matrix: &[Vec<MatchPattern>],
@@ -170,6 +292,7 @@ impl SemanticAnalyzer {
                 ..
             } => Self::pattern_contains_alias(pattern),
             MatchPattern::Identifier(_)
+            | MatchPattern::ReferenceIdentifier(_)
             | MatchPattern::Literal(_)
             | MatchPattern::Range { .. }
             | MatchPattern::EnumVariant { payload: None, .. }
@@ -219,6 +342,7 @@ impl SemanticAnalyzer {
                     .collect(),
             },
             MatchPattern::Identifier(_)
+            | MatchPattern::ReferenceIdentifier(_)
             | MatchPattern::Literal(_)
             | MatchPattern::Range { .. }
             | MatchPattern::Wildcard => pattern.clone(),
@@ -317,7 +441,12 @@ impl SemanticAnalyzer {
                     &element_type,
                 );
             }
-            if matches!(head, MatchPattern::Wildcard | MatchPattern::Identifier(_)) {
+            if matches!(
+                head,
+                MatchPattern::Wildcard
+                    | MatchPattern::Identifier(_)
+                    | MatchPattern::ReferenceIdentifier(_)
+            ) {
                 let max_length = self.max_sequence_prefix_length(matrix, 0);
                 return (0..=max_length + 1).any(|length| {
                     let candidate = vec![MatchPattern::Wildcard; length];
@@ -344,8 +473,12 @@ impl SemanticAnalyzer {
                 candidate_types.extend_from_slice(rest_types);
                 return self.pattern_vector_is_useful(&specialized, &candidate, &candidate_types);
             }
-            if matches!(head, MatchPattern::Wildcard | MatchPattern::Identifier(_))
-                && matches!(typ, Type::Hash | Type::HashValues(_))
+            if matches!(
+                head,
+                MatchPattern::Wildcard
+                    | MatchPattern::Identifier(_)
+                    | MatchPattern::ReferenceIdentifier(_)
+            ) && matches!(typ, Type::Hash | Type::HashValues(_))
             {
                 let defaults = self.hash_default_matrix(matrix);
                 return self.pattern_vector_is_useful(&defaults, tail, rest_types);
@@ -410,20 +543,27 @@ impl SemanticAnalyzer {
                 let value = i128::from(*value);
                 vec![(value, value)]
             }
-            MatchPattern::Range { start, end } => {
+            MatchPattern::Range {
+                start,
+                end,
+                inclusive_end,
+            } => {
                 let start = match start {
                     Some(Literal::Int(value)) => i128::from(*value),
                     Some(_) => return Vec::new(),
                     None => i128::from(i64::MIN),
                 };
                 let end = match end {
-                    Some(Literal::Int(value)) => i128::from(*value),
+                    Some(Literal::Int(value)) if *inclusive_end => i128::from(*value),
+                    Some(Literal::Int(value)) => i128::from(*value) - 1,
                     Some(_) => return Vec::new(),
                     None => i128::from(i64::MAX),
                 };
                 (start <= end).then_some((start, end)).into_iter().collect()
             }
-            MatchPattern::Wildcard | MatchPattern::Identifier(_) => {
+            MatchPattern::Wildcard
+            | MatchPattern::Identifier(_)
+            | MatchPattern::ReferenceIdentifier(_) => {
                 vec![(i128::from(i64::MIN), i128::from(i64::MAX))]
             }
             MatchPattern::Or(alternatives) => alternatives
@@ -535,6 +675,7 @@ impl SemanticAnalyzer {
             | MatchPattern::Hash(_)
             | MatchPattern::Wildcard
             | MatchPattern::Identifier(_)
+            | MatchPattern::ReferenceIdentifier(_)
             | MatchPattern::Or(_) => None,
         }
     }
@@ -554,7 +695,9 @@ impl SemanticAnalyzer {
             MatchPattern::Literal(Literal::Bool(value)) => {
                 *constructor == CoverageConstructor::Bool(*value)
             }
-            MatchPattern::Wildcard | MatchPattern::Identifier(_) => true,
+            MatchPattern::Wildcard
+            | MatchPattern::Identifier(_)
+            | MatchPattern::ReferenceIdentifier(_) => true,
             _ => self
                 .pattern_constructor(pattern)
                 .is_some_and(|(found, _)| found == *constructor),
@@ -621,7 +764,9 @@ impl SemanticAnalyzer {
                 MatchPattern::Literal(found) if found == literal => {
                     specialized.push(tail.to_vec());
                 }
-                MatchPattern::Wildcard | MatchPattern::Identifier(_) => {
+                MatchPattern::Wildcard
+                | MatchPattern::Identifier(_)
+                | MatchPattern::ReferenceIdentifier(_) => {
                     specialized.push(tail.to_vec());
                 }
                 MatchPattern::Or(alternatives) => {
@@ -740,7 +885,9 @@ impl SemanticAnalyzer {
             return Vec::new();
         };
         match head {
-            MatchPattern::Wildcard | MatchPattern::Identifier(_) => {
+            MatchPattern::Wildcard
+            | MatchPattern::Identifier(_)
+            | MatchPattern::ReferenceIdentifier(_) => {
                 let mut expanded = vec![MatchPattern::Wildcard; candidate_entries.len()];
                 expanded.extend_from_slice(tail);
                 vec![expanded]
@@ -788,7 +935,9 @@ impl SemanticAnalyzer {
                 continue;
             };
             match head {
-                MatchPattern::Wildcard | MatchPattern::Identifier(_) => {
+                MatchPattern::Wildcard
+                | MatchPattern::Identifier(_)
+                | MatchPattern::ReferenceIdentifier(_) => {
                     defaults.push(tail.to_vec())
                 }
                 MatchPattern::Hash(entries) if entries.is_empty() => defaults.push(tail.to_vec()),
@@ -796,7 +945,9 @@ impl SemanticAnalyzer {
                     if alternatives.iter().any(|alternative| {
                         matches!(
                             alternative,
-                            MatchPattern::Wildcard | MatchPattern::Identifier(_)
+                            MatchPattern::Wildcard
+                                | MatchPattern::Identifier(_)
+                                | MatchPattern::ReferenceIdentifier(_)
                         ) || matches!(alternative, MatchPattern::Hash(entries) if entries.is_empty())
                     }) =>
                 {
@@ -842,7 +993,9 @@ impl SemanticAnalyzer {
         length: usize,
     ) -> Vec<Vec<MatchPattern>> {
         match pattern {
-            MatchPattern::Wildcard | MatchPattern::Identifier(_) => {
+            MatchPattern::Wildcard
+            | MatchPattern::Identifier(_)
+            | MatchPattern::ReferenceIdentifier(_) => {
                 vec![vec![MatchPattern::Wildcard; length]]
             }
             MatchPattern::Sequence { patterns, rest } => {
@@ -879,7 +1032,12 @@ impl SemanticAnalyzer {
                     specialized.push(new_row);
                 }
                 None => {
-                    if matches!(head, MatchPattern::Wildcard | MatchPattern::Identifier(_)) {
+                    if matches!(
+                        head,
+                        MatchPattern::Wildcard
+                            | MatchPattern::Identifier(_)
+                            | MatchPattern::ReferenceIdentifier(_)
+                    ) {
                         let mut new_row = vec![MatchPattern::Wildcard; arity];
                         new_row.extend_from_slice(tail);
                         specialized.push(new_row);
@@ -909,14 +1067,16 @@ impl SemanticAnalyzer {
                 continue;
             };
             match head {
-                MatchPattern::Wildcard | MatchPattern::Identifier(_) => {
-                    defaults.push(tail.to_vec())
-                }
+                MatchPattern::Wildcard
+                | MatchPattern::Identifier(_)
+                | MatchPattern::ReferenceIdentifier(_) => defaults.push(tail.to_vec()),
                 MatchPattern::Or(alternatives)
                     if alternatives.iter().any(|alternative| {
                         matches!(
                             alternative,
-                            MatchPattern::Wildcard | MatchPattern::Identifier(_)
+                            MatchPattern::Wildcard
+                                | MatchPattern::Identifier(_)
+                                | MatchPattern::ReferenceIdentifier(_)
                         )
                     }) =>
                 {
@@ -937,6 +1097,10 @@ impl SemanticAnalyzer {
         match pattern {
             MatchPattern::Wildcard => Ok(true),
             MatchPattern::Identifier(name) => {
+                bindings.push((name.clone(), expected.clone()));
+                Ok(true)
+            }
+            MatchPattern::ReferenceIdentifier(name) => {
                 bindings.push((name.clone(), expected.clone()));
                 Ok(true)
             }
@@ -1043,7 +1207,11 @@ impl SemanticAnalyzer {
                 }
                 Ok(false)
             }
-            MatchPattern::Range { start, end } => {
+            MatchPattern::Range {
+                start,
+                end,
+                inclusive_end,
+            } => {
                 for bound in start.iter().chain(end.iter()) {
                     if !matches!(bound, Literal::Int(_)) {
                         return Err(self.error(
@@ -1061,7 +1229,8 @@ impl SemanticAnalyzer {
                         ),
                     ));
                 }
-                if let (Some(Literal::Int(start)), Some(Literal::Int(end))) = (start, end)
+                if *inclusive_end
+                    && let (Some(Literal::Int(start)), Some(Literal::Int(end))) = (start, end)
                     && start > end
                 {
                     return Err(self.error(

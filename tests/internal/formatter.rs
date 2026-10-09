@@ -41,6 +41,15 @@ fn is_idempotent_for_nested_blocks_and_blank_lines() {
 }
 
 #[test]
+fn preserves_mutable_ref_parameter_syntax() {
+    let source = "fn update(mut ref values as List[Int]):\nvalues[0] -> 7\nend\n";
+    let formatted = format(source);
+
+    assert!(formatted.contains("fn update(mut ref values as List[Int]):"), "{formatted}");
+    assert_eq!(format(&formatted), formatted);
+}
+
+#[test]
 fn preserves_string_contents_and_comment_text() {
     let source = "Say \"  # not a comment  \" # keep  \n#  keep trailing spaces  \n";
 
@@ -261,33 +270,44 @@ fn formats_literal_match_arms_without_changing_literal_spelling() {
 
 #[test]
 fn formats_range_pattern_bounds_without_surrounding_spaces() {
-    let source = "match value:\n0 .. 10:\n1\n10 ..:\n2\n.. 10:\n3\n-10 .. 10:\n4\nend\n";
+    let source = "match value:\n0 ..= 10:\n1\n10 ..=:\n2\n..= 10:\n3\n-10 ..= 10:\n4\nend\n";
     let formatted = format(source);
     assert_eq!(
         formatted,
-        "match value:\n    0..10:\n        1\n    10..:\n        2\n    ..10:\n        3\n    -10..10:\n        4\nend\n"
+        "match value:\n    0..=10:\n        1\n    10..:\n        2\n    ..=10:\n        3\n    -10..=10:\n        4\nend\n"
+    );
+    assert_eq!(format(&formatted), formatted);
+}
+
+#[test]
+fn formatter_preserves_half_open_and_inclusive_pattern_endpoints() {
+    let source = "match value:\n1 .. 5:\n0\n1 ..= 5:\n1\nend\n";
+    let formatted = format(source);
+    assert_eq!(
+        formatted,
+        "match value:\n    1..5:\n        0\n    1..=5:\n        1\nend\n"
     );
     assert_eq!(format(&formatted), formatted);
 }
 
 #[test]
 fn preserves_canonical_sequence_pattern_spacing_and_formats_nested_ranges() {
-    let source = "match values:\n[]:\n\"empty\"\n[1, 2, 3]:\n\"exact\"\n[[0 .. 10, 20 .. 30], [1, 2] | [3, 4]]:\n\"nested\"\nend\n";
+    let source = "match values:\n[]:\n\"empty\"\n[1, 2, 3]:\n\"exact\"\n[[0 ..= 10, 20 ..= 30], [1, 2] | [3, 4]]:\n\"nested\"\nend\n";
     let formatted = format(source);
     assert_eq!(
         formatted,
-        "match values:\n    []:\n        \"empty\"\n    [1, 2, 3]:\n        \"exact\"\n    [[0..10, 20..30], [1, 2] | [3, 4]]:\n        \"nested\"\nend\n"
+        "match values:\n    []:\n        \"empty\"\n    [1, 2, 3]:\n        \"exact\"\n    [[0..=10, 20..=30], [1, 2] | [3, 4]]:\n        \"nested\"\nend\n"
     );
     assert_eq!(format(&formatted), formatted);
 }
 
 #[test]
 fn formats_rest_patterns_canonically_and_keeps_formatted_source_parseable() {
-    let source = "match values:\n[...rest]:\nrest\n[head,...tail]:\nhead\n[a, b, ...rest]:\nrest\n[0 .. 10,...rest]:\nrest\n[Person(name, age),...people]:\nname\n[0,...rest]|[1,...rest]:\nrest\nend\n";
+    let source = "match values:\n[...rest]:\nrest\n[head,...tail]:\nhead\n[a, b, ...rest]:\nrest\n[0 ..= 10,...rest]:\nrest\n[Person(name, age),...people]:\nname\n[0,...rest]|[1,...rest]:\nrest\nend\n";
     let formatted = format(source);
     assert_eq!(
         formatted,
-        "match values:\n    [...rest]:\n        rest\n    [head, ...tail]:\n        head\n    [a, b, ...rest]:\n        rest\n    [0..10, ...rest]:\n        rest\n    [Person(name, age), ...people]:\n        name\n    [0, ...rest] | [1, ...rest]:\n        rest\nend\n"
+        "match values:\n    [...rest]:\n        rest\n    [head, ...tail]:\n        head\n    [a, b, ...rest]:\n        rest\n    [0..=10, ...rest]:\n        rest\n    [Person(name, age), ...people]:\n        name\n    [0, ...rest] | [1, ...rest]:\n        rest\nend\n"
     );
     assert_eq!(format(&formatted), formatted);
     let parsed = crate::parser::Parser::new(crate::lexer::Lexer::new(source).tokenize().unwrap())
@@ -302,11 +322,11 @@ fn formats_rest_patterns_canonically_and_keeps_formatted_source_parseable() {
 
 #[test]
 fn formats_hash_patterns_and_preserves_their_parsed_structure() {
-    let source = "match record:\n{\"name\": person, extra: [0 .. 10, _]}|{name: person, extra: [11 .., _]}:\nperson\n{}:\n\"other\"\nend\n";
+    let source = "match record:\n{\"name\": person, extra: [0 ..= 10, _]}|{name: person, extra: [11 ..=, _]}:\nperson\n{}:\n\"other\"\nend\n";
     let formatted = format(source);
     assert_eq!(
         formatted,
-        "match record:\n    {name: person, extra: [0..10, _]} | {name: person, extra: [11.., _]}:\n        person\n    {}:\n        \"other\"\nend\n"
+        "match record:\n    {name: person, extra: [0..=10, _]} | {name: person, extra: [11.., _]}:\n        person\n    {}:\n        \"other\"\nend\n"
     );
     assert_eq!(format(&formatted), formatted);
     let parse = |source: &str| {
@@ -320,7 +340,7 @@ fn formats_hash_patterns_and_preserves_their_parsed_structure() {
         "{}",
         "{\"name\": name}",
         "{name: name}",
-        "{\"name\": name, \"age\": 18..}",
+        "{\"name\": name, \"age\": 18..=}",
         "{user: {name: name}}",
         "{\"items\": [head, ...tail]}",
         "{\"point\": (x, 0..)}",
@@ -334,7 +354,7 @@ fn formats_hash_patterns_and_preserves_their_parsed_structure() {
 
 #[test]
 fn formats_alias_patterns_and_preserves_their_parsed_structure() {
-    let source = "enum Result:\n    Ok as Int\nend\nmatch value:\nx@18 ..:\nx\nitem@Result::Ok(value):\nitem\nwhole@{name: name}:\nwhole\nrow@[head,...tail]:\nrow\nend\n";
+    let source = "enum Result:\n    Ok as Int\nend\nmatch value:\nx@18 ..=:\nx\nitem@Result::Ok(value):\nitem\nwhole@{name: name}:\nwhole\nrow@[head,...tail]:\nrow\nend\n";
     let formatted = format(source);
     assert_eq!(
         formatted,

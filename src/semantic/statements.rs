@@ -11,7 +11,8 @@ impl SemanticAnalyzer {
             return Ok(false);
         }
         match expression {
-            Expr::Identifier(name) => Ok(scopes.iter().any(|scope| scope.contains(name))),
+            Expr::Identifier(name) => Ok(self.variables.is_reference(name)
+                || scopes.iter().any(|scope| scope.contains(name))),
             Expr::Array(values) | Expr::List(values) => {
                 let element_type = match value_type {
                     Type::Array(element) | Type::List(element) => element.as_ref(),
@@ -113,31 +114,44 @@ impl SemanticAnalyzer {
         }
     }
 
-    fn reject_borrow_escape(
+    pub(super) fn reject_borrow_escape(
         &self,
         expression: &Expr,
         value_type: &Type,
         destination: &str,
     ) -> Result<(), SimplyError> {
-        if !self.ref_parameter_scopes.is_empty()
-            && self.expression_contains_borrowed_collection(
-                expression,
-                value_type,
-                &self.ref_parameter_scopes,
-            )?
-        {
+        if self.expression_contains_borrowed_collection(
+            expression,
+            value_type,
+            &self.ref_parameter_scopes,
+        )? {
+            let borrowed_from = if destination == "a match result" {
+                "a `ref` match binding"
+            } else {
+                "a `ref` parameter"
+            };
             return Err(self.error(
                 DiagnosticCode::InvalidRefUsage,
-                format!("a `ref` parameter cannot escape through {destination}"),
+                format!("{borrowed_from} cannot escape through {destination}"),
             ));
         }
         Ok(())
     }
 
-    fn is_ref_borrowed(&self, name: &str) -> bool {
-        self.ref_parameter_scopes
-            .iter()
-            .any(|scope| scope.contains(name))
+    pub(super) fn is_ref_borrowed(&self, name: &str) -> bool {
+        self.variables.is_reference(name)
+            || self
+                .ref_parameter_scopes
+                .iter()
+                .any(|scope| scope.contains(name))
+    }
+
+    fn is_mut_ref_borrowed(&self, name: &str) -> bool {
+        self.variables.is_exclusive_reference(name)
+            || self
+                .mut_ref_parameter_scopes
+                .iter()
+                .any(|scope| scope.contains(name))
     }
 
     pub(super) fn type_may_contain_collection(value_type: &Type) -> bool {
@@ -192,7 +206,9 @@ impl SemanticAnalyzer {
         scopes: &[HashSet<String>],
     ) -> bool {
         match expression {
-            Expr::Identifier(name) => scopes.iter().any(|scope| scope.contains(name)),
+            Expr::Identifier(name) => {
+                self.variables.is_reference(name) || scopes.iter().any(|scope| scope.contains(name))
+            }
             Expr::Array(values)
             | Expr::List(values)
             | Expr::Tuple(values)
@@ -202,9 +218,7 @@ impl SemanticAnalyzer {
             Expr::Hash(entries) => entries
                 .iter()
                 .any(|(_, value)| self.expression_contains_ref_parameter(value, scopes)),
-            Expr::Unary { operand, .. } | Expr::Ref(operand) => {
-                self.expression_contains_ref_parameter(operand, scopes)
-            }
+            Expr::Unary { operand, .. } => self.expression_contains_ref_parameter(operand, scopes),
             Expr::Binary { left, right, .. } => {
                 self.expression_contains_ref_parameter(left, scopes)
                     || self.expression_contains_ref_parameter(right, scopes)
@@ -408,12 +422,98 @@ impl SemanticAnalyzer {
                             actual.clone()
                         }
                     });
+                let vector_provenance =
+                    self.expression_vector_provenance(value, &actual, &expected);
                 self.reject_borrow_escape(value, &expected, "a variable binding")?;
                 if matches!(expected, Type::Matrix | Type::TypedMatrix(_, _, _)) {
                     self.require_rectangular_matrix_literal(value)?;
                 }
                 self.require_type(&expected, &actual)?;
                 self.define_variable(name.clone(), expected, *mutable)?;
+                self.variables
+                    .set_vector_provenance(name, vector_provenance);
+            }
+            Stmt::Borrow {
+                name,
+                mutable,
+                value,
+            } => {
+                let actual = self.analyze_expression(value)?;
+                let mut root = value;
+                let mut element_borrow = false;
+                while let Expr::Index { target, .. } = root {
+                    element_borrow = true;
+                    root = target;
+                }
+                let Expr::Identifier(source) = root else {
+                    return Err(self.error(
+                        DiagnosticCode::InvalidRefUsage,
+                        "a local `ref` binding must target a named collection or a nested location within a collection or Struct",
+                    ));
+                };
+                let owner_type = self.analyze_expression(root)?;
+                let owner_is_struct = matches!(&owner_type, Type::Struct(_));
+                if !Self::is_mutable_collection_type(&owner_type)
+                    && !(element_borrow && owner_is_struct)
+                {
+                    return Err(self.error(
+                        DiagnosticCode::InvalidRefUsage,
+                        format!(
+                            "a local `ref` binding requires an Array, List, Hash, Vector, or a field of a Struct, found {}",
+                            owner_type.name()
+                        ),
+                    ));
+                }
+                let mut path_expressions = Vec::new();
+                let mut path_root = value;
+                while let Expr::Index { target, index } = path_root {
+                    path_expressions.push(index.as_ref());
+                    path_root = target;
+                }
+                path_expressions.reverse();
+                let mut current_type = owner_type.clone();
+                let mut contains_struct_field = false;
+                for index in path_expressions {
+                    contains_struct_field |= matches!(&current_type, Type::Struct(_));
+                    let index_type = self.analyze_expression(index)?;
+                    current_type = self.index_type(&current_type, &index_type, index)?;
+                }
+                let supported_type = if element_borrow {
+                    matches!(&actual, Type::Int | Type::Float | Type::Bool | Type::String)
+                        || (contains_struct_field && Self::is_mutable_collection_type(&actual))
+                } else {
+                    Self::is_mutable_collection_type(&actual)
+                };
+                if !supported_type {
+                    return Err(self.error(
+                        DiagnosticCode::InvalidRefUsage,
+                        if element_borrow {
+                            format!(
+                                "element `ref` bindings support scalar values and Struct fields containing collections, found {}",
+                                actual.name()
+                            )
+                        } else {
+                            format!(
+                                "a local `ref` binding requires an Array, List, Hash, or Vector, found {}",
+                                actual.name()
+                            )
+                        },
+                    ));
+                }
+                if *mutable && !self.variables.is_mutable(source) {
+                    return Err(self.error(
+                        DiagnosticCode::InvalidRefUsage,
+                        format!("mutable `ref` binding `{name}` requires a `mut` owner"),
+                    ));
+                }
+                if *mutable && self.is_ref_borrowed(source) && !self.is_mut_ref_borrowed(source) {
+                    return Err(self.error(
+                        DiagnosticCode::InvalidRefUsage,
+                        "cannot create a mutable `ref` from a shared borrow",
+                    ));
+                }
+                self.define_variable(name.clone(), actual, *mutable)?;
+                self.variables.mark_reference(name, *mutable);
             }
             Stmt::Flow {
                 name,
@@ -428,11 +528,24 @@ impl SemanticAnalyzer {
                 self.define_variable(name.clone(), actual, false)?;
             }
             Stmt::Reassign { name, value } => {
-                if self.is_ref_borrowed(name) {
-                    return Err(self.error(
-                        DiagnosticCode::InvalidRefUsage,
-                        format!("`ref` value `{name}` is read-only and cannot be reassigned"),
-                    ));
+                let expected = self.variables.get(name).cloned().ok_or_else(|| {
+                    self.error(
+                        DiagnosticCode::UndefinedVariable,
+                        format!("unknown variable `{name}`"),
+                    )
+                })?;
+                let mutable_element_reference = self.variables.is_exclusive_reference(name)
+                    && matches!(
+                        &expected,
+                        Type::Int | Type::Float | Type::Bool | Type::String
+                    );
+                if self.is_ref_borrowed(name) && !mutable_element_reference {
+                    let message = if self.is_mut_ref_borrowed(name) {
+                        format!("`mut ref` parameter binding `{name}` cannot be reassigned")
+                    } else {
+                        format!("`ref` value `{name}` is read-only and cannot be reassigned")
+                    };
+                    return Err(self.error(DiagnosticCode::InvalidRefUsage, message));
                 }
                 if self.is_snapshot_capture(name) || !self.variables.is_mutable(name) {
                     return Err(self.error(
@@ -442,28 +555,32 @@ impl SemanticAnalyzer {
                         ),
                     ));
                 }
-                let expected = self.variables.get(name).cloned().ok_or_else(|| {
-                    self.error(
-                        DiagnosticCode::UndefinedVariable,
-                        format!("unknown variable `{name}`"),
-                    )
-                })?;
                 let actual = self.analyze_expression(value)?;
+                let vector_provenance =
+                    self.expression_vector_provenance(value, &actual, &expected);
                 self.reject_borrow_escape(value, &expected, "a variable assignment")?;
                 self.require_type(&expected, &actual)?;
+                self.variables
+                    .set_vector_provenance(name, vector_provenance);
             }
             Stmt::DestructureReassign { pattern, value } => {
                 let actual = self.analyze_expression(value)?;
                 self.reject_borrow_escape(value, &actual, "a destructuring assignment")?;
                 let mut targets = Vec::new();
                 self.validate_destructure_assignment_pattern(pattern, &actual, &mut targets)?;
+                for target in targets {
+                    if matches!(self.variables.get(&target), Some(Type::Vector(_, _))) {
+                        self.variables
+                            .set_vector_provenance(&target, VectorProvenance::Unknown);
+                    }
+                }
             }
             Stmt::SetIndex {
                 name,
                 indices,
                 value,
             } => {
-                if self.is_ref_borrowed(name) {
+                if self.is_ref_borrowed(name) && !self.is_mut_ref_borrowed(name) {
                     return Err(self.error(
                         DiagnosticCode::InvalidRefUsage,
                         format!("`ref` value `{name}` is read-only and cannot be mutated"),
@@ -547,7 +664,7 @@ impl SemanticAnalyzer {
                 operation,
                 value,
             } => {
-                if self.is_ref_borrowed(name) {
+                if self.is_ref_borrowed(name) && !self.is_mut_ref_borrowed(name) {
                     return Err(self.error(
                         DiagnosticCode::InvalidRefUsage,
                         format!("`ref` value `{name}` is read-only and cannot be mutated"),
@@ -595,6 +712,19 @@ impl SemanticAnalyzer {
                 let saved_saw_return = self.saw_return;
                 let saved_loop_depth = self.loop_depth;
                 let captures_outer = self.function_scopes.len() > 1 || self.module_return_allowed;
+                if captures_outer
+                    && let Some(captured_name) = closure_dependencies(body, parameters)
+                        .iter()
+                        .filter(|captured_name| self.variables.is_reference(captured_name))
+                        .min()
+                {
+                    return Err(self.error(
+                        DiagnosticCode::InvalidRefUsage,
+                        format!(
+                            "a closure cannot capture a `ref` parameter or local reference binding `{captured_name}`"
+                        ),
+                    ));
+                }
                 let parent_function_scope = self.function_scopes.len().saturating_sub(1);
                 let frame_start = self.variables.scopes.len();
                 self.variables.push();
@@ -624,15 +754,21 @@ impl SemanticAnalyzer {
                     .filter(|(_, _, _, by_ref)| *by_ref)
                     .map(|(parameter, _, _, _)| parameter.clone())
                     .collect();
+                let mut_ref_names = parameters
+                    .iter()
+                    .filter(|(_, _, mutable, by_ref)| *mutable && *by_ref)
+                    .map(|(parameter, _, _, _)| parameter.clone())
+                    .collect();
                 self.ref_parameter_scopes.push(ref_names);
-                for (parameter, parameter_type, mutable, by_ref) in parameters {
+                self.mut_ref_parameter_scopes.push(mut_ref_names);
+                for (parameter, parameter_type, mutable, _by_ref) in parameters {
                     self.define_variable(
                         parameter.clone(),
                         parameter_type
                             .as_ref()
                             .map(|typ| self.resolve_type_identity(typ))
                             .unwrap_or(Type::Unknown),
-                        *mutable && !*by_ref,
+                        *mutable,
                     )?;
                 }
                 let body_result = self
@@ -643,6 +779,8 @@ impl SemanticAnalyzer {
                     self.variables.truncate(frame_start);
                     self.function_scopes.pop();
                     self.function_capture_frames.pop();
+                    self.ref_parameter_scopes.pop();
+                    self.mut_ref_parameter_scopes.pop();
                     self.function_depth = saved_function_depth;
                     self.loop_depth = saved_loop_depth;
                     self.function_return = saved_return;
@@ -657,6 +795,8 @@ impl SemanticAnalyzer {
                     self.variables.truncate(frame_start);
                     self.function_scopes.pop();
                     self.function_capture_frames.pop();
+                    self.ref_parameter_scopes.pop();
+                    self.mut_ref_parameter_scopes.pop();
                     self.function_depth = saved_function_depth;
                     self.loop_depth = saved_loop_depth;
                     self.function_return = saved_return;
@@ -673,9 +813,10 @@ impl SemanticAnalyzer {
                 self.function_depth = saved_function_depth;
                 self.loop_depth = saved_loop_depth;
                 self.function_return = saved_return;
+                self.ref_parameter_scopes.pop();
+                self.mut_ref_parameter_scopes.pop();
                 if return_type.is_none() {
                     let inferred_return = self.inferred_return.clone();
-                    self.ref_parameter_scopes.pop();
                     if let Some(signature) = self
                         .function_scopes
                         .iter_mut()
@@ -751,6 +892,7 @@ impl SemanticAnalyzer {
                 let condition_type = self.analyze_expression(condition)?;
                 self.require_type(&Type::Bool, &condition_type)?;
                 let saved_saw_return = self.saw_return;
+                let provenance_before = self.variables.snapshot_vector_provenance();
                 let frame_start = self.variables.scopes.len();
                 self.variables.push();
                 self.function_scopes.push(HashMap::new());
@@ -767,6 +909,8 @@ impl SemanticAnalyzer {
                 let then_returns = self.saw_return;
                 self.variables.truncate(frame_start);
                 self.function_scopes.pop();
+                let then_provenance = self.variables.snapshot_vector_provenance();
+                self.variables.restore_vector_provenance(&provenance_before);
                 let frame_start = self.variables.scopes.len();
                 self.variables.push();
                 self.function_scopes.push(HashMap::new());
@@ -783,6 +927,18 @@ impl SemanticAnalyzer {
                 let else_returns = self.saw_return;
                 self.variables.truncate(frame_start);
                 self.function_scopes.pop();
+                let else_provenance = self.variables.snapshot_vector_provenance();
+                match condition {
+                    Expr::Literal(Literal::Bool(true)) => {
+                        self.variables.restore_vector_provenance(&then_provenance)
+                    }
+                    Expr::Literal(Literal::Bool(false)) => {
+                        self.variables.restore_vector_provenance(&else_provenance)
+                    }
+                    _ => self
+                        .variables
+                        .merge_vector_provenance(&[then_provenance, else_provenance]),
+                }
                 self.saw_return = saved_saw_return || (then_returns && else_returns);
             }
             Stmt::Try {
@@ -824,6 +980,7 @@ impl SemanticAnalyzer {
             Stmt::For {
                 name,
                 mutable,
+                by_ref,
                 iterable,
                 body,
             } => {
@@ -834,13 +991,33 @@ impl SemanticAnalyzer {
                         "for requires a collection",
                     )
                 })?;
+                if *by_ref
+                    && (!matches!(iterable, Expr::Identifier(_))
+                        || !matches!(
+                            iterable_type,
+                            Type::Array(_)
+                                | Type::List(_)
+                                | Type::Vector(_, _)
+                                | Type::Hash
+                                | Type::HashValues(_)
+                        ))
+                {
+                    return Err(self.error(
+                        DiagnosticCode::InvalidRefUsage,
+                        "`for ref` requires a named Array, List, Vector, or Hash",
+                    ));
+                }
                 let frame_start = self.variables.scopes.len();
                 let saved_saw_return = self.saw_return;
+                let provenance_before = self.variables.snapshot_vector_provenance();
                 self.variables.push();
                 self.function_scopes.push(HashMap::new());
                 let span = self.current_span.clone().unwrap_or_else(|| Span::new(0, 0));
                 self.variables
                     .insert_at(name.clone(), element, *mutable, span)?;
+                if *by_ref {
+                    self.variables.mark_reference(name, false);
+                }
                 let borrowed_element = Self::type_may_contain_collection(
                     self.variables.get(name).unwrap_or(&Type::Unknown),
                 ) && !self.ref_parameter_scopes.is_empty()
@@ -869,12 +1046,16 @@ impl SemanticAnalyzer {
                 }
                 self.variables.truncate(frame_start);
                 self.function_scopes.pop();
+                let provenance_after_body = self.variables.snapshot_vector_provenance();
+                self.variables
+                    .merge_vector_provenance(&[provenance_before, provenance_after_body]);
                 self.saw_return = saved_saw_return;
             }
             Stmt::While { condition, body } => {
                 let condition_type = self.analyze_expression(condition)?;
                 self.require_type(&Type::Bool, &condition_type)?;
                 let saved_saw_return = self.saw_return;
+                let provenance_before = self.variables.snapshot_vector_provenance();
                 self.loop_depth += 1;
                 let result = self
                     .collect_functions(body)
@@ -882,6 +1063,9 @@ impl SemanticAnalyzer {
                 self.loop_depth -= 1;
                 self.saw_return = saved_saw_return;
                 result?;
+                let provenance_after_body = self.variables.snapshot_vector_provenance();
+                self.variables
+                    .merge_vector_provenance(&[provenance_before, provenance_after_body]);
             }
             Stmt::Break | Stmt::Continue if self.loop_depth == 0 => {
                 return Err(self.error(

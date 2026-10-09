@@ -179,7 +179,7 @@ impl SemanticAnalyzer {
                             return Err(self.error(
                                 DiagnosticCode::InvalidRefUsage,
                                 format!(
-                                    "`ref` parameter `{parameter}` must be an Array, List, or Hash"
+                                    "`ref` parameter `{parameter}` must be an Array, List, Hash, or Vector"
                                 ),
                             ));
                         }
@@ -210,6 +210,10 @@ impl SemanticAnalyzer {
                             ref_parameters: parameters
                                 .iter()
                                 .map(|(_, _, _, by_ref)| *by_ref)
+                                .collect(),
+                            mut_ref_parameters: parameters
+                                .iter()
+                                .map(|(_, _, mutable, by_ref)| *mutable && *by_ref)
                                 .collect(),
                             return_type: None,
                         },
@@ -293,6 +297,7 @@ impl SemanticAnalyzer {
             | MatchPattern::Or(_)
             | MatchPattern::Hash(_)
             | MatchPattern::Alias { .. }
+            | MatchPattern::ReferenceIdentifier(_)
             | MatchPattern::EnumVariant { .. }
             | MatchPattern::Struct { .. }
             | MatchPattern::NamedStruct { .. } => {
@@ -317,6 +322,12 @@ impl SemanticAnalyzer {
                 format!("cannot destructure-assign unknown variable `{name}`"),
             )
         })?;
+        if self.is_ref_borrowed(name) {
+            return Err(self.error(
+                DiagnosticCode::InvalidRefUsage,
+                format!("`ref` value `{name}` cannot be reassigned"),
+            ));
+        }
         if self.is_snapshot_capture(name) || !self.variables.is_mutable(name) {
             return Err(self.error(
                 DiagnosticCode::InvalidReassignment,
@@ -458,6 +469,7 @@ impl SemanticAnalyzer {
             | MatchPattern::Or(_)
             | MatchPattern::Hash(_)
             | MatchPattern::Alias { .. }
+            | MatchPattern::ReferenceIdentifier(_)
             | MatchPattern::EnumVariant { .. }
             | MatchPattern::Struct { .. }
             | MatchPattern::NamedStruct { .. } => {
@@ -491,24 +503,17 @@ impl SemanticAnalyzer {
                 body,
             } = statement
             {
-                let borrowed_capture = if self
-                    .ref_parameter_scopes
+                let captured_dependencies = closure_dependencies(body, parameters);
+                let borrowed_capture = captured_dependencies
                     .iter()
-                    .any(|scope| !scope.is_empty())
-                {
-                    let captured_dependencies = closure_dependencies(body, parameters);
-                    self.ref_parameter_scopes
-                        .iter()
-                        .flat_map(|scope| scope.iter())
-                        .filter(|name| captured_dependencies.contains(name.as_str()))
-                        .min()
-                } else {
-                    None
-                };
+                    .filter(|name| self.is_ref_borrowed(name))
+                    .min();
                 if let Some(captured_name) = borrowed_capture {
                     return Err(self.error(
                         DiagnosticCode::InvalidRefUsage,
-                        format!("a closure cannot capture `ref` parameter `{captured_name}`"),
+                        format!(
+                            "a closure cannot capture a `ref` parameter or local reference binding `{captured_name}`"
+                        ),
                     ));
                 }
                 if self.structs.contains_key(name) || self.enums.contains_key(name) {
@@ -535,7 +540,7 @@ impl SemanticAnalyzer {
                     {
                         return Err(self.error(
                             DiagnosticCode::InvalidRefUsage,
-                            "a `ref` parameter must be an Array, List, or Hash",
+                            "a `ref` parameter must be an Array, List, Hash, or Vector",
                         ));
                     }
                     if !*by_ref
@@ -583,6 +588,10 @@ impl SemanticAnalyzer {
                             ref_parameters: parameters
                                 .iter()
                                 .map(|(_, _, _, by_ref)| *by_ref)
+                                .collect(),
+                            mut_ref_parameters: parameters
+                                .iter()
+                                .map(|(_, _, mutable, by_ref)| *mutable && *by_ref)
                                 .collect(),
                             return_type: resolved_return_type.clone(),
                         },

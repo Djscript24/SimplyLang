@@ -27,14 +27,6 @@ impl RuntimeHeap {
         self.functions.borrow().get(handle).cloned()
     }
 
-    pub(crate) fn with_function<R>(
-        &self,
-        handle: Handle<FunctionValue>,
-        inspect: impl FnOnce(&FunctionValue) -> R,
-    ) -> Option<R> {
-        self.functions.borrow().get(handle).map(inspect)
-    }
-
     pub(crate) fn with_function_mut<R>(
         &self,
         handle: Handle<FunctionValue>,

@@ -16,8 +16,8 @@ use std::{
 
 use crate::{
     ast::{
-        BinaryOperator, Expr, Literal, PartitionRule, PipelineStep, Program, Stmt, UnaryOperator,
-        is_parallel_safe_expression,
+        BinaryOperator, CollectionOperation, Expr, Literal, PartitionRule, PipelineStep, Program,
+        Stmt, UnaryOperator, is_parallel_safe_expression,
     },
     error::{DiagnosticCode, SimplyError, Span},
     lexer::Lexer,
@@ -585,6 +585,10 @@ fn collect_statement_dependencies(
                 collect_expression_dependencies(value, bound, dependencies);
                 bound.insert(name.clone());
             }
+            Stmt::Borrow { name, value, .. } => {
+                collect_expression_dependencies(value, bound, dependencies);
+                bound.insert(name.clone());
+            }
             Stmt::Reassign { name, value } => {
                 collect_expression_dependencies(value, bound, dependencies);
                 if !bound.contains(name) {
@@ -711,7 +715,7 @@ fn collect_expression_dependencies(
                 dependencies.insert(name.clone());
             }
         }
-        Expr::Unary { operand, .. } | Expr::Ref(operand) => {
+        Expr::Unary { operand, .. } => {
             collect_expression_dependencies(operand, bound, dependencies)
         }
         Expr::Binary { left, right, .. } => {
@@ -777,7 +781,8 @@ fn collect_expression_dependencies(
                             collect_pattern_bindings(alternative, bindings);
                         }
                     }
-                    crate::ast::MatchPattern::Identifier(name) => {
+                    crate::ast::MatchPattern::Identifier(name)
+                    | crate::ast::MatchPattern::ReferenceIdentifier(name) => {
                         bindings.insert(name.clone());
                     }
                     crate::ast::MatchPattern::Alias { name, pattern } => {
@@ -924,6 +929,41 @@ struct ActiveMessageState {
     scope_index: usize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuntimeBorrowMode {
+    Shared,
+    Exclusive,
+}
+
+#[derive(Clone)]
+enum CollectionBorrowSegment {
+    Index(i64),
+    Key(String),
+    Field(String),
+}
+
+#[derive(Clone)]
+struct CollectionBorrowLocation {
+    identity: (u64, usize, u32),
+    path: Vec<CollectionBorrowSegment>,
+}
+
+struct ActiveCollectionBorrow {
+    locations: Vec<CollectionBorrowLocation>,
+    mode: RuntimeBorrowMode,
+    parameter: String,
+    owner: Option<String>,
+    path: Vec<CollectionBorrowSegment>,
+    scope_index: Option<usize>,
+    escape_kind: Option<SharedBorrowEscapeKind>,
+}
+
+#[derive(Clone, Copy)]
+enum SharedBorrowEscapeKind {
+    MatchPattern,
+    Iteration,
+}
+
 #[derive(Default)]
 pub struct Evaluator {
     scopes: ScopeStack,
@@ -936,6 +976,7 @@ pub struct Evaluator {
     message_scopes: Vec<HashMap<(DeclarationIdentity, String), MessageBehavior>>,
     hoisted_functions: HashSet<(usize, String)>,
     active_message_states: Vec<ActiveMessageState>,
+    active_collection_borrows: Vec<ActiveCollectionBorrow>,
     current_span: Option<Span>,
     current_file: Option<PathBuf>,
     module_identity: String,
@@ -1196,11 +1237,21 @@ impl Evaluator {
                     format!("cannot reassign unknown variable `{name}`"),
                 )
             })?;
+            self.ensure_active_message_field_mutation_allowed(&name)?;
+            if self.scopes.is_reference(&name) {
+                return Err(self.runtime_error_with_code(
+                    DiagnosticCode::InvalidRefUsage,
+                    format!("local `ref` binding `{name}` cannot be reassigned by destructuring"),
+                ));
+            }
             if !self.scopes.is_mutable(&name) {
                 return Err(self.runtime_error_with_code(
                     DiagnosticCode::InvalidReassignment,
                     format!("cannot reassign immutable variable `{name}`; declare it with `mut`"),
                 ));
+            }
+            if let Some(current_value) = self.lookup(&name) {
+                self.ensure_collection_reassignment_allowed(&name, current_value)?;
             }
             if let Some(expected) = self.variable_types.lookup(&name).cloned() {
                 self.ensure_reassignment_type(&value, &expected, &name)?;
@@ -1259,7 +1310,10 @@ impl Evaluator {
     }
 
     fn pop_scope(&mut self) {
+        let leaving_scope = self.scopes.current_scope_index();
         self.scopes.pop();
+        self.active_collection_borrows
+            .retain(|borrow| borrow.scope_index != Some(leaving_scope));
         self.variable_types.pop();
         if self.function_scopes.len() > 1
             && let Some(functions) = self.function_scopes.pop()

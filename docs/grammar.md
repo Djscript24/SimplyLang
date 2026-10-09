@@ -4,7 +4,7 @@ The grammar below is an implementation-oriented summary, not a complete parser g
 
 ```ebnf
 program        = { newline | statement newline } ;
-statement      = say | assignment | reassignment | destructure
+statement      = say | reference_binding | assignment | reassignment | destructure
                | destructure_assignment | call | function
                | conditional | for_loop | while_loop | return
                | try_statement | throw
@@ -25,6 +25,8 @@ pipeline_step  = "where" expression | "derive" expression
                | "write_csv" "(" expression ")" ;
 partition_rule = expression "->" name | "otherwise" "->" name ;
 assignment     = [ "mut" ] name [ "as" type ] "is" expression ;
+reference_binding = [ "mut" ] name "is" "ref"
+                    ( name | name "[" expression "]" ) ;
 reassignment   = name "->" [ newline ] expression ;
 destructure    = [ "mut" ] ( tuple_target | sequence_target ) "is" expression ;
 destructure_assignment = ( tuple_target | sequence_target )
@@ -52,7 +54,8 @@ conditional_tail = "end"
                  | "else" ":" newline { statement newline } "end"
                  | "else" "if" expression ":" newline
                    { statement newline } conditional_tail ;
-for_loop       = "for" [ "mut" ] name "in" expression ":" newline { statement newline } "end" ;
+for_loop       = "for" [ "ref" | "mut" ] name "in" expression ":" newline
+                 { statement newline } "end" ;
 while_loop     = "while" expression ":" newline { statement newline } "end" ;
 try_statement = "try" ":" newline { statement newline }
                 { "catch" [ name ] [ "as" diagnostic_code ] ":"
@@ -66,12 +69,18 @@ imported_name  = name [ "as" name ] ;
 diagnostic_code = name { "." name { "-" name } } ;
 export         = "export" name { "," name } ;
 collection_op  = name ( "add" | "remove" ) expression ;
-parameters     = parameter { "," parameter } ;
-parameter      = [ "mut" | "ref" ] name [ "as" type ] ;
+parameters     = function_parameter { "," function_parameter } ;
+function_parameter = value_parameter | mutable_parameter | ref_parameter
+                   | mutable_ref_parameter ;
+value_parameter = name [ "as" type ] ;
+mutable_parameter = "mut" name [ "as" type ] ;
+ref_parameter  = "ref" name "as" collection_type ;
+mutable_ref_parameter = "mut" "ref" name "as" collection_type ;
 message_parameters = message_parameter { "," message_parameter } ;
 message_parameter = [ "mut" ] name [ "as" type ] ;
-call_arguments = call_argument { "," call_argument } ;
-call_argument  = [ "ref" ] expression ;
+call_arguments = expression { "," expression } ;
+collection_type = "Array" "[" type "]" | "List" "[" type "]"
+               | "Hash" | "Vector" "[" type [ "," dimension ] "]" ;
 expressions    = expression { "," expression } ;
 type           = "String" | "Int" | "Float" | "Bool" | "Hash"
                | "Matrix" | name | "Array" "[" type "]" | "List" "[" type "]"
@@ -91,9 +100,9 @@ pattern_atom   = alias_pattern | literal | range_pattern | "_" | name | struct_p
                | hash_pattern ;
 alias_pattern  = name "@" pattern_atom ;
 range_pattern  = closed_range | lower_bounded_range | upper_bounded_range ;
-closed_range   = int_literal ".." int_literal ;
-lower_bounded_range = int_literal ".." ;
-upper_bounded_range = ".." int_literal ;
+closed_range   = int_literal ( ".." | "..=" ) int_literal ;
+lower_bounded_range = int_literal ( ".." | "..=" ) ;
+upper_bounded_range = ( ".." | "..=" ) int_literal ;
 int_literal    = integer | "-" integer ;
 literal        = integer | float | string | "true" | "false"
                | "-" ( integer | float ) ;
@@ -109,12 +118,101 @@ hash_pattern   = "{" [ hash_entry { "," hash_entry } [ "," ] ] "}" ;
 hash_entry     = ( string | name ) ":" pattern ;
 ```
 
-`ref` is allowed only on function parameters and corresponding function-call arguments,
-for example `fn first(ref values as List[Int]) ...` and `first(ref numbers)`.
-It applies to collection parameters, including collection expressions such as
-`ref profile["scores"]`. A `ref` parameter is a read-only, temporary view of
-the collection handle; it does not copy collection contents and cannot escape
-the call. Assignment and reassignment do not accept a `ref` marker.
+Function parameter forms are deliberately distinct: ordinary parameters may
+omit their type, `mut` parameters are writable, and `ref`/`mut ref`
+parameters require an explicit collection type. `ref` supports Array, List,
+Hash, and Vector.
+Message parameters do not support `ref`.
+
+The function declaration alone determines which parameter is borrowed. Callers
+use ordinary arguments; do not repeat `ref` at the call site. A local reference
+binding borrows a named collection until its binding scope ends:
+
+```simply
+fn first(ref values as List[Int]) gives Int:
+    return values[0]
+end
+
+items is list [10, 20]
+Sayln first(items)
+```
+
+```simply
+mut alias is ref items
+alias[0] -> 11
+```
+
+An immutable local binding creates a shared borrow; a `mut` local binding
+creates an exclusive borrow and requires a mutable owner.
+
+`for item in collection` and `for mut item in collection` iterate by value;
+they do not hold a borrow on the source, and the source may be mutated in the
+loop body. Shared reference iteration uses `for ref item in named_collection`.
+It requires an identifier bound to an Array, List, Vector, or Hash. The binding
+is read-only and the shared borrow lasts for the entire loop. The runtime
+snapshots the elements for iteration, while the borrow conservatively covers
+the source and all reachable nested collection/Struct identities. Mutation
+through aliases, including structural changes, is rejected until the loop
+exits. Nested collection/Struct values cannot escape the active iteration
+through supported storage or return operations; scalar values are copied and
+retain ordinary value behavior. `for mut ref`, reference patterns, and
+reference iteration over ranges, tuples, temporaries, or other expressions are
+unsupported.
+
+This complete example runs with `simply run`: it reads a nested value, catches
+an attempted mutation during the borrow, and mutates the collection after the
+loop has released the borrow.
+
+```simply
+mut rows is list [list [7]]
+mut rejected is false
+for ref row in rows:
+    Sayln row[0]
+    try:
+        rows add list [8]
+    catch error:
+        rejected -> true
+    end
+end
+Sayln rejected
+rows add list [9]
+Sayln rows
+```
+
+A local binding may also borrow a scalar location through nested Array/List
+indices, Hash keys, and Struct field keys. Struct fields use the existing
+bracket syntax; dot access remains Hash-only.
+
+```simply
+mut numbers is list [10, 20]
+mut second is ref numbers[1]
+second -> 99
+Sayln numbers
+
+type Profile:
+    age as Int
+end
+mut profile is Profile(30)
+mut age is ref profile["age"]
+age -> 31
+Sayln profile["age"]
+```
+
+For a shared slot binding, the alias is read-only. Each index or key is resolved
+when the binding is created, and `alias -> value` through a mutable slot writes
+to that original location rather than rebinding the alias. A collection stored
+directly in a Struct field may also be borrowed; collection-valued slots inside
+collections remain unsupported.
+
+The argument can be a collection expression such as
+`first(profile["scores"])`, or a `ref` parameter forwarded to another
+function as `next(values)`. `ref` is not an expression or call-site modifier:
+it cannot be used in arguments, reassignment, returns, message calls, or enum
+payloads. The temporary handle is read-only and does not copy collection
+contents for `ref`; `mut ref` is an exclusive, call-scoped borrow whose
+parameter may mutate the original collection. Message dispatch may infer the
+borrow mode from a function's receiver parameter, but call sites still do not
+spell a borrow marker.
 
 Match patterns are parsed in match-arm context, separately from tuple expressions.
 They recursively match tuple elements, enum payloads, and Struct fields.
@@ -131,7 +229,15 @@ bindings use an identifier, appear at most once, and must be last. An empty
 prefix (`[...tail]`) matches every length. Array and List values preserve their
 collection kind in the suffix. CSV streams are matched lazily by reading only
 the prefix needed to decide the pattern; their rest binding remains a lazy
-stream positioned at the suffix.
+stream positioned at the suffix. Ordinary pattern bindings are by value. A
+top-level identifier pattern may use `ref name` to create a shared, read-only
+binding to a named Array, List, Vector, or Hash for that match arm. Its borrow
+conservatively covers the collection and reachable nested collection/Struct
+storage, and is released when the arm exits, including on runtime errors.
+Borrowed collection values cannot escape through assignment, collection
+storage, return values, or closure capture. `ref` is not supported inside
+aliases, OR-patterns, or nested patterns; exclusive reference patterns are
+unsupported.
 Hash patterns use `{key: pattern}` with string-literal keys or bare field-name
 keys. Every listed key must exist and match its nested pattern; additional keys
 are allowed. `{}` matches every Hash. Hash keys are strings in the current
@@ -164,24 +270,32 @@ with compatible types. Unguarded alternatives contribute coverage as a union.
 Literal patterns compare Int, Float, String, and Bool values exactly, without
 numeric coercion. Bool has finite coverage (`true` and `false` are exhaustive);
 Float and String are open domains and require a wildcard or identifier. Int
-literal and range patterns use inclusive intervals, can compose recursively,
-and can prove exhaustiveness when their union covers the entire Int domain.
-Ranges require at least one Int-literal bound; for example, `-10..10`,
-`10..`, and `..10`. A closed range with a lower bound greater than its upper
-bound is invalid.
+literal and range patterns can compose recursively and prove exhaustiveness
+when their union covers the entire Int domain. A pattern using `..` has the
+same half-open bounds as a range expression: `1..5` matches 1 through 4,
+`10..` matches values from 10 upward, and `..10` matches values below 10.
+Equal or reversed `..` bounds match no values, as do equivalent empty range
+values. Use `..=` for an inclusive upper bound; for example, `1..=5` preserves
+the historical inclusive behavior of `1..`. Existing range patterns that
+relied on the old inclusive endpoint must be changed to `..=`. A closed `..=`
+range with a lower bound greater than its upper bound is invalid. Bounds must
+be Int literals.
 
 Struct fields require type annotations and preserve declaration order.
 `Person("Budi", 17)` constructs a nominal `Person` instance positionally.
 Messages are declared with `on Person receive greet:` and invoked with
-`person :: greet`; explicit message parameters use the ordinary function
-parameter grammar.
+`person :: greet`; explicit message parameters have their own grammar and
+allow `mut`, but not `ref`.
 
-`ref` marks a read-only Array, List, or Hash parameter and must also appear
-before the matching call argument, for example `inspect(ref values)`. A ref
-parameter requires an explicit collection type. It cannot be mutated, stored,
-returned, or used while declaring a nested function.
+Expressions also include array/list literals, tuples, named Hash blocks, matrix literals, indexing with `[]`, Hash field access with `.`, function calls, and pipeline blocks. Struct fields may be read or borrowed with string-key bracket access such as `person["name"]`; dot access remains Hash-only.
 
-Expressions also include array/list literals, tuples, named Hash blocks, matrix literals, indexing with `[]`, Hash field access with `.`, function calls, and pipeline blocks. Dot access is not struct field access.
+The infix expression `start .. end` constructs an end-exclusive `Range` value.
+Both bounds must be `Int`; range expressions have lower precedence than
+arithmetic and higher precedence than comparisons and `in`. The `in` operator
+tests membership using the same collection/string semantics as
+`contains(collection, value)`. Range values can be stored, passed to functions,
+returned, and iterated lazily. This is distinct from range patterns, whose
+integer bounds remain inclusive for compatibility.
 
 Message dispatch is an expression suffix on a postfix receiver. It is not
 chainable without explicit parentheses:

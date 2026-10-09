@@ -1,5 +1,17 @@
 use super::*;
 
+fn borrow_index_path(expression: &Expr) -> Option<(&str, Vec<&Expr>)> {
+    match expression {
+        Expr::Identifier(name) => Some((name, Vec::new())),
+        Expr::Index { target, index } => {
+            let (owner, mut indices) = borrow_index_path(target)?;
+            indices.push(index);
+            Some((owner, indices))
+        }
+        _ => None,
+    }
+}
+
 impl Evaluator {
     pub(super) fn run_with_output(
         &mut self,
@@ -288,6 +300,7 @@ impl Evaluator {
                     value,
                 } => {
                     let value = self.evaluate(value)?;
+                    self.ensure_no_scoped_shared_borrow_escape(&value, "a variable binding")?;
                     if let Some(expected) = declared_type {
                         let expected = self.resolve_type_identity(expected);
                         self.ensure_type(&value, &expected, name)?;
@@ -313,6 +326,124 @@ impl Evaluator {
                             )
                         })?;
                 }
+                Stmt::Borrow {
+                    name,
+                    mutable,
+                    value: source,
+                } => {
+                    let (owner, index_expressions) = borrow_index_path(source).ok_or_else(|| {
+                        self.runtime_error_with_code(
+                            DiagnosticCode::InvalidRefUsage,
+                            "a local `ref` binding must target a named collection or a nested location within a collection or Struct",
+                        )
+                    })?;
+                    let owner_value = self.lookup(owner).cloned().ok_or_else(|| {
+                        self.runtime_error_with_code(
+                            DiagnosticCode::RuntimeName,
+                            format!("unknown borrow owner `{owner}`"),
+                        )
+                    })?;
+                    let mut value = owner_value.clone();
+                    let mut path = Vec::with_capacity(index_expressions.len());
+                    for index_expression in &index_expressions {
+                        let index = self.evaluate(index_expression)?;
+                        let segment = match (&value, &index) {
+                            (Value::Array(_) | Value::List(_), Value::Int(index)) => {
+                                CollectionBorrowSegment::Index(*index)
+                            }
+                            (Value::Hash(_), Value::String(key)) => {
+                                CollectionBorrowSegment::Key(key.clone())
+                            }
+                            (Value::Struct(_), Value::String(field)) => {
+                                CollectionBorrowSegment::Field(field.clone())
+                            }
+                            _ => {
+                                return Err(self.runtime_error_with_code(
+                                    DiagnosticCode::InvalidRefUsage,
+                                    "element `ref` path requires a valid collection index or field key",
+                                ));
+                            }
+                        };
+                        path.push(segment);
+                        self.borrow_location_identity(&value).ok_or_else(|| {
+                            self.runtime_error_with_code(
+                                DiagnosticCode::InvalidRefUsage,
+                                "every segment in a nested `ref` path must be an Array, List, Hash, or Struct",
+                            )
+                        })?;
+                        value = collections::index(&value, &index, self.current_span.as_ref())?;
+                    }
+                    let contains_struct_field = path
+                        .iter()
+                        .any(|segment| matches!(segment, CollectionBorrowSegment::Field(_)));
+                    if !index_expressions.is_empty()
+                        && !matches!(
+                            &value,
+                            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::String(_)
+                        )
+                        && !(contains_struct_field && Self::collection_identity(&value).is_some())
+                    {
+                        return Err(self.runtime_error_with_code(
+                            DiagnosticCode::InvalidRefUsage,
+                            "element `ref` bindings support scalar values and Struct fields containing collections",
+                        ));
+                    }
+                    let mut locations = Vec::new();
+                    if path.is_empty() {
+                        let identity =
+                            self.borrow_location_identity(&owner_value).ok_or_else(|| {
+                                self.runtime_error_with_code(
+                                    DiagnosticCode::InvalidRefUsage,
+                                    format!("local `ref` binding `{name}` requires a borrowable location"),
+                                )
+                            })?;
+                        locations.push(CollectionBorrowLocation {
+                            identity,
+                            path: Vec::new(),
+                        });
+                    } else {
+                        let mut container = owner_value.clone();
+                        for index in 0..path.len() {
+                            let identity =
+                                self.borrow_location_identity(&container).ok_or_else(|| {
+                                    self.runtime_error_with_code(
+                                        DiagnosticCode::InvalidRefUsage,
+                                        "every segment in a nested `ref` path must be an Array, List, Hash, or Struct",
+                                    )
+                                })?;
+                            locations.push(CollectionBorrowLocation {
+                                identity,
+                                path: path[index..].to_vec(),
+                            });
+                            let index = match &path[index] {
+                                CollectionBorrowSegment::Index(index) => Value::Int(*index),
+                                CollectionBorrowSegment::Key(key) => Value::String(key.clone()),
+                                CollectionBorrowSegment::Field(field) => {
+                                    Value::String(field.clone())
+                                }
+                            };
+                            container =
+                                collections::index(&container, &index, self.current_span.as_ref())?;
+                        }
+                        if let Some(identity) = self.borrow_location_identity(&value) {
+                            locations.push(CollectionBorrowLocation {
+                                identity,
+                                path: Vec::new(),
+                            });
+                        }
+                    }
+                    self.begin_local_collection_borrow(name, owner, locations, path, *mutable)?;
+                    self.variable_types
+                        .define(name.clone(), self.type_of_value(&value), *mutable);
+                    self.scopes
+                        .define_with_borrow_mode(name.clone(), value, *mutable, true, *mutable)
+                        .map_err(|error| {
+                            self.runtime_error_with_code(
+                                DiagnosticCode::DuplicateDeclaration,
+                                error,
+                            )
+                        })?;
+                }
                 Stmt::Flow {
                     name,
                     source,
@@ -322,6 +453,7 @@ impl Evaluator {
                         source: Box::new(source.clone()),
                         steps: steps.clone(),
                     })?;
+                    self.ensure_no_scoped_shared_borrow_escape(&value, "a variable binding")?;
                     self.variable_types
                         .define(name.clone(), self.type_of_value(&value), false);
                     self.scopes
@@ -334,6 +466,20 @@ impl Evaluator {
                         })?;
                 }
                 Stmt::Reassign { name, value } => {
+                    if self.scopes.is_reference(name) {
+                        if !self.has_writable_local_element_borrow(name) {
+                            return Err(self.runtime_error_with_code(
+                                DiagnosticCode::InvalidRefUsage,
+                                format!("local `ref` binding `{name}` cannot be reassigned"),
+                            ));
+                        }
+                        let assigned = self.evaluate(value)?;
+                        if let Some(expected) = self.variable_types.lookup(name).cloned() {
+                            self.ensure_reassignment_type(&assigned, &expected, name)?;
+                        }
+                        self.write_through_local_element_borrow(name, assigned)?;
+                        continue;
+                    }
                     if !self.scopes.is_mutable(name) {
                         return Err(self.runtime_error_with_code(
                             DiagnosticCode::InvalidReassignment,
@@ -348,10 +494,15 @@ impl Evaluator {
                             format!("cannot reassign unknown variable `{name}`"),
                         ));
                     }
+                    if let Some(current_value) = self.lookup(name) {
+                        self.ensure_collection_reassignment_allowed(name, current_value)?;
+                    }
                     let value = self.evaluate(value)?;
+                    self.ensure_no_scoped_shared_borrow_escape(&value, "a variable binding")?;
                     if let Some(expected) = self.variable_types.lookup(name).cloned() {
                         self.ensure_reassignment_type(&value, &expected, name)?;
                     }
+                    self.ensure_active_message_field_mutation_allowed(name)?;
                     if !self.assign(name, value) {
                         return Err(self.runtime_error_with_code(
                             DiagnosticCode::RuntimeName,
@@ -366,6 +517,9 @@ impl Evaluator {
                             "destructuring assignment target does not match the value",
                         ));
                     };
+                    for (_, value) in &bindings {
+                        self.ensure_no_scoped_shared_borrow_escape(value, "a variable binding")?;
+                    }
                     self.assign_many(bindings)?;
                 }
                 Stmt::CollectionOp {
@@ -381,7 +535,13 @@ impl Evaluator {
                             ),
                         ));
                     }
+                    if let Some(target) = self.lookup(name).cloned() {
+                        self.ensure_collection_mutation_allowed(name, &target)?;
+                    }
                     let value = self.evaluate(value)?;
+                    if *operation == CollectionOperation::Add {
+                        self.ensure_no_scoped_shared_borrow_escape(&value, "a collection")?;
+                    }
                     if let Some(Type::List(element)) = self.variable_types.lookup(name).cloned() {
                         if *element == Type::Unknown {
                             self.variable_types.replace_visible(
@@ -418,11 +578,15 @@ impl Evaluator {
                             ),
                         ));
                     }
+                    if let Some(target) = self.lookup(name).cloned() {
+                        self.ensure_collection_mutation_allowed(name, &target)?;
+                    }
                     let index_values = indices
                         .iter()
                         .map(|index| self.evaluate(index))
                         .collect::<Result<Vec<_>, _>>()?;
                     let value = self.evaluate(value)?;
+                    self.ensure_no_scoped_shared_borrow_escape(&value, "a collection")?;
                     let mut element_type = self.variable_types.lookup(name).cloned();
                     for _ in &index_values {
                         element_type = element_type.map(|current| match current {
@@ -460,6 +624,9 @@ impl Evaluator {
                             "destructuring target does not match the value",
                         ));
                     };
+                    for (_, value) in &bindings {
+                        self.ensure_no_scoped_shared_borrow_escape(value, "a variable binding")?;
+                    }
                     let typed_bindings = bindings
                         .into_iter()
                         .map(|(name, value)| {
@@ -507,18 +674,32 @@ impl Evaluator {
                     let resolved_return_type = return_type
                         .as_ref()
                         .map(|typ| self.resolve_type_identity(typ));
+                    let captures = if self.function_scopes.len() > 1 || self.import_stack.len() > 1
+                    {
+                        let mut dependencies = closure_dependencies(body, parameters);
+                        dependencies.remove(name);
+                        self.scopes.values_for(&dependencies)
+                    } else {
+                        HashMap::new()
+                    };
+                    if captures
+                        .keys()
+                        .any(|captured_name| self.scopes.is_reference(captured_name))
+                    {
+                        return Err(self.runtime_error_with_code(
+                            DiagnosticCode::InvalidRefUsage,
+                            "closure cannot capture a reference binding",
+                        ));
+                    }
+                    for value in captures.values() {
+                        self.ensure_no_scoped_shared_borrow_escape(value, "a closure")?;
+                    }
                     let function = self.track_function(FunctionValue {
                         name: Some(name.clone()),
                         parameters: resolved_parameters.clone(),
                         return_type: resolved_return_type.clone(),
                         body: Arc::clone(body),
-                        captures: if self.function_scopes.len() > 1 || self.import_stack.len() > 1 {
-                            let mut dependencies = closure_dependencies(body, parameters);
-                            dependencies.remove(name);
-                            self.scopes.values_for(&dependencies)
-                        } else {
-                            HashMap::new()
-                        },
+                        captures,
                         source: source.clone(),
                     });
                     let function_value = Value::Function(function);
@@ -566,17 +747,55 @@ impl Evaluator {
                     }
                 }
                 Stmt::Struct { .. } | Stmt::Enum { .. } | Stmt::Message { .. } => {}
-                Stmt::Return(expr) => return Ok(Flow::Return(self.evaluate(expr)?)),
+                Stmt::Return(expr) => {
+                    let value = self.evaluate(expr)?;
+                    self.ensure_no_scoped_shared_borrow_escape(&value, "a return value")?;
+                    return Ok(Flow::Return(value));
+                }
                 Stmt::Throw(expr) => return self.evaluate_throw(expr),
                 Stmt::Break => return Ok(Flow::Break),
                 Stmt::Continue => return Ok(Flow::Continue),
                 Stmt::For {
                     name,
                     mutable,
+                    by_ref,
                     iterable,
                     body,
                 } => {
-                    let values: Box<dyn Iterator<Item = Value>> = match self.evaluate(iterable)? {
+                    let iterable_value = self.evaluate(iterable)?;
+                    let iteration_borrow = if *by_ref {
+                        let Expr::Identifier(source_name) = iterable else {
+                            return Err(self.runtime_error_with_code(
+                                DiagnosticCode::InvalidRefUsage,
+                                "`for ref` requires a named collection",
+                            ));
+                        };
+                        if !matches!(
+                            &iterable_value,
+                            Value::Array(_) | Value::List(_) | Value::Hash(_)
+                        ) {
+                            return Err(self.runtime_error_with_code(
+                                DiagnosticCode::InvalidRefUsage,
+                                "`for ref` supports Array, List, and Hash collections",
+                            ));
+                        }
+                        let mut identities = HashSet::new();
+                        self.collect_reachable_storage_identities(
+                            &iterable_value,
+                            &mut identities,
+                        )?;
+                        let locations = identities
+                            .into_iter()
+                            .map(|identity| CollectionBorrowLocation {
+                                identity,
+                                path: Vec::new(),
+                            })
+                            .collect();
+                        Some((source_name.as_str(), locations))
+                    } else {
+                        None
+                    };
+                    let values: Box<dyn Iterator<Item = Value>> = match iterable_value {
                         Value::Range { start, end, step } => {
                             Box::new(Value::range_values(start, end, step))
                         }
@@ -591,7 +810,42 @@ impl Evaluator {
                     };
                     self.push_scope();
                     let result = (|| {
+                        if let Some((source_name, locations)) = iteration_borrow {
+                            self.begin_shared_iteration_borrow(name, source_name, locations)?;
+                        }
                         for value in values {
+                            if *by_ref {
+                                self.push_scope();
+                                let iteration = (|| {
+                                    self.variable_types.define(
+                                        name.clone(),
+                                        self.type_of_value(&value),
+                                        false,
+                                    );
+                                    self.scopes
+                                        .define_with_borrow_mode(
+                                            name.clone(),
+                                            value,
+                                            false,
+                                            true,
+                                            false,
+                                        )
+                                        .map_err(|error| {
+                                            self.runtime_error_with_code(
+                                                DiagnosticCode::DuplicateDeclaration,
+                                                error,
+                                            )
+                                        })?;
+                                    self.execute_statements(body)
+                                })();
+                                self.pop_scope();
+                                match iteration? {
+                                    Flow::None | Flow::Continue => {}
+                                    Flow::Break => break,
+                                    Flow::Return(value) => return Ok(Some(value)),
+                                }
+                                continue;
+                            }
                             if self.scopes.has_in_current_scope(name) {
                                 self.scopes.assign_current(name, value);
                             } else {
@@ -715,6 +969,7 @@ impl Evaluator {
 
     pub(super) fn evaluate_throw(&mut self, expression: &Expr) -> Result<Flow, SimplyError> {
         let value = self.evaluate(expression)?;
+        self.ensure_no_scoped_shared_borrow_escape(&value, "an error value")?;
         if !matches!(value, Value::Enum(_)) {
             return Err(self.runtime_error_with_code(
                 DiagnosticCode::RuntimeTypeMismatch,

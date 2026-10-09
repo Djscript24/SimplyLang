@@ -5,6 +5,7 @@ use crate::{
     ast::{BinaryOperator, UnaryOperator},
     error::{DiagnosticCode, SimplyError, Span},
     runtime::{
+        collections,
         heap::RuntimeHeap,
         value::{Value, shared_values},
     },
@@ -66,6 +67,16 @@ pub(crate) fn binary(
         Greater | GreaterEqual | Less | LessEqual => {
             numeric_comparison(left, operator, right, span)
         }
+        Range => match (left, right) {
+            (Value::Int(start), Value::Int(end)) => Ok(Value::Range {
+                start,
+                end,
+                step: 1,
+            }),
+            _ => Err(type_error(span, "`..` requires two integers")),
+        },
+        In => collections::contains(&right, &left, span, "`in` requires a collection or string")
+            .map(Value::Bool),
         Equal => Ok(Value::Bool(left == right)),
         NotEqual => Ok(Value::Bool(left != right)),
         And => match (left, right) {

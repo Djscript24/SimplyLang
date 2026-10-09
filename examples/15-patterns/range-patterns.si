@@ -1,11 +1,11 @@
 age is 17
 
 category is match age:
-    ..-1:
+    ..0:
         "negative"
-    0..12:
+    0..13:
         "child"
-    13..17:
+    13..18:
         "teen"
     18..:
         "adult"
@@ -14,7 +14,7 @@ end
 score is -5
 
 kind is match score:
-    ..-1:
+    ..0:
         "negative"
     0:
         "zero"

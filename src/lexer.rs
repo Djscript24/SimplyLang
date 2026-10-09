@@ -88,6 +88,7 @@ pub enum TokenKind {
     RightBrace,
     Dot,
     DotDot,
+    DotDotEqual,
     DotDotDot,
     True,
     False,
@@ -152,6 +153,9 @@ impl<'a> Lexer<'a> {
                 ']' => tokens.push(self.single_char(TokenKind::RightBracket)),
                 '{' => tokens.push(self.single_char(TokenKind::LeftBrace)),
                 '}' => tokens.push(self.single_char(TokenKind::RightBrace)),
+                '.' if self.next_two_are_dots_and_equal() => {
+                    tokens.push(self.read_triple_char(TokenKind::DotDotEqual));
+                }
                 '.' if self.next_two_are_dots() => {
                     tokens.push(self.read_triple_char(TokenKind::DotDotDot));
                 }
@@ -218,6 +222,12 @@ impl<'a> Lexer<'a> {
         characters.next() == Some('.')
             && characters.next() == Some('.')
             && characters.next() == Some('.')
+    }
+
+    fn next_two_are_dots_and_equal(&self) -> bool {
+        self.source
+            .get(self.index..)
+            .is_some_and(|text| text.starts_with("..="))
     }
 
     fn advance(&mut self) -> Option<char> {

@@ -10,6 +10,58 @@ use std::{
 };
 
 #[test]
+fn formatter_preserves_shared_reference_iteration_syntax() {
+    let path = std::env::temp_dir().join(format!(
+        "simply-format-ref-loop-{}-{}.si",
+        std::process::id(),
+        TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(
+        &path,
+        "values is list [1]\nfor ref item in values:\nSayln item\nend\n",
+    )
+    .expect("failed to write reference iteration source");
+    let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["fmt", path.to_str().expect("temporary path was not UTF-8")])
+        .output()
+        .expect("failed to format reference iteration source");
+    let _ = fs::remove_file(path);
+
+    assert!(output.status.success());
+    let formatted = String::from_utf8_lossy(&output.stdout);
+    assert!(formatted.contains("for ref item in values:"), "{formatted}");
+}
+
+#[test]
+fn formatter_preserves_half_open_and_inclusive_range_patterns() {
+    let path = std::env::temp_dir().join(format!(
+        "simply-format-range-pattern-{}-{}.si",
+        std::process::id(),
+        TEMP_SOURCE_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(
+        &path,
+        "value is 5\nmatch value:\n1 .. 5:\n0\n5 ..= 7:\n1\n_:\n2\nend\n",
+    )
+    .expect("failed to write range pattern source");
+    let output = Command::new(env!("CARGO_BIN_EXE_simply"))
+        .args(["fmt", path.to_str().expect("temporary path was not UTF-8")])
+        .output()
+        .expect("failed to format range pattern source");
+    let _ = fs::remove_file(path);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "value is 5\nmatch value:\n    1..5:\n        0\n    5..=7:\n        1\n    _:\n        2\nend\n"
+    );
+}
+
+#[test]
 fn runs_basic_values() {
     let output = run_example("examples/01-basics/values.si");
     assert!(output.contains("Hello, Simply!"));

@@ -447,6 +447,11 @@ fn collect_statement_stats(statements: &[Stmt], stats: &mut ExplainStats, inside
                 stats.mutable_bindings += usize::from(*mutable);
                 collect_expression_stats(value, stats);
             }
+            Stmt::Borrow { mutable, value, .. } => {
+                stats.bindings += 1;
+                stats.mutable_bindings += usize::from(*mutable);
+                collect_expression_stats(value, stats);
+            }
             Stmt::Flow { source, steps, .. } => {
                 stats.bindings += 1;
                 collect_expression_stats(source, stats);
@@ -581,9 +586,7 @@ fn collect_expression_stats(expression: &Expr, stats: &mut ExplainStats) {
                 }
             }
         }
-        Expr::Unary { operand, .. } | Expr::Ref(operand) => {
-            collect_expression_stats(operand, stats)
-        }
+        Expr::Unary { operand, .. } => collect_expression_stats(operand, stats),
         Expr::Binary { left, right, .. } => {
             collect_expression_stats(left, stats);
             collect_expression_stats(right, stats);

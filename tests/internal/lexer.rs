@@ -53,7 +53,7 @@ fn lexes_assignment_tokens() {
 
 #[test]
 fn lexes_range_operators_without_splitting_integer_literals_as_floats() {
-    let tokens = Lexer::new("0..10 1.5..2.5 ..-1\n")
+    let tokens = Lexer::new("0..10 1.5..2.5 ..-1 0..=10 ...tail\n")
         .tokenize()
         .unwrap()
         .into_iter()
@@ -71,6 +71,11 @@ fn lexes_range_operators_without_splitting_integer_literals_as_floats() {
             TokenKind::DotDot,
             TokenKind::Minus,
             TokenKind::Int(1),
+            TokenKind::Int(0),
+            TokenKind::DotDotEqual,
+            TokenKind::Int(10),
+            TokenKind::DotDotDot,
+            TokenKind::Identifier("tail".into()),
             TokenKind::Newline,
             TokenKind::Eof,
         ]

@@ -203,6 +203,7 @@ impl Evaluator {
             DiagnosticCode::TypeMismatch => DiagnosticCode::RuntimeTypeMismatch,
             DiagnosticCode::DuplicateDeclaration => DiagnosticCode::RuntimeDeclaration,
             DiagnosticCode::InvalidReassignment => DiagnosticCode::RuntimeMutability,
+            DiagnosticCode::InvalidRefUsage => DiagnosticCode::InvalidRefUsage,
             code if code.category() == crate::error::DiagnosticCategory::Runtime => code,
             _ => DiagnosticCode::RuntimeGeneral,
         };
@@ -557,7 +558,6 @@ impl Evaluator {
                 Literal::Float(_) => Type::Float,
                 Literal::Bool(_) => Type::Bool,
             },
-            Expr::Ref(inner) => self.runtime_expression_type(inner, item_type),
             Expr::Identifier(name) if name == "item" => item_type.cloned().unwrap_or(Type::Unknown),
             Expr::Identifier(name) => self
                 .variable_types

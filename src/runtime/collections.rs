@@ -51,6 +51,15 @@ pub(crate) fn index(
         }
         return Err(error(span, "hash key must be a string"));
     }
+    if let Value::Struct(instance) = target {
+        if let Value::String(name) = index {
+            return instance
+                .with(|instance| instance.fields.get(name).cloned())
+                .flatten()
+                .ok_or_else(|| error(span, format!("unknown field `{name}`")));
+        }
+        return Err(error(span, "struct field name must be a string"));
+    }
     if let Value::Range { start, end, step } = target {
         let index = match index {
             Value::Int(index) if *index >= 0 => *index,
@@ -90,6 +99,44 @@ pub(crate) fn index(
             .cloned()
             .ok_or_else(|| error(span, "collection index out of bounds")),
         _ => Err(error(span, "value is not indexable")),
+    }
+}
+
+pub(crate) fn contains(
+    target: &Value,
+    searched: &Value,
+    span: Option<&Span>,
+    invalid_target_message: &str,
+) -> Result<bool, SimplyError> {
+    match target {
+        Value::String(value) => Ok(match searched {
+            Value::String(searched) => value.contains(searched),
+            _ => false,
+        }),
+        Value::Array(values) | Value::List(values) => values
+            .get_cloned()
+            .map(|values| values.iter().any(|value| value == searched))
+            .ok_or_else(|| error(span, "collection storage is no longer available")),
+        Value::Tuple(values) => Ok(values.iter().any(|value| value == searched)),
+        Value::Range { start, end, step } => {
+            let Value::Int(value) = searched else {
+                return Ok(false);
+            };
+            if *step == 0 {
+                return Err(error(span, "range step cannot be zero"));
+            }
+            let in_bounds = if *step > 0 {
+                *value >= *start && *value < *end
+            } else {
+                *value <= *start && *value > *end
+            };
+            Ok(in_bounds && (i128::from(*value) - i128::from(*start)) % i128::from(*step) == 0)
+        }
+        Value::Hash(values) => values
+            .get_cloned()
+            .map(|values| values.values().any(|value| value == searched))
+            .ok_or_else(|| error(span, "hash storage is no longer available")),
+        _ => Err(error(span, invalid_target_message)),
     }
 }
 

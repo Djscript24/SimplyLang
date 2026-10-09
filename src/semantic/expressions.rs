@@ -7,7 +7,6 @@ impl SemanticAnalyzer {
             Expr::Literal(Literal::Int(_)) => Ok(Type::Int),
             Expr::Literal(Literal::Float(_)) => Ok(Type::Float),
             Expr::Literal(Literal::Bool(_)) => Ok(Type::Bool),
-            Expr::Ref(inner) => self.analyze_expression(inner),
             Expr::Identifier(name) => {
                 if let Some(typ) = self.variables.get(name).cloned() {
                     if matches!(typ, Type::Function { .. }) {
@@ -144,15 +143,6 @@ impl SemanticAnalyzer {
                 arguments,
             } => {
                 if self.enums.contains_key(enum_name) {
-                    if arguments
-                        .iter()
-                        .any(|argument| matches!(argument, Expr::Ref(_)))
-                    {
-                        return Err(self.error(
-                            DiagnosticCode::InvalidRefUsage,
-                            "`ref` arguments are not allowed for enum variants",
-                        ));
-                    }
                     self.enum_variant_type(enum_name, variant_name, arguments)
                 } else if self.variables.get(enum_name).is_none() {
                     Err(self.error(
@@ -426,6 +416,39 @@ impl SemanticAnalyzer {
                 self.require_numeric(right)?;
                 Ok(Type::Bool)
             }
+            Range => {
+                self.require_type(&Type::Int, left)?;
+                self.require_type(&Type::Int, right)?;
+                Ok(Type::Range)
+            }
+            In => {
+                if !matches!(
+                    right,
+                    Type::String
+                        | Type::Range
+                        | Type::Array(_)
+                        | Type::List(_)
+                        | Type::Vector(_, _)
+                        | Type::Tuple(_)
+                        | Type::Hash
+                        | Type::HashValues(_)
+                        | Type::Unknown
+                ) {
+                    return Err(self.error(
+                        DiagnosticCode::SemanticCollection,
+                        format!(
+                            "`in` requires a collection, range, or string, found {}",
+                            right.name()
+                        ),
+                    ));
+                }
+                if right == &Type::String {
+                    self.require_type(&Type::String, left)?;
+                } else if right == &Type::Range {
+                    self.require_type(&Type::Int, left)?;
+                }
+                Ok(Type::Bool)
+            }
             Equal | NotEqual => Ok(Type::Bool),
             And | Or => {
                 self.require_type(&Type::Bool, left)?;
@@ -449,6 +472,7 @@ impl SemanticAnalyzer {
             self.validate_ref_arguments(
                 arguments,
                 &argument_types,
+                &vec![false; fields.len()],
                 &vec![false; fields.len()],
                 name,
                 false,
@@ -491,6 +515,7 @@ impl SemanticAnalyzer {
                     arguments,
                     &argument_types,
                     &function.ref_parameters,
+                    &function.mut_ref_parameters,
                     name,
                     true,
                 )?;
@@ -517,6 +542,7 @@ impl SemanticAnalyzer {
                 arguments,
                 &argument_types,
                 &vec![false; parameters.len()],
+                &vec![false; parameters.len()],
                 name,
                 true,
             )?;
@@ -536,15 +562,6 @@ impl SemanticAnalyzer {
                 }
             }
             return Ok(return_type.as_deref().cloned().unwrap_or(Type::Unknown));
-        }
-        if arguments
-            .iter()
-            .any(|argument| matches!(argument, Expr::Ref(_)))
-        {
-            return Err(self.error(
-                DiagnosticCode::InvalidRefUsage,
-                "`ref` arguments are only allowed for declared `ref` parameters",
-            ));
         }
         if name == "Ask" {
             if !(1..=2).contains(&arguments.len()) {
@@ -1465,6 +1482,7 @@ impl SemanticAnalyzer {
                 arguments,
                 &argument_types,
                 &signature.ref_parameters,
+                &signature.mut_ref_parameters,
                 message,
                 true,
             )?;
@@ -1486,7 +1504,14 @@ impl SemanticAnalyzer {
             }
             return Ok(signature.return_type.clone().unwrap_or(Type::Unknown));
         }
-        let (parameters, return_type, ref_parameters, receiver_ref) = if let Some(function) = self
+        let (
+            parameters,
+            return_type,
+            ref_parameters,
+            mut_ref_parameters,
+            receiver_ref,
+            receiver_mut_ref,
+        ) = if let Some(function) = self
             .function_scopes
             .iter()
             .rev()
@@ -1501,7 +1526,18 @@ impl SemanticAnalyzer {
                     .skip(1)
                     .copied()
                     .collect::<Vec<_>>(),
+                function
+                    .mut_ref_parameters
+                    .iter()
+                    .skip(1)
+                    .copied()
+                    .collect::<Vec<_>>(),
                 function.ref_parameters.first().copied().unwrap_or(false),
+                function
+                    .mut_ref_parameters
+                    .first()
+                    .copied()
+                    .unwrap_or(false),
             )
         } else if let Some(Type::Function {
             parameters,
@@ -1515,6 +1551,8 @@ impl SemanticAnalyzer {
                     .collect(),
                 return_type.as_deref().cloned().unwrap_or(Type::Unknown),
                 vec![false; parameters.len().saturating_sub(1)],
+                vec![false; parameters.len().saturating_sub(1)],
+                false,
                 false,
             )
         } else if receiver_type == Type::Unknown
@@ -1549,7 +1587,28 @@ impl SemanticAnalyzer {
                 ),
             ));
         }
-        self.validate_ref_arguments(arguments, &argument_types, &ref_parameters, message, true)?;
+        if receiver_mut_ref {
+            let Expr::Identifier(name) = receiver else {
+                return Err(self.error(
+                    DiagnosticCode::InvalidRefUsage,
+                    format!("mutable `ref` receiver for `{message}` must be a mutable variable"),
+                ));
+            };
+            if !self.variables.is_mutable(name) {
+                return Err(self.error(
+                    DiagnosticCode::InvalidRefUsage,
+                    format!("mutable `ref` receiver `{name}` requires a `mut` owner"),
+                ));
+            }
+        }
+        self.validate_ref_arguments(
+            arguments,
+            &argument_types,
+            &ref_parameters,
+            &mut_ref_parameters,
+            message,
+            true,
+        )?;
         for (expected, actual) in parameters.iter().zip(actual_types) {
             if let Some(expected) = expected {
                 self.require_type(expected, actual)?;
@@ -1563,21 +1622,31 @@ impl SemanticAnalyzer {
         arguments: &[Expr],
         argument_types: &[Type],
         expected: &[bool],
+        expected_mut: &[bool],
         callee: &str,
         require_collection_ref: bool,
     ) -> Result<(), SimplyError> {
         for (index, argument) in arguments.iter().enumerate() {
-            let marked = matches!(argument, Expr::Ref(_));
             let required = expected.get(index).copied().unwrap_or(false);
-            if marked != required {
-                return Err(self.error(
-                    DiagnosticCode::InvalidRefUsage,
-                    format!(
-                        "argument {} to `{callee}` {} `ref`",
-                        index + 1,
-                        if required { "requires" } else { "must not use" }
-                    ),
-                ));
+            let requires_mutable = expected_mut.get(index).copied().unwrap_or(false);
+            if requires_mutable {
+                let Expr::Identifier(name) = argument else {
+                    return Err(self.error(
+                        DiagnosticCode::InvalidRefUsage,
+                        format!(
+                            "mutable `ref` argument {} to `{callee}` must be a mutable variable",
+                            index + 1
+                        ),
+                    ));
+                };
+                if !self.variables.is_mutable(name) {
+                    return Err(self.error(
+                        DiagnosticCode::InvalidRefUsage,
+                        format!(
+                            "mutable `ref` argument `{name}` to `{callee}` requires a `mut` owner"
+                        ),
+                    ));
+                }
             }
             if !required
                 && require_collection_ref

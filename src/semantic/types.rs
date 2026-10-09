@@ -42,6 +42,25 @@ impl SemanticAnalyzer {
                     _ => Type::Unknown,
                 })
             }
+            Type::Struct(identity) => {
+                self.require_type(&Type::String, index)?;
+                match index_expression {
+                    Expr::Literal(Literal::String(field)) => self
+                        .struct_identities
+                        .iter()
+                        .find(|(_, candidate)| *candidate == identity)
+                        .and_then(|(name, _)| self.structs.get(name))
+                        .and_then(|fields| fields.iter().find(|item| item.name == *field))
+                        .map(|field| field.field_type.clone())
+                        .ok_or_else(|| {
+                            self.error(
+                                DiagnosticCode::SemanticField,
+                                format!("struct `{}` has no field `{field}`", identity.local_name),
+                            )
+                        }),
+                    _ => Ok(Type::Unknown),
+                }
+            }
             Type::String => {
                 self.require_type(&Type::Int, index)?;
                 Ok(Type::String)

@@ -612,7 +612,7 @@ fn checks_vector_and_matrix_element_types_statically() {
          fn transform(m as Matrix[Float], ref v as Vector[Float]) gives Array[Float]:\n\
              return matvec(m, v)\n\
          end\n\
-         Sayln transform(mat, ref vec)\n\
+         Sayln transform(mat, vec)\n\
          Sayln mat[0, 1]\n\
          Sayln mat + mat\n\
          Sayln vec[1]\n";

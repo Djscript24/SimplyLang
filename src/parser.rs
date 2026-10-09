@@ -230,7 +230,8 @@ impl Parser {
         }
 
         if self.match_kind(TokenKind::For) {
-            let mutable = self.match_kind(TokenKind::Mut);
+            let by_ref = self.match_kind(TokenKind::Ref);
+            let mutable = !by_ref && self.match_kind(TokenKind::Mut);
             let name = self.expect_identifier("expected loop variable")?;
             self.expect(TokenKind::In, "expected `in` after loop variable")?;
             let iterable = self.expression()?;
@@ -241,6 +242,7 @@ impl Parser {
             return Ok(Stmt::For {
                 name,
                 mutable,
+                by_ref,
                 iterable,
                 body,
             });
@@ -316,10 +318,18 @@ impl Parser {
             };
             if self.match_kind(TokenKind::Is) {
                 if self.check(TokenKind::Ref) {
-                    return Err(self.invalid_ref_at(
-                        self.peek().span.clone(),
-                        "`ref` cannot be stored in a binding",
-                    ));
+                    self.advance();
+                    if declared_type.is_some() {
+                        return Err(self.invalid_ref_at(
+                            self.tokens[self.current - 1].span.clone(),
+                            "a local `ref` binding infers its collection type",
+                        ));
+                    }
+                    return Ok(Stmt::Borrow {
+                        name,
+                        mutable,
+                        value: self.expression()?,
+                    });
                 }
                 return Ok(Stmt::Assign {
                     name,
@@ -343,7 +353,7 @@ impl Parser {
                 if self.check(TokenKind::Ref) {
                     return Err(self.invalid_ref_at(
                         self.peek().span.clone(),
-                        "`ref` cannot be stored by reassignment",
+                        "a local `ref` binding cannot be reassigned",
                     ));
                 }
                 return Ok(Stmt::Reassign {
@@ -437,12 +447,6 @@ impl Parser {
                     return Err(self.invalid_ref_at(
                         self.tokens[self.current - 1].span.clone(),
                         "`ref` parameters are only allowed in functions",
-                    ));
-                }
-                if mutable && by_ref {
-                    return Err(self.invalid_ref_at(
-                        self.tokens[self.current - 1].span.clone(),
-                        "a `ref` parameter cannot also be `mut`",
                     ));
                 }
                 let parameter = self.expect_identifier("expected parameter name")?;
@@ -670,10 +674,12 @@ impl Parser {
         matches!(
             self.peek().kind,
             TokenKind::Identifier(_)
+                | TokenKind::Ref
                 | TokenKind::LeftParen
                 | TokenKind::LeftBracket
                 | TokenKind::LeftBrace
                 | TokenKind::DotDot
+                | TokenKind::DotDotEqual
                 | TokenKind::String(_)
                 | TokenKind::Int(_)
                 | TokenKind::Float(_)
@@ -694,12 +700,25 @@ impl Parser {
     }
 
     fn match_pattern_atom_inner(&mut self) -> Result<MatchPattern, SimplyError> {
-        if self.match_kind(TokenKind::DotDot) {
+        if self.match_kind(TokenKind::Ref) {
+            let name = self.expect_identifier("expected a binding name after `ref`")?;
+            if name == "_" {
+                return Err(self.error_here("`ref` pattern requires a binding identifier"));
+            }
+            return Ok(MatchPattern::ReferenceIdentifier(name));
+        }
+
+        if self.match_kind(TokenKind::DotDot) || self.match_kind(TokenKind::DotDotEqual) {
+            let inclusive_end = self.tokens[self.current - 1].kind == TokenKind::DotDotEqual;
             let end = self.range_pattern_endpoint()?;
             if end.is_none() {
                 return Err(self.error_here("a range pattern must have at least one bound"));
             }
-            return Ok(MatchPattern::Range { start: None, end });
+            return Ok(MatchPattern::Range {
+                start: None,
+                end,
+                inclusive_end,
+            });
         }
 
         let literal = match self.peek().kind.clone() {
@@ -818,7 +837,7 @@ impl Parser {
 
         let name = self.expect_identifier("expected a match pattern")?;
         if name == "_" {
-            if self.check(TokenKind::DotDot) {
+            if self.check(TokenKind::DotDot) || self.check(TokenKind::DotDotEqual) {
                 return Err(self.error_here("range pattern bounds must be literal values"));
             }
             if self.check(TokenKind::At) {
@@ -833,7 +852,7 @@ impl Parser {
                 pattern: Box::new(pattern),
             });
         }
-        if self.check(TokenKind::DotDot) {
+        if self.check(TokenKind::DotDot) || self.check(TokenKind::DotDotEqual) {
             return Err(self.error_here("range pattern bounds must be literal values"));
         }
         if self.match_kind(TokenKind::LeftParen) {
@@ -897,11 +916,13 @@ impl Parser {
     }
 
     fn finish_literal_pattern(&mut self, literal: Literal) -> Result<MatchPattern, SimplyError> {
-        if self.match_kind(TokenKind::DotDot) {
+        if self.match_kind(TokenKind::DotDot) || self.match_kind(TokenKind::DotDotEqual) {
+            let inclusive_end = self.tokens[self.current - 1].kind == TokenKind::DotDotEqual;
             let end = self.range_pattern_endpoint()?;
             return Ok(MatchPattern::Range {
                 start: Some(literal),
                 end,
+                inclusive_end,
             });
         }
         Ok(MatchPattern::Literal(literal))
@@ -1462,14 +1483,11 @@ impl Parser {
             };
             let arguments = if self.check(TokenKind::LeftParen) {
                 self.advance();
-                self.argument_list(
-                    false,
-                    if enum_name.is_some() {
-                        "`ref` cannot be used as an enum payload"
-                    } else {
-                        "`ref` arguments are only allowed in function calls"
-                    },
-                )?
+                self.argument_list(if enum_name.is_some() {
+                    "`ref` cannot be used as an enum payload"
+                } else {
+                    "`ref` is inferred from a function parameter and cannot mark message arguments"
+                })?
             } else {
                 Vec::new()
             };
@@ -1769,32 +1787,26 @@ impl Parser {
 
     fn call_expression(&mut self, name: String) -> Result<Expr, SimplyError> {
         self.expect(TokenKind::LeftParen, "expected `(` after function name")?;
-        let arguments = self.argument_list(true, "")?;
+        let arguments = self.argument_list(
+            "call arguments infer `ref` from the function parameter; omit the marker",
+        )?;
         Ok(Expr::Call { name, arguments })
     }
 
-    fn argument_list(
-        &mut self,
-        allow_ref: bool,
-        invalid_ref_message: &str,
-    ) -> Result<Vec<Expr>, SimplyError> {
+    fn argument_list(&mut self, invalid_ref_message: &str) -> Result<Vec<Expr>, SimplyError> {
         let mut arguments = Vec::new();
         self.consume_newlines();
         if !self.check(TokenKind::RightParen) {
             loop {
                 let by_ref = self.match_kind(TokenKind::Ref);
-                if by_ref && !allow_ref {
+                if by_ref {
                     return Err(self.invalid_ref_at(
                         self.tokens[self.current - 1].span.clone(),
                         invalid_ref_message,
                     ));
                 }
                 let argument = self.expression()?;
-                arguments.push(if by_ref {
-                    Expr::Ref(Box::new(argument))
-                } else {
-                    argument
-                });
+                arguments.push(argument);
                 self.consume_newlines();
                 if !self.match_kind(TokenKind::Comma) {
                     break;
@@ -1811,16 +1823,18 @@ impl Parser {
 
     fn binary_operator(&self) -> Option<(u8, BinaryOperator)> {
         match self.peek().kind {
-            TokenKind::Plus => Some((5, BinaryOperator::Add)),
-            TokenKind::Minus => Some((5, BinaryOperator::Subtract)),
-            TokenKind::Star => Some((6, BinaryOperator::Multiply)),
-            TokenKind::Slash => Some((6, BinaryOperator::Divide)),
-            TokenKind::Percent => Some((6, BinaryOperator::Remainder)),
-            TokenKind::MultiplyWord => Some((5, BinaryOperator::MatrixMultiply)),
-            TokenKind::Greater => Some((4, BinaryOperator::Greater)),
-            TokenKind::GreaterEqual => Some((4, BinaryOperator::GreaterEqual)),
-            TokenKind::Less => Some((4, BinaryOperator::Less)),
-            TokenKind::LessEqual => Some((4, BinaryOperator::LessEqual)),
+            TokenKind::Plus => Some((7, BinaryOperator::Add)),
+            TokenKind::Minus => Some((7, BinaryOperator::Subtract)),
+            TokenKind::Star => Some((8, BinaryOperator::Multiply)),
+            TokenKind::Slash => Some((8, BinaryOperator::Divide)),
+            TokenKind::Percent => Some((8, BinaryOperator::Remainder)),
+            TokenKind::MultiplyWord => Some((7, BinaryOperator::MatrixMultiply)),
+            TokenKind::Greater => Some((5, BinaryOperator::Greater)),
+            TokenKind::GreaterEqual => Some((5, BinaryOperator::GreaterEqual)),
+            TokenKind::Less => Some((5, BinaryOperator::Less)),
+            TokenKind::LessEqual => Some((5, BinaryOperator::LessEqual)),
+            TokenKind::DotDot => Some((6, BinaryOperator::Range)),
+            TokenKind::In => Some((5, BinaryOperator::In)),
             TokenKind::EqualEqual => Some((3, BinaryOperator::Equal)),
             TokenKind::NotEqual => Some((3, BinaryOperator::NotEqual)),
             TokenKind::And => Some((2, BinaryOperator::And)),

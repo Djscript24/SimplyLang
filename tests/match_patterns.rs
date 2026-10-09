@@ -17,8 +17,649 @@ fn identifier_patterns_bind_the_whole_value_and_are_exhaustive() {
 }
 
 #[test]
+fn reference_identifier_patterns_borrow_named_collections_for_one_match_arm() {
+    let source = r#"fn combine(ref left as List[List[Int]], ref right as List[List[Int]]) gives Int:
+    return left[0][0] + right[1][0]
+end
+mut rows is list [list [3], list [5]]
+result is match rows:
+    ref first_view:
+        combine(first_view, first_view)
+end
+Sayln result
+rows add list [7]
+Sayln rows
+"#;
+    let (valid, _, error) = check_source(source);
+    assert!(valid, "shared match bindings did not type-check: {error}");
+    let (success, output) = run_source_stdout(source);
+    assert!(success, "shared match binding failed: {output}");
+    assert_eq!(output, "8\n[[3], [5], [7]]\n");
+}
+
+#[test]
+fn reference_identifier_patterns_keep_array_list_hash_and_by_value_matches_working() {
+    let source = r#"numbers as Array[Int] is [1]
+items is list [2]
+record as Hash is hash:
+    score is 3
+end
+    vector as Vector[Int] is [4]
+    match numbers:
+        ref view:
+            Sayln view[0]
+end
+match items:
+    ref view:
+        Sayln view[0]
+end
+match record:
+    ref view:
+        Sayln view["score"]
+end
+match vector:
+    ref view:
+        Sayln view[0]
+end
+mut ordinary is list [4]
+match ordinary:
+    value:
+        ordinary add 5
+        Sayln value
+end
+Sayln ordinary
+"#;
+    let (valid, _, error) = check_source(source);
+    assert!(valid, "supported ref pattern did not type-check: {error}");
+    let (success, output) = run_source_stdout(source);
+    assert!(success, "supported ref pattern failed: {output}");
+    assert_eq!(output, "1\n2\n3\n4\n[4, 5]\n[4, 5]\n");
+}
+
+#[test]
+fn reference_identifier_patterns_reject_known_tuple_backed_vectors() {
+    let tuple_vector = r#"items as Vector[Int] is (1, 2)
+match items:
+    ref view:
+        Sayln view[0]
+end
+"#;
+    let (valid, _, error) = check_source(tuple_vector);
+    assert!(!valid, "tuple-backed Vector ref pattern passed checking");
+    assert!(
+        error.contains("tuple-backed Vector"),
+        "missing tuple-backed Vector diagnostic: {error}"
+    );
+
+    let tuple_vector_alias = r#"items as Vector[Int] is (1, 2)
+alias as Vector[Int] is items
+match alias:
+    ref view:
+        Sayln view[0]
+end
+"#;
+    let (valid, _, error) = check_source(tuple_vector_alias);
+    assert!(
+        !valid,
+        "tuple-backed Vector alias ref pattern passed checking"
+    );
+    assert!(
+        error.contains("tuple-backed Vector"),
+        "missing tuple-backed Vector alias diagnostic: {error}"
+    );
+
+    let reassigned_vector = r#"mut items as Vector[Int] is (1, 2)
+    items -> [6, 7]
+match items:
+    ref view:
+        Sayln view[0]
+end
+"#;
+    let (valid, _, error) = check_source(reassigned_vector);
+    assert!(
+        valid,
+        "Vector reassigned to Array storage was rejected: {error}"
+    );
+    let (success, output) = run_source_stdout(reassigned_vector);
+    assert!(success, "Array-backed Vector ref pattern failed: {output}");
+    assert_eq!(output, "6\n");
+
+    let dynamic_collection = r#"fn read(items):
+    match items:
+        ref view:
+            Sayln view
+    end
+end
+"#;
+    let (valid, _, error) = check_source(dynamic_collection);
+    assert!(
+        valid,
+        "dynamic Unknown scrutinee was rejected statically: {error}"
+    );
+}
+
+#[test]
+fn vector_reference_provenance_joins_control_flow_and_recovers_after_reassignment() {
+    let cases = [
+        (
+            r#"mut items as Vector[Int] is (1, 2)
+if false:
+    items -> [3, 4]
+end
+match items:
+    ref view:
+        Sayln view[0]
+end
+"#,
+            false,
+            false,
+            "",
+        ),
+        (
+            r#"mut items as Vector[Int] is [1, 2]
+if false:
+    items -> (3, 4)
+end
+match items:
+    ref view:
+        Sayln view[0]
+end
+"#,
+            true,
+            true,
+            "1\n",
+        ),
+        (
+            r#"mut items as Vector[Int] is [1, 2]
+if true:
+    items -> (3, 4)
+else:
+    items -> [5, 6]
+end
+match items:
+    ref view:
+        Sayln view[0]
+end
+"#,
+            false,
+            false,
+            "",
+        ),
+        (
+            r#"mut items as Vector[Int] is [1, 2]
+match true:
+    true:
+        items -> (3, 4)
+    false:
+        items -> [5, 6]
+end
+match items:
+    ref view:
+        Sayln view[0]
+end
+"#,
+            false,
+            false,
+            "",
+        ),
+        (
+            r#"mut items as Vector[Int] is [1, 2]
+match true:
+    true:
+        items -> [3, 4]
+    false:
+        items -> (5, 6)
+end
+match items:
+    ref view:
+        Sayln view[0]
+end
+"#,
+            true,
+            true,
+            "3\n",
+        ),
+        (
+            r#"mut items as Vector[Int] is [1, 2]
+if true:
+    items -> [3, 4]
+else:
+    items -> [5, 6]
+end
+match items:
+    ref view:
+        Sayln view[0]
+end
+"#,
+            true,
+            true,
+            "3\n",
+        ),
+        (
+            r#"mut items as Vector[Int] is (1, 2)
+for n in range(0, 0):
+    items -> [3, 4]
+end
+match items:
+    ref view:
+        Sayln view[0]
+end
+"#,
+            false,
+            false,
+            "",
+        ),
+    ];
+    for (source, expected_check, expected_run, expected_output) in cases {
+        let (valid, _, error) = check_source(source);
+        assert_eq!(
+            valid, expected_check,
+            "unexpected check result: {error}\nsource:\n{source}"
+        );
+        let (success, output) = run_source_stdout(source);
+        assert_eq!(
+            success, expected_run,
+            "unexpected runtime result: {output}\nsource:\n{source}"
+        );
+        if expected_run {
+            assert_eq!(output, expected_output);
+        }
+    }
+
+    let after_if_reassignment = r#"mut items as Vector[Int] is (1, 2)
+if false:
+    items -> [3, 4]
+end
+items -> [7, 8]
+match items:
+    ref view:
+        Sayln view[0]
+end
+"#;
+    let (valid, _, error) = check_source(after_if_reassignment);
+    assert!(valid, "known Array provenance was not restored: {error}");
+    let (success, output) = run_source_stdout(after_if_reassignment);
+    assert!(success, "reassignment after if failed: {output}");
+    assert_eq!(output, "7\n");
+
+    let after_loop_reassignment = r#"mut items as Vector[Int] is (1, 2)
+for n in range(0, 0):
+    items -> [3, 4]
+end
+items -> [9, 10]
+match items:
+    ref view:
+        Sayln view[0]
+end
+"#;
+    let (valid, _, error) = check_source(after_loop_reassignment);
+    assert!(
+        valid,
+        "known Array provenance was not restored after loop: {error}"
+    );
+    let (success, output) = run_source_stdout(after_loop_reassignment);
+    assert!(success, "reassignment after loop failed: {output}");
+    assert_eq!(output, "9\n");
+
+    let after_match_reassignment = r#"mut items as Vector[Int] is (1, 2)
+match true:
+    true:
+        items -> [3, 4]
+    false:
+        items -> (5, 6)
+end
+items -> [11, 12]
+match items:
+    ref view:
+        Sayln view[0]
+end
+"#;
+    let (valid, _, error) = check_source(after_match_reassignment);
+    assert!(
+        valid,
+        "known Array provenance was not restored after match: {error}"
+    );
+    let (success, output) = run_source_stdout(after_match_reassignment);
+    assert!(success, "reassignment after match failed: {output}");
+    assert_eq!(output, "11\n");
+}
+
+#[test]
+fn vector_reference_provenance_restores_shadowed_bindings_and_tracks_pattern_bindings() {
+    let shadowed = r#"mut items as Vector[Int] is [1, 2]
+if true:
+    items as Vector[Int] is (3, 4)
+end
+match items:
+    ref view:
+        Sayln view[0]
+end
+"#;
+    let (valid, _, error) = check_source(shadowed);
+    assert!(valid, "shadowed Vector provenance leaked: {error}");
+    let (success, output) = run_source_stdout(shadowed);
+    assert!(
+        success,
+        "outer Array-backed binding was not restored: {output}"
+    );
+    assert_eq!(output, "1\n");
+
+    let tuple_outer = r#"mut items as Vector[Int] is (1, 2)
+if true:
+    items as Vector[Int] is [3, 4]
+end
+match items:
+    ref view:
+        Sayln view[0]
+end
+"#;
+    let (valid, _, error) = check_source(tuple_outer);
+    assert!(!valid, "inner shadowing hid tuple-backed outer storage");
+    assert!(
+        error.contains("tuple-backed Vector"),
+        "missing tuple-backed diagnostic after shadow cleanup: {error}"
+    );
+
+    let tuple_pattern_binding = r#"items as Vector[Int] is (1, 2)
+match items:
+    saved:
+        match saved:
+            ref view:
+                Sayln view[0]
+        end
+end
+"#;
+    let (valid, _, error) = check_source(tuple_pattern_binding);
+    assert!(
+        !valid,
+        "tuple provenance was lost through a by-value pattern: {error}"
+    );
+    assert!(
+        error.contains("tuple-backed Vector"),
+        "missing tuple-backed diagnostic: {error}"
+    );
+    let (success, output) = run_source(tuple_pattern_binding);
+    assert!(!success, "runtime accepted a tuple-backed ref pattern");
+    assert!(
+        output.contains("requires an Array, List, or Hash"),
+        "{output}"
+    );
+
+    let array_pattern_binding = r#"items as Vector[Int] is [5, 6]
+match items:
+    saved:
+        match saved:
+            ref view:
+                Sayln view[0]
+        end
+end
+"#;
+    let (valid, _, error) = check_source(array_pattern_binding);
+    assert!(
+        valid,
+        "Array provenance was lost through a by-value pattern: {error}"
+    );
+    let (success, output) = run_source_stdout(array_pattern_binding);
+    assert!(success, "Array-backed pattern binding failed: {output}");
+    assert_eq!(output, "5\n");
+}
+
+#[test]
+fn vector_reference_provenance_is_unknown_for_parameters_and_function_results() {
+    let parameter = r#"fn inspect(ref items as Vector[Int]):
+    match items:
+        ref view:
+            Sayln view[0]
+    end
+end
+"#;
+    let (valid, _, error) = check_source(parameter);
+    assert!(
+        !valid,
+        "unknown parameter provenance was treated as Array-backed"
+    );
+    assert!(
+        error.contains("statically known Array-backed storage"),
+        "missing unknown-provenance diagnostic: {error}"
+    );
+    let (success, output) = run_source_stdout(
+        &(parameter.to_owned() + "numbers as Vector[Int] is [7]\ninspect(numbers)\n"),
+    );
+    assert!(success, "Array-backed parameter runtime failed: {output}");
+    assert_eq!(output, "7\n");
+    let (success, error) = run_source(
+        &(parameter.to_owned() + "numbers as Vector[Int] is (7, 8)\ninspect(numbers)\n"),
+    );
+    assert!(!success, "tuple-backed parameter passed runtime ref check");
+    assert!(error.contains("requires a collection value"), "{error}");
+
+    let function_result = r#"fn make() gives Vector[Int]:
+    return [1, 2]
+end
+items as Vector[Int] is make()
+match items:
+    ref view:
+        Sayln view[0]
+end
+"#;
+    let (valid, _, error) = check_source(function_result);
+    assert!(
+        !valid,
+        "unknown function-result provenance was treated as Array-backed"
+    );
+    assert!(
+        error.contains("statically known Array-backed storage"),
+        "missing unknown-provenance diagnostic: {error}"
+    );
+    let (success, output) = run_source_stdout(function_result);
+    assert!(
+        success,
+        "Array runtime value should remain usable: {output}"
+    );
+    assert_eq!(output, "1\n");
+}
+
+#[test]
+fn reference_identifier_pattern_borrow_is_released_after_a_runtime_error() {
+    let source = r#"enum Failure:
+    Failed
+end
+mut rows is list [list [3]]
+try:
+    match rows:
+        ref view:
+            throw Failure::Failed
+    end
+catch error:
+end
+rows add list [5]
+Sayln rows
+"#;
+    let (success, output) = run_source_stdout(source);
+    assert!(
+        success,
+        "match arm error did not release its shared borrow: {output}"
+    );
+    assert_eq!(output, "[[3], [5]]\n");
+}
+
+#[test]
+fn reference_match_borrow_is_released_when_a_function_returns_from_the_arm() {
+    let source = r#"fn first(ref values as List[Int]) gives Int:
+        return match values:
+            ref view:
+                (view[0])
+        end
+    end
+mut items is list [4]
+Sayln first(items)
+items add 5
+Sayln items
+"#;
+    let (valid, _, error) = check_source(source);
+    assert!(valid, "scalar match return did not type-check: {error}");
+    let (success, output) = run_source_stdout(source);
+    assert!(success, "return did not release the match borrow: {output}");
+    assert_eq!(output, "4\n[4, 5]\n");
+}
+
+#[test]
+fn reference_match_borrow_stays_active_for_caught_errors_and_nested_aliases() {
+    let source = r#"type Box:
+    items as List[Int]
+end
+on Box receive add(item as Int):
+    items add item
+end
+fn update(mut ref values as List[Int]):
+    values[0] -> 9
+end
+mut nested is list [1]
+box is Box(nested)
+mut rows is list [box]
+match rows:
+    ref view:
+        try:
+            nested[0] -> 2
+        catch error:
+            Sayln true
+        end
+        try:
+            update(nested)
+        catch error:
+            Sayln true
+        end
+        try:
+            box :: add(3)
+        catch error:
+            Sayln true
+        end
+end
+nested[0] -> 7
+Sayln nested
+"#;
+    let (valid, _, error) = check_source(source);
+    assert!(valid, "nested borrow checks did not type-check: {error}");
+    let (success, output) = run_source_stdout(source);
+    assert!(success, "nested alias conflict or cleanup failed: {output}");
+    assert_eq!(output, "true\ntrue\ntrue\n[7]\n");
+}
+
+#[test]
+fn reference_identifier_patterns_reject_conflicts_escapes_and_unsupported_shapes() {
+    let conflict = r#"fn write(mut ref values as List[Int]):
+    values[0] -> 9
+end
+mut items is list [1]
+match items:
+    ref view:
+        try:
+            write(items)
+        catch error:
+            Sayln true
+        end
+        try:
+            items add 3
+        catch error:
+            Sayln true
+        end
+end
+items add 2
+Sayln items
+"#;
+    let (success, output) = run_source_stdout(conflict);
+    assert!(
+        success,
+        "exclusive access was not rejected or the loan was not released: {output}"
+    );
+    assert_eq!(output, "true\ntrue\n[1, 2]\n");
+
+    for source in [
+        r#"mut items is list [1]
+match items:
+    ref view:
+        saved is view
+end
+"#,
+        r#"mut items is list [1]
+mut saved is list [0]
+match items:
+    ref view:
+        saved is view
+end
+"#,
+        r#"mut items is list [1]
+match items:
+    ref view:
+        view[0] -> 2
+end
+"#,
+        r#"mut items is list [1]
+mut stash is list []
+match items:
+    ref view:
+        stash add view
+end
+"#,
+        r#"mut items is list [1]
+match items:
+    [ref view]:
+        0
+    _:
+        1
+end
+"#,
+        r#"value is 1
+match value:
+    ref view:
+        view
+end
+"#,
+        r#"mut items is list [1]
+fn leak(values as List[Int]) gives List[Int]:
+    return match values:
+        ref view:
+            view
+    end
+end
+"#,
+        r#"fn leak(values as List[Int]) gives List[Int]:
+    match values:
+        ref view:
+            return view
+    end
+end
+"#,
+    ] {
+        let (valid, _, error) = check_source(source);
+        assert!(!valid, "unsupported or escaping ref pattern was accepted");
+        assert!(
+            error.contains("ref") || error.contains("borrow"),
+            "reference diagnostic missing: {error}"
+        );
+    }
+
+    let closure_escape = r#"items is list [1]
+match items:
+    ref view:
+        fn captured() gives Int:
+            return view[0]
+        end
+end
+"#;
+    let (success, error) = run_source(closure_escape);
+    assert!(!success, "closure captured a match reference");
+    assert!(
+        error.contains("closure cannot capture a reference binding"),
+        "missing closure-capture diagnostic: {error}"
+    );
+}
+
+#[test]
 fn parses_and_matches_closed_open_negative_and_zero_width_int_ranges() {
-    for pattern in ["0..10", "-10..10", "10..", "..10", "-10..", "..-10", "0..0"] {
+    for pattern in [
+        "0..=10", "-10..=10", "10..=", "..=10", "-10..=", "..=-10", "0..=0",
+    ] {
         let source = format!(
             "value is 0\nmatch value:\n    {pattern}:\n        \"matched\"\n    _:\n        \"other\"\nend\n"
         );
@@ -30,18 +671,18 @@ fn parses_and_matches_closed_open_negative_and_zero_width_int_ranges() {
     }
 
     for (value, pattern, expected) in [
-        (0, "0..10", "matched"),
-        (10, "0..10", "matched"),
-        (-1, "0..10", "other"),
-        (11, "0..10", "other"),
-        (-5, "-10..-5", "matched"),
-        (-4, "-10..-5", "other"),
-        (10, "10..", "matched"),
-        (9, "10..", "other"),
-        (-10, "..-10", "matched"),
-        (-9, "..-10", "other"),
-        (0, "0..0", "matched"),
-        (1, "0..0", "other"),
+        (0, "0..=10", "matched"),
+        (10, "0..=10", "matched"),
+        (-1, "0..=10", "other"),
+        (11, "0..=10", "other"),
+        (-5, "-10..=-5", "matched"),
+        (-4, "-10..=-5", "other"),
+        (10, "10..=", "matched"),
+        (9, "10..=", "other"),
+        (-10, "..=-10", "matched"),
+        (-9, "..=-10", "other"),
+        (0, "0..=0", "matched"),
+        (1, "0..=0", "other"),
     ] {
         let source = format!(
             "value is {value}\nresult is match value:\n    {pattern}:\n        \"matched\"\n    _:\n        \"other\"\nend\nSayln result\n"
@@ -53,18 +694,47 @@ fn parses_and_matches_closed_open_negative_and_zero_width_int_ranges() {
 }
 
 #[test]
+fn range_patterns_share_half_open_bounds_and_keep_explicit_inclusive_compatibility() {
+    for (value, pattern, expected) in [
+        (1, "1..5", "matched"),
+        (4, "1..5", "matched"),
+        (5, "1..5", "other"),
+        (0, "1..5", "other"),
+        (-2, "-3..0", "matched"),
+        (0, "-3..0", "other"),
+        (2, "2..2", "other"),
+        (1, "5..2", "other"),
+        (5, "1..=5", "matched"),
+        (6, "1..=5", "other"),
+        (-1, "..0", "matched"),
+        (0, "..0", "other"),
+        (0, "..=0", "matched"),
+    ] {
+        let source = format!(
+            "value is {value}\nresult is match value:\n    {pattern}:\n        \"matched\"\n    _:\n        \"other\"\nend\nSayln result\n"
+        );
+        let (success, output) = run_source_stdout(&source);
+        assert!(
+            success,
+            "range pattern {pattern} failed for {value}: {output}"
+        );
+        assert_eq!(output, format!("{expected}\n"), "{pattern} for {value}");
+    }
+}
+
+#[test]
 fn rejects_invalid_int_ranges_and_non_int_scrutinees() {
     for (pattern, expected) in [
-        ("..", "range pattern must have at least one bound"),
-        ("10..0", "lower bound must not exceed upper bound"),
-        ("0.0..1.0", "range pattern bounds must be Int"),
-        ("\"a\"..\"z\"", "range pattern bounds must be Int"),
-        ("false..true", "range pattern bounds must be Int"),
-        ("foo..10", "range pattern bounds must be literal values"),
-        ("10..foo", "range pattern bounds must be literal values"),
-        ("x..y", "range pattern bounds must be literal values"),
+        ("..=", "range pattern must have at least one bound"),
+        ("10..=0", "lower bound must not exceed upper bound"),
+        ("0.0..=1.0", "range pattern bounds must be Int"),
+        ("\"a\"..=\"z\"", "range pattern bounds must be Int"),
+        ("false..=true", "range pattern bounds must be Int"),
+        ("foo..=10", "range pattern bounds must be literal values"),
+        ("10..=foo", "range pattern bounds must be literal values"),
+        ("x..=y", "range pattern bounds must be literal values"),
         (
-            "0..some_function()",
+            "0..=some_function()",
             "range pattern bounds must be literal values",
         ),
     ] {
@@ -77,7 +747,7 @@ fn rejects_invalid_int_ranges_and_non_int_scrutinees() {
     }
 
     let source =
-        "value is \"hello\"\nmatch value:\n    0..10:\n        1\n    _:\n        0\nend\n";
+        "value is \"hello\"\nmatch value:\n    0..=10:\n        1\n    _:\n        0\nend\n";
     let (success, _, error) = check_source(source);
     assert!(!success);
     assert!(
@@ -88,12 +758,36 @@ fn rejects_invalid_int_ranges_and_non_int_scrutinees() {
 
 #[test]
 fn int_interval_analysis_checks_exhaustiveness_and_unreachable_ranges() {
+    let patterns = ["..0", "0.."];
+    let arms = patterns
+        .iter()
+        .map(|pattern| format!("    {pattern}:\n        1\n"))
+        .collect::<String>();
+    let source = format!("value is 7\nmatch value:\n{arms}end\n");
+    let (valid, _, error) = check_source(&source);
+    assert!(valid, "half-open coverage failed: {error}\n{source}");
+
+    for pattern in ["..0\n    1..", "0..0"] {
+        let arms = if pattern.contains('\n') {
+            pattern
+                .lines()
+                .map(|range| format!("    {range}:\n        1\n"))
+                .collect::<String>()
+        } else {
+            format!("    {pattern}:\n        1\n")
+        };
+        let source = format!("value is 7\nmatch value:\n{arms}end\n");
+        let (valid, _, error) = check_source(&source);
+        assert!(!valid, "half-open gap/empty pattern passed: {source}");
+        assert!(error.contains("non-exhaustive match"), "{error}");
+    }
+
     for patterns in [
-        vec!["..0", "1.."],
-        vec!["..10", "11.."],
-        vec!["..-1", "0..10", "11.."],
-        vec!["..-10", "-9..9", "10.."],
-        vec!["..-1", "0..10", "11..20", "21.."],
+        vec!["..=0", "1..="],
+        vec!["..=10", "11..="],
+        vec!["..=-1", "0..=10", "11..="],
+        vec!["..=-10", "-9..=9", "10..="],
+        vec!["..=-1", "0..=10", "11..=20", "21..="],
     ] {
         let arms = patterns
             .iter()
@@ -107,7 +801,7 @@ fn int_interval_analysis_checks_exhaustiveness_and_unreachable_ranges() {
         );
     }
 
-    for patterns in [["0..10", ""], ["..0", "2.."], ["..-2", "0.."]] {
+    for patterns in [["0..=10", ""], ["..=0", "2..="], ["..=-2", "0..="]] {
         let arms = patterns
             .iter()
             .filter(|pattern| !pattern.is_empty())
@@ -120,17 +814,17 @@ fn int_interval_analysis_checks_exhaustiveness_and_unreachable_ranges() {
     }
 
     let range_with_wildcard =
-        "value is 7\nmatch value:\n    0..10:\n        1\n    _:\n        0\nend\n";
+        "value is 7\nmatch value:\n    0..=10:\n        1\n    _:\n        0\nend\n";
     let (valid, _, error) = check_source(range_with_wildcard);
     assert!(valid, "range with wildcard should be exhaustive: {error}");
 
     for (arms, message) in [
         (
-            "    0..10:\n        1\n    0..10:\n        2\n    _:\n        0\n",
+            "    0..=10:\n        1\n    0..=10:\n        2\n    _:\n        0\n",
             "unreachable match pattern",
         ),
         (
-            "    0..100:\n        1\n    20..30:\n        2\n",
+            "    0..=100:\n        1\n    20..=30:\n        2\n",
             "unreachable match pattern",
         ),
         (
@@ -138,15 +832,15 @@ fn int_interval_analysis_checks_exhaustiveness_and_unreachable_ranges() {
             "unreachable match pattern",
         ),
         (
-            "    0..10:\n        1\n    5:\n        2\n    _:\n        0\n",
+            "    0..=10:\n        1\n    5:\n        2\n    _:\n        0\n",
             "unreachable match pattern",
         ),
         (
-            "    0:\n        1\n    0..10:\n        2\n    _:\n        0\n",
+            "    0:\n        1\n    0..=10:\n        2\n    _:\n        0\n",
             "",
         ),
         (
-            "    0..10:\n        1\n    5..20:\n        2\n    _:\n        0\n",
+            "    0..=10:\n        1\n    5..=20:\n        2\n    _:\n        0\n",
             "",
         ),
     ] {
@@ -169,27 +863,27 @@ fn range_patterns_compose_with_or_guards_and_nested_patterns() {
                   tuple is (7, 25)\n\
                   person is Person(17, \"Ada\")\n\
                   enum_result is match enum_value:\n\
-                      Result::Ok(..-1):\n    \"negative\"\n\
-                      Result::Ok(0..10):\n    \"small\"\n\
+                      Result::Ok(..=-1):\n    \"negative\"\n\
+                      Result::Ok(0..=10):\n    \"small\"\n\
                       Result::Ok(11..):\n    \"large\"\n\
                       Result::Error(_):\n    \"error\"\n\
                   end\n\
                   tuple_result is match tuple:\n\
-                      (0..10, 20..30):\n    \"tuple\"\n\
+                      (0..=10, 20..=30):\n    \"tuple\"\n\
                       _:\n    \"other\"\n\
                   end\n\
                   person_result is match person:\n\
-                      Person(..-1, _):\n    \"negative age\"\n\
-                      Person(0..17, name):\n    name\n\
+                      Person(..=-1, _):\n    \"negative age\"\n\
+                      Person(0..=17, name):\n    name\n\
                       Person(18.., _):\n    \"adult\"\n\
                   end\n\
                   or_result is match 12:\n\
-                      0..5 | 10..15:\n    \"selected\"\n\
+                      0..=5 | 10..=15:\n    \"selected\"\n\
                       _:\n    \"other\"\n\
                   end\n\
                   guarded_result is match 7:\n\
-                      0..10 if false:\n    \"guarded\"\n\
-                      0..10:\n    \"fallback\"\n\
+                      0..=10 if false:\n    \"guarded\"\n\
+                      0..=10:\n    \"fallback\"\n\
                       _:\n    \"other\"\n\
                   end\n\
                   Sayln enum_result\nSayln tuple_result\nSayln person_result\nSayln or_result\nSayln guarded_result\n";
@@ -200,14 +894,14 @@ fn range_patterns_compose_with_or_guards_and_nested_patterns() {
     assert_eq!(output, "small\ntuple\nAda\nselected\nfallback\n");
 
     let overlapping_or =
-        "value is 12\nmatch value:\n    0..10 | 5..15:\n        1\n    _:\n        0\nend\n";
+        "value is 12\nmatch value:\n    0..=10 | 5..=15:\n        1\n    _:\n        0\nend\n";
     let (valid, _, error) = check_source(overlapping_or);
     assert!(
         valid,
         "partially overlapping OR ranges were rejected: {error}"
     );
 
-    let literal_or_range = "result is match 12:\n    0 | 10..15:\n        \"selected\"\n    _:\n        \"other\"\nend\nSayln result\n";
+    let literal_or_range = "result is match 12:\n    0 | 10..=15:\n        \"selected\"\n    _:\n        \"other\"\nend\nSayln result\n";
     let (valid, _, error) = check_source(literal_or_range);
     assert!(valid, "literal/range OR-pattern was rejected: {error}");
     let (success, output) = run_source_stdout(literal_or_range);
@@ -215,7 +909,7 @@ fn range_patterns_compose_with_or_guards_and_nested_patterns() {
     assert_eq!(output, "selected\n");
 
     let redundant_or =
-        "value is 12\nmatch value:\n    0..10 | 5..8:\n        1\n    _:\n        0\nend\n";
+        "value is 12\nmatch value:\n    0..=10 | 5..=8:\n        1\n    _:\n        0\nend\n";
     let (valid, _, error) = check_source(redundant_or);
     assert!(!valid);
     assert!(
@@ -223,7 +917,7 @@ fn range_patterns_compose_with_or_guards_and_nested_patterns() {
         "{error}"
     );
 
-    let guarded_only = "value is 7\nmatch value:\n    0..10 if true:\n        1\nend\n";
+    let guarded_only = "value is 7\nmatch value:\n    0..=10 if true:\n        1\nend\n";
     let (valid, _, error) = check_source(guarded_only);
     assert!(!valid);
     assert!(error.contains("non-exhaustive match"), "{error}");
@@ -360,7 +1054,7 @@ fn rest_sequence_patterns_bind_typed_suffixes_and_match_minimum_lengths() {
                            []:\n\
                                Sayln \"empty\"\n\
                            [first, second, ...tail]:\n\
-                               Sayln expect_list(ref tail)\n\
+                               Sayln expect_list(tail)\n\
                                Sayln type_of(tail)\n\
                                Sayln tail\n\
                            _:\n\
@@ -415,7 +1109,7 @@ fn rest_sequence_patterns_bind_typed_suffixes_and_match_minimum_lengths() {
                               values is [10, 20]\n\
                               match values:\n\
                                   [first, second, ...tail]:\n\
-                                      Sayln expect_array(ref tail)\n\
+                                      Sayln expect_array(tail)\n\
                                       Sayln type_of(tail)\n\
                                       Sayln tail\n\
                                   _:\n\
@@ -446,7 +1140,7 @@ fn rest_sequence_patterns_compose_with_nested_patterns_ranges_or_and_guards() {
     let nested = "type Person:\n    name as String\n    age as Int\nend\n\
                   people is [Person(\"Ada\", 17), Person(\"Lin\", 20)]\n\
                   result is match people:\n\
-                      [Person(name, 0..18), ...others]:\n    name + type_of(others)\n\
+                      [Person(name, 0..=18), ...others]:\n    name + type_of(others)\n\
                       _:\n    \"fallback\"\n\
                   end\n\
                   Sayln result\n";
@@ -459,8 +1153,8 @@ fn rest_sequence_patterns_compose_with_nested_patterns_ranges_or_and_guards() {
     let ranged = "values is [-1, 4, 12]\n\
                   match values:\n\
                       []:\n    Sayln \"empty\"\n\
-                      [..-1, ...rest]:\n    Sayln \"negative\"\n\
-                      [0..10, ...rest]:\n    Sayln \"small\"\n\
+                      [..=-1, ...rest]:\n    Sayln \"negative\"\n\
+                      [0..=10, ...rest]:\n    Sayln \"small\"\n\
                       [11.., ...rest]:\n    Sayln \"large\"\n\
                   end\n";
     let (valid, _, error) = check_source(ranged);
@@ -506,8 +1200,8 @@ fn rest_sequence_patterns_compose_with_nested_patterns_ranges_or_and_guards() {
                            [[], ...outer]:\n    Sayln \"empty inner sequence\"\n\
                            [[x, ...inner], ...outer]:\n\
                                Sayln x\n\
-                               Sayln expect_int_array(ref inner)\n\
-                               Sayln expect_nested_array(ref outer)\n\
+                               Sayln expect_int_array(inner)\n\
+                               Sayln expect_nested_array(outer)\n\
                                Sayln inner\n\
                                Sayln outer\n\
                        end\n";
@@ -564,8 +1258,8 @@ fn rest_sequence_usefulness_and_exhaustiveness_respect_lengths_and_prefixes() {
     let int_domain = "values is [0, 10]\n\
                       match values:\n\
                           []:\n    0\n\
-                          [..-1, ...negative]:\n    1\n\
-                          [0..10, ...middle]:\n    2\n\
+                          [..=-1, ...negative]:\n    1\n\
+                          [0..=10, ...middle]:\n    2\n\
                           [11.., ...large]:\n    3\n\
                       end\n";
     let (valid, _, error) = check_source(int_domain);
@@ -653,7 +1347,7 @@ fn rest_sequence_exhaustiveness_matrix_covers_minimum_lengths_and_fixed_arms() {
     let complete_integer_prefixes = "xs is [0, 2]\n\
         match xs:\n\
             []:\n                0\n\
-            [..0, ...negative]:\n                1\n\
+            [..=0, ...negative]:\n                1\n\
             [1.., ...nonnegative]:\n                2\n\
         end\n";
     let (valid, _, error) = check_source(complete_integer_prefixes);
@@ -662,10 +1356,10 @@ fn rest_sequence_exhaustiveness_matrix_covers_minimum_lengths_and_fixed_arms() {
     let disjoint_or_union = "xs is [15, 2]\n\
         match xs:\n\
             []:\n                0\n\
-            [..-1, ...negative]:\n                1\n\
-            [0..10, ...first]:\n                1\n\
-            [20..30, ...second]:\n                2\n\
-            [11..19, ...gap]:\n                3\n\
+            [..=-1, ...negative]:\n                1\n\
+            [0..=10, ...first]:\n                1\n\
+            [20..=30, ...second]:\n                2\n\
+            [11..=19, ...gap]:\n                3\n\
             [31.., ...large]:\n                4\n\
         end\n";
     let (valid, _, error) = check_source(disjoint_or_union);
@@ -677,9 +1371,9 @@ fn rest_sequence_exhaustiveness_matrix_covers_minimum_lengths_and_fixed_arms() {
     let rest_or_union = "xs is [15, 2]\n\
         match xs:\n\
             []:\n                0\n\
-            [..-1, ...negative]:\n                1\n\
-            [0..10, ...rest] | [20..30, ...rest]:\n                2\n\
-            [11..19, ...gap]:\n                3\n\
+            [..=-1, ...negative]:\n                1\n\
+            [0..=10, ...rest] | [20..=30, ...rest]:\n                2\n\
+            [11..=19, ...gap]:\n                3\n\
             [31.., ...large]:\n                4\n\
         end\n";
     let (valid, _, error) = check_source(rest_or_union);
@@ -690,8 +1384,8 @@ fn rest_sequence_exhaustiveness_matrix_covers_minimum_lengths_and_fixed_arms() {
 
     let redundant_or_overlap = "xs is [7, 2]\n\
         match xs:\n\
-            [0..10, ...rest] | [5..15, ...rest]:\n                1\n\
-            [7..9, ...covered]:\n                2\n\
+            [0..=10, ...rest] | [5..=15, ...rest]:\n                1\n\
+            [7..=9, ...covered]:\n                2\n\
             _:\n                0\n\
         end\n";
     let (valid, _, error) = check_source(redundant_or_overlap);
@@ -961,11 +1655,11 @@ fn sequence_patterns_compose_with_enum_struct_tuple_and_range_patterns() {
                   people is [Person(\"Ada\", 17), Person(\"Lin\", 20)]\n\
                   pairs is [(1, 2), (3, 4)]\n\
                   enum_result is match values:\n\
-                      [Result::Ok(0..10), Result::Err(_)]:\n    \"enum\"\n\
+                      [Result::Ok(0..=10), Result::Err(_)]:\n    \"enum\"\n\
                       _:\n    \"other\"\n\
                   end\n\
                   person_result is match people:\n\
-                      [Person(first_name, 0..17), Person(second_name, 18..)]:\n    first_name + second_name\n\
+                      [Person(first_name, 0..=17), Person(second_name, 18..)]:\n    first_name + second_name\n\
                       _:\n    \"other\"\n\
                   end\n\
                   tuple_result is match pairs:\n\
@@ -1025,14 +1719,14 @@ fn sequence_patterns_check_types_usefulness_exhaustiveness_and_guards() {
         "values is [1, 2]\nmatch values:\n    _:\n        1\n    [1, 2]:\n        0\nend\n",
         "values is [1, 2]\nmatch values:\n    [1, 2]:\n        1\n    [1, 2]:\n        0\nend\n",
         "values is [[1, 2]]\nmatch values:\n    [[1, _]]:\n        1\n    [[1, 2]]:\n        0\n    _:\n        0\nend\n",
-        "values is [[5, 1]]\nmatch values:\n    [[0..10, _]]:\n        1\n    [[5, _]]:\n        0\n    _:\n        0\nend\n",
+        "values is [[5, 1]]\nmatch values:\n    [[0..=10, _]]:\n        1\n    [[5, _]]:\n        0\n    _:\n        0\nend\n",
     ] {
         let (success, _, error) = check_source(source);
         assert!(!success, "redundant sequence pattern passed checking");
         assert!(error.contains("unreachable match pattern"), "{error}");
     }
 
-    let useful_range_element = "values is [[11, 1]]\nmatch values:\n    [[0..10, _]]:\n        1\n    [[11, _]]:\n        2\n    _:\n        0\nend\n";
+    let useful_range_element = "values is [[11, 1]]\nmatch values:\n    [[0..=10, _]]:\n        1\n    [[11, _]]:\n        2\n    _:\n        0\nend\n";
     let (success, _, error) = check_source(useful_range_element);
     assert!(success, "useful nested range was rejected: {error}");
 
@@ -2013,7 +2707,7 @@ fn hash_patterns_match_required_keys_recursively_and_bind_transactionally() {
                       extra is true\n\
                   end\n\
                   answer is match record:\n\
-                      {\"result\": Result::Ok(0..10), person: Person(name, 18..), values: [1, 2]}:\n\
+                      {\"result\": Result::Ok(0..=10), person: Person(name, 18..), values: [1, 2]}:\n\
                           name\n\
                       {\"person\": Person(leaked, _), \"result\": Result::Error(_)}:\n\
                           leaked\n\
@@ -2081,8 +2775,8 @@ fn hash_patterns_match_required_keys_recursively_and_bind_transactionally() {
 fn hash_pattern_usefulness_and_exhaustiveness_are_partial_and_key_sensitive() {
     let exhaustive = "record is hash:\n    value is 1\nend\n\
                       result is match record:\n\
-                          {value: 0..10}:\n    1\n\
-                          {\"value\": 11..}:\n    2\n\
+                          {value: 0..=10}:\n    1\n\
+                          {\"value\": 11..=}:\n    2\n\
                           {}:\n    3\n\
                       end\n";
     let (valid, _, error) = check_source(exhaustive);
@@ -2111,7 +2805,7 @@ fn hash_pattern_usefulness_and_exhaustiveness_are_partial_and_key_sensitive() {
 
     let not_exhaustive = "record is hash:\n    value is 1\nend\n\
                           match record:\n\
-                              {value: 0..10 | 20..30}:\n    1\n\
+                              {value: 0..=10 | 20..=30}:\n    1\n\
                           end\n";
     let (valid, _, error) = check_source(not_exhaustive);
     assert!(!valid, "keyed Hash patterns cannot cover arbitrary maps");
@@ -2119,7 +2813,7 @@ fn hash_pattern_usefulness_and_exhaustiveness_are_partial_and_key_sensitive() {
 
     let disjoint_or_union = "record is hash:\n    value is 15\nend\n\
                              match record:\n\
-                                 {value: 0..10 | 20..30}:\n    1\n\
+                                 {value: 0..=10 | 20..=30}:\n    1\n\
                                  {value: 15}:\n    2\n\
                                  {}:\n    3\n\
                              end\n";
@@ -2174,7 +2868,7 @@ fn hash_pattern_keys_are_literal_unique_and_or_patterns_round_trip() {
 
     let source = "record as Hash is hash:\n    name is \"Ada\"\nend\n\
                   result is match record:\n\
-                      {\"name\": person, extra: [0 .. 10, _]} | {name: person, extra: [11 .., _]}:\n\
+                      {\"name\": person, extra: [0 ..= 10, _]} | {name: person, extra: [11 ..=, _]}:\n\
                           person\n\
                       {}:\n\
                           \"other\"\n\
@@ -2295,7 +2989,7 @@ fn nested_hash_patterns_compose_with_struct_enum_tuple_sequence_and_or() {
                       items is [5, 6, 7]\n\
                   end\n\
                   output is match record:\n\
-                      {user: {name: name}, person: Person(person_name, age), result: Result::Ok(0..10), point: (x, 0..), items: [head, ...tail]}:\n\
+                      {user: {name: name}, person: Person(person_name, age), result: Result::Ok(0..=10), point: (x, 0..), items: [head, ...tail]}:\n\
                           name\n\
                       {user: {}, result: Result::Err(error)}:\n\
                           error\n\
@@ -2345,7 +3039,7 @@ fn hash_runtime_lookup_preserves_exact_string_keys_and_partial_matching() {
                  {{name: \"A\"}}:\n    \"exact-A\"\n\
                  {{\"name\": \"B\"}}:\n    \"exact-B\"\n\
                  {{name: name}}:\n    \"named-\" + name\n\
-                 {{age: 18..}}:\n    \"adult\"\n\
+                 {{age: 18..=}}:\n    \"adult\"\n\
                  {{}}:\n    \"other\"\n\
              end\nSayln result\n"
         );
@@ -2493,7 +3187,7 @@ fn alias_patterns_bind_the_whole_value_and_nested_bindings() {
                       _:\n    0\n\
                   end\n\
                   Sayln match result:\n\
-                      whole @ Result::Ok(payload @ 0..10):\n    payload\n\
+                      whole @ Result::Ok(payload @ 0..=10):\n    payload\n\
                       whole @ Result::Ok(_):\n    0\n\
                       whole @ Result::Error(message):\n    0\n\
                   end\n\
@@ -2526,7 +3220,7 @@ fn alias_pattern_failure_bindings_guards_and_coverage_are_transactional() {
                       age is 10\n\
                   end\n\
                   result is match record:\n\
-                      whole @ {name: name, age: 18..}:\n    \"wrong\"\n\
+                      whole @ {name: name, age: 18..=}:\n    \"wrong\"\n\
                       whole @ {name: name, age: _} if name == \"Ada\":\n    name\n\
                       {}:\n    \"fallback\"\n\
                   end\nSayln result\n";
@@ -2627,7 +3321,7 @@ fn pattern_type_checking_rejects_provably_incompatible_shapes_recursively() {
             "literal pattern of type String cannot match value of type Int",
         ),
         (
-            "value is true\nmatch value:\n    0..10:\n        1\n    _:\n        0\nend\n",
+            "value is true\nmatch value:\n    0..=10:\n        1\n    _:\n        0\nend\n",
             "range pattern cannot match value of type Bool",
         ),
         (
@@ -2679,7 +3373,7 @@ fn pattern_type_checking_rejects_provably_incompatible_shapes_recursively() {
 fn unknown_scrutinee_types_remain_permissive_for_dynamic_nested_patterns() {
     let source = "fn inspect(value):\n\
                       result is match value:\n\
-                          whole @ (Result::Ok(_) | {age: 18..} | [_, _]):\n\
+                          whole @ (Result::Ok(_) | {age: 18..=} | [_, _]):\n\
                               1\n\
                           whole @ _:\n\
                               0\n\
@@ -2701,7 +3395,7 @@ fn unknown_scrutinee_types_remain_permissive_for_dynamic_nested_patterns() {
                   end\n\
                   Sayln inspect(Result::Ok(3))\n\
                   Sayln inspect(\"dynamic\")\n\
-                  Sayln inspect_array(ref [1, 2])\n";
+                  Sayln inspect_array([1, 2])\n";
     let (valid, _, error) = check_source(source);
     assert!(
         valid,

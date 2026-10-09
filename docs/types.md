@@ -19,10 +19,18 @@ dynamically typed code. Element types and known literal dimensions are checked
 statically; dynamic values are checked at runtime. Operation dimension
 compatibility is checked statically whenever both dimensions are known.
 
-`range(...)` values have runtime type `Range`; `csv_rows(...)` values have
-runtime type `CsvStream`. These are not aliases for arrays or lists. A Flow can
-consume them as streaming sources; the checker's Flow analysis understands
-their yielded item types.
+`start .. end` and `range(start, end[, step])` values have runtime type `Range`;
+the type is non-generic and range elements are `Int`. The `..` operator uses
+step `1` and an end-exclusive bound; reversed or equal bounds produce an empty
+range. `range(...)` retains its optional explicit step, including negative
+steps, and is likewise end-exclusive. Both forms are lazy and can be used with
+`in`, passed to or returned from typed functions, and iterated without
+materializing all their elements. The built-in `contains(range, value)` remains
+available. Integer range patterns using `..` share range values' half-open
+endpoint semantics; use `..=` when an inclusive upper bound is needed.
+`csv_rows(...)` values have runtime type `CsvStream`; ranges and CSV streams
+are not aliases for arrays or lists. A Flow can consume them as streaming
+sources; the checker's Flow analysis understands their yielded item types.
 
 Function parameters and declared return types are optional. A function without an explicit return annotation returns `Unit` when it reaches the end. A typed function must return a compatible value on every possible branch.
 

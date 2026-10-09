@@ -164,6 +164,20 @@ impl Formatter {
                     indent,
                 );
             }
+            Stmt::Borrow {
+                name,
+                mutable,
+                value,
+            } => {
+                self.expression_line(
+                    &Expr::Identifier(format!(
+                        "{}{name} is ref {}",
+                        if *mutable { "mut " } else { "" },
+                        expr(value)
+                    )),
+                    indent,
+                );
+            }
             Stmt::Flow {
                 name,
                 source,
@@ -333,12 +347,19 @@ impl Formatter {
             Stmt::For {
                 name,
                 mutable,
+                by_ref,
                 iterable,
                 body,
             } => {
-                let mutable = if *mutable { "mut " } else { "" };
+                let binding = if *by_ref {
+                    "ref "
+                } else if *mutable {
+                    "mut "
+                } else {
+                    ""
+                };
                 self.line(
-                    &format!("for {mutable}{name} in {}:", expr(iterable)),
+                    &format!("for {binding}{name} in {}:", expr(iterable)),
                     indent,
                     None,
                 );
@@ -606,7 +627,9 @@ fn function_parameters_text(parameters: &[(String, Option<Type>, bool, bool)]) -
     parameters
         .iter()
         .map(|(name, typ, mutable, by_ref)| {
-            let mut text = if *by_ref {
+            let mut text = if *by_ref && *mutable {
+                format!("mut ref {name}")
+            } else if *by_ref {
                 format!("ref {name}")
             } else if *mutable {
                 format!("mut {name}")
@@ -676,12 +699,14 @@ fn precedence(operator: &BinaryOperator) -> u8 {
         BinaryOperator::Or => 1,
         BinaryOperator::And => 2,
         BinaryOperator::Equal | BinaryOperator::NotEqual => 3,
+        BinaryOperator::In => 5,
         BinaryOperator::Greater
         | BinaryOperator::GreaterEqual
         | BinaryOperator::Less
-        | BinaryOperator::LessEqual => 4,
-        BinaryOperator::Add | BinaryOperator::Subtract | BinaryOperator::MatrixMultiply => 5,
-        BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Remainder => 6,
+        | BinaryOperator::LessEqual => 5,
+        BinaryOperator::Range => 6,
+        BinaryOperator::Add | BinaryOperator::Subtract | BinaryOperator::MatrixMultiply => 7,
+        BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Remainder => 8,
     }
 }
 
@@ -699,6 +724,8 @@ fn binary_symbol(operator: &BinaryOperator) -> &'static str {
         BinaryOperator::GreaterEqual => ">=",
         BinaryOperator::Less => "<",
         BinaryOperator::LessEqual => "<=",
+        BinaryOperator::In => "in",
+        BinaryOperator::Range => "..",
         BinaryOperator::Equal => "==",
         BinaryOperator::NotEqual => "!=",
     }
@@ -726,12 +753,11 @@ fn expr_prec(expression: &Expr, parent: u8) -> String {
     let (text, own) = match expression {
         Expr::Literal(value) => (literal(value), 10),
         Expr::Identifier(name) => (name.clone(), 10),
-        Expr::Ref(value) => (format!("ref {}", expr_prec(value, 0)), 10),
         Expr::Unary { operator, operand } => {
             let (symbol, precedence) = match operator {
-                UnaryOperator::Not => ("not ", 7),
-                UnaryOperator::Negate => ("-", 7),
-                UnaryOperator::Transpose => ("", 8),
+                UnaryOperator::Not => ("not ", 9),
+                UnaryOperator::Negate => ("-", 9),
+                UnaryOperator::Transpose => ("", 10),
             };
             (
                 format!(
@@ -949,6 +975,15 @@ fn statement_text(statement: &Stmt) -> String {
                 .unwrap_or_default();
             format!("{prefix}{name}{declared_type} is {}", expr(value))
         }
+        Stmt::Borrow {
+            name,
+            mutable,
+            value,
+        } => format!(
+            "{}{name} is ref {}",
+            if *mutable { "mut " } else { "" },
+            expr(value)
+        ),
         Stmt::Flow {
             name,
             source,
@@ -1085,12 +1120,19 @@ fn statement_text(statement: &Stmt) -> String {
         Stmt::For {
             name,
             mutable,
+            by_ref,
             iterable,
             body,
         } => render_block(
             format!(
                 "for {}{name} in {}:",
-                if *mutable { "mut " } else { "" },
+                if *by_ref {
+                    "ref "
+                } else if *mutable {
+                    "mut "
+                } else {
+                    ""
+                },
                 expr(iterable)
             ),
             body,
@@ -1204,10 +1246,16 @@ fn render_steps(steps: &[PipelineStep], indent: usize) -> Vec<String> {
 fn render_pattern(value: &MatchPattern) -> String {
     match value {
         MatchPattern::Identifier(name) => name.clone(),
+        MatchPattern::ReferenceIdentifier(name) => format!("ref {name}"),
         MatchPattern::Literal(value) => literal(value),
-        MatchPattern::Range { start, end } => format!(
-            "{}..{}",
+        MatchPattern::Range {
+            start,
+            end,
+            inclusive_end,
+        } => format!(
+            "{}{}{}",
             start.as_ref().map(literal).unwrap_or_default(),
+            if *inclusive_end { "..=" } else { ".." },
             end.as_ref().map(literal).unwrap_or_default()
         ),
         MatchPattern::Or(values) => values

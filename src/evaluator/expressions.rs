@@ -63,7 +63,6 @@ impl Evaluator {
                     format!("unknown variable `{name}`"),
                 )
             }),
-            Expr::Ref(inner) => self.evaluate(inner),
             Expr::Unary { operator, operand } => {
                 let value = self.evaluate(operand)?;
                 operations::unary(&self.heap, value, operator, self.current_span.as_ref())
@@ -96,30 +95,8 @@ impl Evaluator {
                     return self.construct_struct(name, &definition, values);
                 }
                 if matches!(self.lookup(name), Some(Value::Function(_))) {
-                    if let Some(Value::Function(function)) = self.lookup(name) {
-                        let mismatch = self.heap.with_function(*function, |function| {
-                            arguments.iter().enumerate().find_map(|(index, argument)| {
-                                let expected = function
-                                    .parameters
-                                    .get(index)
-                                    .is_some_and(|(_, _, _, by_ref)| *by_ref);
-                                let marked = matches!(argument, Expr::Ref(_));
-                                (expected != marked).then_some((index, expected))
-                            })
-                        });
-                        if let Some(Some((index, expected))) = mismatch {
-                            return Err(self.runtime_error_with_code(
-                                DiagnosticCode::RuntimeArgument,
-                                format!(
-                                    "argument {} to `{name}` {} `ref`",
-                                    index + 1,
-                                    if expected { "requires" } else { "must not use" }
-                                ),
-                            ));
-                        }
-                    }
                     let values = self.evaluate_values(arguments)?;
-                    return self.invoke_function(name, values);
+                    return self.invoke_function_with_sources(name, values, Some(arguments));
                 }
                 if name == "Ask" {
                     if !(1..=2).contains(&arguments.len()) {
@@ -648,31 +625,13 @@ impl Evaluator {
                     }
                     let collection = self.evaluate(&arguments[0])?;
                     let searched = self.evaluate(&arguments[1])?;
-                    let result = match collection {
-                        Value::String(value) => match searched {
-                            Value::String(searched) => value.contains(&searched),
-                            _ => false,
-                        },
-                        Value::Array(values) | Value::List(values) => {
-                            values.iter().any(|value| value == searched)
-                        }
-                        Value::Tuple(values) => values.iter().any(|value| value == &searched),
-                        Value::Range { start, end, step } => {
-                            matches!(searched, Value::Int(value)
-                                if (step > 0 && value >= start && value < end
-                                    || step < 0 && value <= start && value > end)
-                                    && (i128::from(value) - i128::from(start))
-                                        % i128::from(step)
-                                        == 0)
-                        }
-                        Value::Hash(values) => values.values().any(|value| value == searched),
-                        _ => {
-                            return Err(self.runtime_collection_error(
-                                "`contains` requires a collection or string",
-                            ));
-                        }
-                    };
-                    return Ok(Value::Bool(result));
+                    return collections::contains(
+                        &collection,
+                        &searched,
+                        self.current_span.as_ref(),
+                        "`contains` requires a collection or string",
+                    )
+                    .map(Value::Bool);
                 }
                 if (name == "keys"
                     || name == "values"
@@ -1271,19 +1230,25 @@ impl Evaluator {
                     .iter()
                     .map(|argument| self.evaluate(argument))
                     .collect::<Result<Vec<_>, _>>()?;
-                self.invoke_function(name, values)
+                self.invoke_function_with_sources(name, values, Some(arguments))
             }
             Expr::MessageDispatch {
                 receiver,
                 message,
                 arguments,
             } => {
-                let receiver = self.evaluate(receiver)?;
+                let receiver_value = self.evaluate(receiver)?;
                 let argument_values = arguments
                     .iter()
                     .map(|argument| self.evaluate(argument))
                     .collect::<Result<Vec<_>, _>>()?;
-                self.dispatch_message(receiver, message, argument_values)
+                self.dispatch_message(
+                    receiver_value,
+                    message,
+                    argument_values,
+                    receiver,
+                    arguments,
+                )
             }
             Expr::EnumVariant {
                 enum_name,
@@ -1339,9 +1304,16 @@ impl Evaluator {
                     ))
                 }
             }
-            Expr::Match { value, arms } => {
-                let value = self.evaluate(value)?;
-                self.evaluate_match(value, arms)
+            Expr::Match {
+                value: value_expr,
+                arms,
+            } => {
+                let value = self.evaluate(value_expr)?;
+                let source_name = match value_expr.as_ref() {
+                    Expr::Identifier(name) => Some(name.as_str()),
+                    _ => None,
+                };
+                self.evaluate_match(value, arms, source_name)
             }
             Expr::Index { target, index } => {
                 let target = self.evaluate(target)?;

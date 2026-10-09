@@ -46,10 +46,12 @@ pub struct MatchArm {
 #[derive(Debug, Clone, PartialEq)]
 pub enum MatchPattern {
     Identifier(String),
+    ReferenceIdentifier(String),
     Literal(Literal),
     Range {
         start: Option<Literal>,
         end: Option<Literal>,
+        inclusive_end: bool,
     },
     Or(Vec<MatchPattern>),
     Tuple(Vec<MatchPattern>),
@@ -82,7 +84,9 @@ impl MatchPattern {
     pub(crate) fn destructure_binding_names(&self) -> Vec<&str> {
         fn collect<'a>(pattern: &'a MatchPattern, names: &mut Vec<&'a str>) {
             match pattern {
-                MatchPattern::Identifier(name) => names.push(name),
+                MatchPattern::Identifier(name) | MatchPattern::ReferenceIdentifier(name) => {
+                    names.push(name)
+                }
                 MatchPattern::Tuple(patterns) => {
                     for pattern in patterns {
                         collect(pattern, names);
@@ -135,6 +139,11 @@ pub enum Stmt {
         name: String,
         mutable: bool,
         declared_type: Option<Type>,
+        value: Expr,
+    },
+    Borrow {
+        name: String,
+        mutable: bool,
         value: Expr,
     },
     Flow {
@@ -200,6 +209,7 @@ pub enum Stmt {
     For {
         name: String,
         mutable: bool,
+        by_ref: bool,
         iterable: Expr,
         body: Vec<Stmt>,
     },
@@ -215,7 +225,6 @@ pub enum Stmt {
 pub enum Expr {
     Literal(Literal),
     Identifier(String),
-    Ref(Box<Expr>),
     Unary {
         operator: UnaryOperator,
         operand: Box<Expr>,
@@ -334,6 +343,8 @@ pub enum BinaryOperator {
     GreaterEqual,
     Less,
     LessEqual,
+    In,
+    Range,
     Equal,
     NotEqual,
 }
